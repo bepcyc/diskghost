@@ -221,7 +221,7 @@ const LOCAL_FUSE: &[&str] = &[
 /// the network or through a non-local FUSE daemon. `fuseblk` (ntfs-3g and
 /// exFAT on a local block device) is local.
 #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
-fn is_remote_fs(fstype: &str) -> bool {
+pub(crate) fn is_remote_fs(fstype: &str) -> bool {
     match fstype {
         "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "ncpfs" | "afs" | "ceph" | "glusterfs"
         | "lustre" | "davfs" | "fuse" => true,

@@ -183,6 +183,10 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// Bytes and file count of one file extension.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtStat {
@@ -250,6 +254,13 @@ pub struct ScanReport {
     /// only when false.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub complete: bool,
+    /// Folders never read because they sit on another filesystem than the
+    /// scanned root (a mount, or a network/FUSE share met below the root or
+    /// through a followed link). They are listed — as "not measured" — but
+    /// were never opened, so the totals stay lower bounds exactly like a
+    /// depth-limited scan; only the cause differs. 0 when nothing was cut.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub boundary_cuts: u64,
 }
 
 /// A group of byte-identical files (hard links to the same physical file are

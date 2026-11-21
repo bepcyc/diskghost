@@ -48,6 +48,13 @@ pub(crate) struct Node {
     /// Whether this directory's own listing was read (it was not cut off by
     /// the depth limit or a cancelled walk).
     pub(crate) listed: bool,
+    /// This directory was never read because it sits on another filesystem
+    /// than the walked root (a mount, or a network/FUSE share), or the walk
+    /// refused a remote cycle — listed but out of bounds, so its `size` is a
+    /// lower bound like a depth-limited folder's, only the cause differs.
+    pub(crate) boundary: bool,
+    /// Boundary-marked directories below this one (itself not counted).
+    pub(crate) bound_count: u64,
     /// Whether this directory and everything below it was read, so its totals
     /// are exact — set once the walk is done.
     complete: bool,
@@ -189,10 +196,11 @@ impl Builder {
         // walking the arena backwards visits every node before its parent.
         for id in (1..tree.nodes.len()).rev() {
             let node = &tree.nodes[id];
-            let (size, files, dirs, complete, parent) = (
+            let (size, files, dirs, bound, complete, parent) = (
                 node.size,
                 node.file_count,
                 node.dir_count + 1,
+                node.bound_count + u64::from(node.boundary),
                 node.complete,
                 node.parent,
             );
@@ -201,6 +209,7 @@ impl Builder {
                 pn.size += size;
                 pn.file_count += files;
                 pn.dir_count += dirs;
+                pn.bound_count += bound;
                 pn.complete &= complete;
             }
         }
@@ -358,6 +367,8 @@ impl Node {
             children: Vec::new(),
             files: Vec::new(),
             listed: false,
+            boundary: false,
+            bound_count: 0,
             complete: false,
         }
     }
@@ -679,6 +690,7 @@ impl ScanTree {
             disk_free: self.disk_free,
             cancelled: self.cancelled,
             complete: node.complete,
+            boundary_cuts: node.bound_count,
         }
     }
 
@@ -1072,6 +1084,93 @@ mod tests {
         assert!(ok.complete() && ok.root_report(10).complete);
         assert_eq!(ok.root_report(10).total_files, 1);
         assert_eq!(logical_total(&d), 10);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A mounted directory on another filesystem than `near`, if the host
+    /// has one — stands in for a foreign share; remote/FUSE mounts are
+    /// never touched (this test must not reach a real share).
+    #[cfg(target_os = "linux")]
+    fn foreign_mount(near: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let here = std::fs::metadata(near).unwrap().dev();
+        std::fs::read_to_string("/proc/self/mounts")
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace().skip(1);
+                let (path, fstype) = (f.next()?, f.next()?);
+                (!fstype.starts_with("fuse") && !crate::walk::is_remote_fs(fstype))
+                    .then_some(PathBuf::from(path))
+            })
+            .filter(|p| p != Path::new("/") && crate::is_mount_point(p))
+            .filter(|p| std::fs::read_dir(p).is_ok())
+            .find(|p| {
+                std::fs::metadata(p)
+                    .map(|m| m.dev() != here)
+                    .unwrap_or(false)
+            })
+    }
+
+    /// A folder cut by the filesystem boundary is "not measured" exactly
+    /// like a depth-limited one — but the report must say *why*, so the UI
+    /// can stop blaming every incomplete scan on the depth limit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boundary_cut_dirs_are_counted() {
+        let Some(mount) = foreign_mount(&std::env::temp_dir()) else {
+            return; // no second filesystem on this host
+        };
+        let d = tmpdir("boundary");
+        std::os::unix::fs::symlink(&mount, d.join("share")).unwrap();
+        let opts = Options {
+            follow_symlinks: true,
+            same_file_system: true,
+            ..Default::default()
+        };
+        let tree = ScanTree::build(&d, &opts, &Progress::default());
+        let r = tree.root_report(10);
+        assert!(!r.complete, "the foreign folder is never read");
+        let share = r
+            .children
+            .iter()
+            .find(|c| c.path.ends_with("share"))
+            .expect("the linked folder is still listed");
+        assert!(!share.complete);
+        assert_eq!(r.boundary_cuts, 1, "boundary-cause folders are counted");
+
+        // Depth cut, no boundary in play: the count stays 0.
+        let plain = tmpdir("boundary-depth");
+        write(&plain.join("a/1.bin"), &[0u8; 1]);
+        let opts = Options {
+            max_depth: Some(1),
+            ..Default::default()
+        };
+        let r = ScanTree::build(&plain, &opts, &Progress::default()).root_report(10);
+        assert!(!r.complete);
+        assert_eq!(r.boundary_cuts, 0);
+        std::fs::remove_dir_all(&plain).ok();
+
+        // The foreign folder read without the bound is not a boundary cut.
+        let opts = Options {
+            follow_symlinks: true,
+            max_depth: Some(2),
+            ..Default::default()
+        };
+        let r = ScanTree::build(&d, &opts, &Progress::default()).root_report(10);
+        assert_eq!(r.boundary_cuts, 0, "a walked folder is not a boundary cut");
+
+        // And the cause survives a snapshot round trip.
+        let snap = crate::Snapshot::capture(&tree);
+        let file = d.join("boundary.dgs");
+        snap.save(&file).unwrap();
+        let back = crate::Snapshot::load(&file).unwrap().to_tree().unwrap();
+        let r = back.root_report(10);
+        assert!(!r.complete);
+        assert_eq!(
+            r.boundary_cuts, 1,
+            "the boundary cause survives the snapshot"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
