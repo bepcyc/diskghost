@@ -26,6 +26,10 @@ pub(crate) struct Batch {
     pub(crate) modified: Vec<u64>,
     /// Subdirectories (also those not descended into because of `max_depth`).
     pub(crate) subdirs: Vec<PathBuf>,
+    /// The `subdirs` never descended into because they are out of bounds —
+    /// on another filesystem than the root, on a remote one, or a remote
+    /// cycle. Depth-limited folders are *not* here: theirs is a depth cut.
+    pub(crate) bound: Vec<PathBuf>,
     /// Entries neither counted nor followed: symlinks and junctions when links
     /// are not followed, sockets, devices. A delete still has to remove them.
     pub(crate) others: Vec<PathBuf>,
@@ -307,6 +311,7 @@ fn visit<'s, 'c: 's>(
         files: Vec::new(),
         modified: Vec::new(),
         subdirs: Vec::new(),
+        bound: Vec::new(),
         others: Vec::new(),
         skipped: 0,
     };
@@ -385,6 +390,9 @@ fn visit<'s, 'c: 's>(
             let in_bounds = !(ctx.same_file_system && foreign)
                 && !sub_dev.is_some_and(|d| ctx.remote.contains(&d))
                 && !(on_remote_root && looks_like_cycle(&path));
+            if descend && !in_bounds {
+                b.bound.push(path.clone());
+            }
             if descend && in_bounds {
                 let sub = path.clone();
                 s.spawn(move |s| visit(s, ctx, sub, child_depth, sub_dev));

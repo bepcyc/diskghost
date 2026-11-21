@@ -695,6 +695,7 @@ pub(crate) fn walk(
             files: Vec::new(),
             modified: Vec::new(),
             subdirs: Vec::new(),
+            bound: Vec::new(),
             others: Vec::new(),
             skipped: 0,
         };

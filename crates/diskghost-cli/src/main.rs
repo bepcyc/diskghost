@@ -570,10 +570,23 @@ fn print_scan(r: &ScanReport, max_depth: Option<usize>) {
     if r.cancelled {
         println!("  CANCELLED: partial result, the numbers cover only what was scanned");
     } else if !r.complete {
-        let limit = max_depth.map_or(String::new(), |m| format!(" (--max-depth {m})"));
-        println!(
-            "  DEPTH LIMIT{limit}: deeper folders were not read; ≥ marks a lower bound, ? a folder not measured"
-        );
+        if r.boundary_cuts > 0 {
+            println!(
+                "  BOUNDARY: {} folder(s) on other filesystems were listed but not read",
+                r.boundary_cuts
+            );
+        }
+        if max_depth.is_some() {
+            let limit = max_depth.map_or(String::new(), |m| format!(" (--max-depth {m})"));
+            println!(
+                "  DEPTH LIMIT{limit}: deeper folders were not read; ≥ marks a lower bound, ? a folder not measured"
+            );
+        }
+        if r.boundary_cuts == 0 && max_depth.is_none() {
+            println!(
+                "  INCOMPLETE: some folders were not read; ≥ marks a lower bound, ? a folder not measured"
+            );
+        }
     }
     println!();
 

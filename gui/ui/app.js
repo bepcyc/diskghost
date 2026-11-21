@@ -46,6 +46,7 @@ const I18N = {
     cancelling: "Cancelling…",
     cancelledNotice: "This scan was cancelled — every number covers only the part that was walked.",
     depthNotice: "Max depth: deeper folders were not read. ≥ marks a lower bound, “not measured” a folder that was not read at all — and only a complete scan can be compared.",
+    boundaryNotice: "Filesystem boundary: {n} folders on other filesystems (mounts, network or FUSE shares) were listed but not read. ≥ marks a lower bound, “not measured” a folder that was not read at all — and only a complete scan can be compared.",
     notMeasured: "not measured",
     kSize: "Size", kSizeOfUsed: "of the used space on", kSizeOfDisk: "of the disk",
     kFiles: "Files", kAvg: "avg", kPerFile: "per file",
@@ -157,6 +158,7 @@ const I18N = {
     cancelling: "Breche ab…",
     cancelledNotice: "Dieser Scan wurde abgebrochen — alle Zahlen decken nur den gescannten Teil ab.",
     depthNotice: "Max. Tiefe: Tiefere Ordner wurden nicht gelesen. ≥ markiert eine Untergrenze, „nicht gemessen“ einen Ordner, der gar nicht gelesen wurde — und vergleichen lässt sich nur ein vollständiger Scan.",
+    boundaryNotice: "Dateisystemgrenze: {n} Ordner auf anderen Dateisystemen (Einhängepunkte, Netzwerk- oder FUSE-Freigaben) wurden aufgelistet, aber nicht gelesen. ≥ markiert eine Untergrenze, „nicht gemessen“ einen Ordner, der gar nicht gelesen wurde — und vergleichen lässt sich nur ein vollständiger Scan.",
     notMeasured: "nicht gemessen",
     kSize: "Größe", kSizeOfUsed: "des belegten Platzes auf", kSizeOfDisk: "der Platte",
     kFiles: "Dateien", kAvg: "Ø", kPerFile: "pro Datei",
@@ -248,6 +250,12 @@ const lang = () => {
   return (navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en";
 };
 const t = (k) => I18N[lang()][k] ?? I18N.en[k] ?? k;
+// Why a scan is incomplete: cancelled, folders on other filesystems
+// (boundary cuts), or the depth limit — each gets its own notice.
+const partialNotice = (v) =>
+  v.cancelled ? t("cancelledNotice")
+    : v.boundary_cuts > 0 ? t("boundaryNotice").replace("{n}", num(v.boundary_cuts))
+    : t("depthNotice");
 const num = (n) => Number(n || 0).toLocaleString(lang() === "de" ? "de-DE" : "en-US");
 
 // Started as administrator: Explorer cannot drop into this window, so the
@@ -975,8 +983,8 @@ function scanView(j) {
     el("button", { type: "button", class: "small", onclick: () => enqueue("dupes", j.path) }, `👯 ${t("dupesHere")}`),
     el("button", { type: "button", class: "small", onclick: () => rescan(j) }, `↻ ${t("rescan")}`));
   view.append(el("div", { class: "full", style: { display: "flex", flexDirection: "column", gap: "12px" } },
-    head, v.cancelled ? el("div", { class: "notice", text: `⚠ ${t("cancelledNotice")}` })
-      : v.complete === false ? el("div", { class: "notice", text: `⚠ ${t("depthNotice")}` }) : null));
+    head, (v.cancelled || v.complete === false)
+      ? el("div", { class: "notice", text: `⚠ ${partialNotice(v)}` }) : null));
 
   view.append(kpiRow(j, v));
 
@@ -1407,7 +1415,7 @@ function sizesTab(v, body) {
 // Every complete scan is stored as a snapshot of its root (every folder and
 // file, compressed). Compare the folder on screen against an earlier one.
 async function changesTab(j, v, body, tools) {
-  if (j.partial) return body.append(el("div", { class: "muted", text: t(v.cancelled ? "cancelledNotice" : "depthNotice") }));
+  if (j.partial) return body.append(el("div", { class: "muted", text: partialNotice(v) }));
   if (!j.history) {
     try {
       j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || [];

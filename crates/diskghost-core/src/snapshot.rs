@@ -39,6 +39,11 @@ pub(crate) const ENTRY_DIR: u8 = 1;
 /// A directory whose contents were never read (the depth limit, or a
 /// cancelled walk). Readers before 0.12 take it for an ordinary directory.
 pub(crate) const ENTRY_UNREAD_DIR: u8 = 2;
+/// A directory never read because it sits outside the scan's filesystem
+/// bounds (a mount, or a network/FUSE share, or a remote cycle). Any
+/// `kind != ENTRY_FILE` is a directory to every reader, so older builds
+/// still see it — as an unread one.
+pub(crate) const ENTRY_FOREIGN_DIR: u8 = 3;
 
 /// Header flags.
 const FLAG_HAS_FILES: u64 = 1;
@@ -556,6 +561,8 @@ fn capture_node(tree: &ScanTree, id: usize, key: &mut Vec<u8>, enc: &mut Encoder
             key.extend_from_slice(child.name.as_encoded_bytes());
             let kind = if child.listed {
                 ENTRY_DIR
+            } else if child.boundary {
+                ENTRY_FOREIGN_DIR
             } else {
                 ENTRY_UNREAD_DIR
             };

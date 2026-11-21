@@ -15,7 +15,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use crate::snapshot::{ENTRY_DIR, ENTRY_FILE};
+use crate::snapshot::{ENTRY_DIR, ENTRY_FILE, ENTRY_FOREIGN_DIR};
 use crate::walk::{walk, Batch, Engine};
 use crate::{
     disk_space, DirSize, ExtStat, FileEntry, FileStats, Options, Progress, ScanReport, SizeBucket,
@@ -159,6 +159,9 @@ impl Builder {
                 continue;
             }
             let cid = self.push(id, name);
+            if batch.bound.iter().any(|p| p == &sub) {
+                self.tree.nodes[cid].boundary = true;
+            }
             self.pending.insert(sub, cid);
         }
 
@@ -441,6 +444,7 @@ impl ScanTree {
             if kind != ENTRY_FILE {
                 let id = b.push(parent, &name);
                 b.tree.nodes[id].listed = kind == ENTRY_DIR;
+                b.tree.nodes[id].boundary = kind == ENTRY_FOREIGN_DIR;
                 stack.push(id);
             } else {
                 let ext = b.ext_id(&name);
@@ -1192,6 +1196,7 @@ mod tests {
                 .collect(),
             modified: vec![0; files.len()],
             subdirs: subdirs.iter().map(PathBuf::from).collect(),
+            bound: Vec::new(),
             others: Vec::new(),
             skipped: 0,
         };
