@@ -1,19 +1,26 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Diskghost",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "identifier": "org.diskghost.app",
   "build": {
     "frontendDist": "../ui",
-    "beforeDevCommand": { "script": "node scripts/build-cli.mjs", "cwd": ".", "wait": true },
-    "beforeBuildCommand": { "script": "node scripts/build-cli.mjs", "cwd": "." }
+    "beforeDevCommand": {
+      "script": "node scripts/build-cli.mjs",
+      "cwd": ".",
+      "wait": true
+    },
+    "beforeBuildCommand": {
+      "script": "node scripts/build-cli.mjs",
+      "cwd": "."
+    }
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
-        "title": "Diskghost 👻",
+        "title": "Diskghost \ud83d\udc7b",
         "width": 1600,
         "height": 900,
         "minWidth": 1024,
@@ -36,12 +43,20 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/diskghost"],
+    "externalBin": [
+      "binaries/diskghost"
+    ],
     "windows": {
-      "nsis": { "installerHooks": "windows/hooks.nsh" },
+      "nsis": {
+        "installerHooks": "windows/hooks.nsh"
+      },
       "wix": {
-        "fragmentPaths": ["windows/cli-path.wxs"],
-        "featureGroupRefs": ["CliOnPathLink"]
+        "fragmentPaths": [
+          "windows/cli-path.wxs"
+        ],
+        "featureGroupRefs": [
+          "CliOnPathLink"
+        ]
       }
     }
   }
