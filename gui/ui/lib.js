@@ -215,6 +215,8 @@
     window_size: "auto",
     language: "auto",
     theme: "auto", // "auto" follows the OS; "dark" | "light" pin it
+    drive_view: "flat", // sidebar drives: "flat" list | "tree" grouped by media
+    remotes: [], // remembered ssh:// scan roots: [{ url, label }]
   };
 
   // Saved settings over the defaults: unknown keys are dropped, wrong types
@@ -243,6 +245,12 @@
     if (["auto", "maximized", "1080p", "1440p", "4k"].includes(saved.window_size)) s.window_size = saved.window_size;
     if (["auto", "en", "de"].includes(saved.language)) s.language = saved.language;
     if (["auto", "dark", "light"].includes(saved.theme)) s.theme = saved.theme;
+    if (["flat", "tree"].includes(saved.drive_view)) s.drive_view = saved.drive_view;
+    if (Array.isArray(saved.remotes)) {
+      s.remotes = saved.remotes
+        .filter((r) => r && typeof r.url === "string" && r.url.startsWith("ssh://"))
+        .map((r) => ({ url: r.url, label: typeof r.label === "string" ? r.label : "" }));
+    }
     return s;
   }
 
@@ -364,6 +372,42 @@
         return { ...g, files, wasted: g.size * Math.max(0, files.length - 1) };
       })
       .filter((g) => g.files.length > 1);
+  }
+
+  // The media bucket a drive row falls into for the tree view: the
+  // backend reports `ssd`/`hdd`; a remembered remote or a network drive
+  // is `remote`; anything unlabeled lands in `other`.
+  function driveMedia(d) {
+    if (d && typeof d.media === "string" && MEDIA_ORDER.includes(d.media)) return d.media;
+    return d && d.kind === "network" ? "remote" : "other";
+  }
+
+  // Tree order of the media groups: solid state first, then spinning
+  // disks, then remote locations, then whatever could not be told.
+  const MEDIA_ORDER = ["ssd", "hdd", "remote", "other"];
+  const MEDIA_LABEL_KEY = { ssd: "grpSsd", hdd: "grpHdd", remote: "grpRemote", other: "grpOther" };
+
+  // `drives` folded into media groups for the tree view — empty groups
+  // are dropped, items keep the backend's order.
+  function groupDrives(drives) {
+    const out = MEDIA_ORDER.map((key) => ({ key, labelKey: MEDIA_LABEL_KEY[key], items: [] }));
+    for (const d of drives || []) out[MEDIA_ORDER.indexOf(driveMedia(d))].items.push(d);
+    return out.filter((g) => g.items.length > 0);
+  }
+
+  // A remembered ssh:// scan root rendered like a drive row: the label
+  // is the host so the row reads "nas" not a bare URL.
+  function remoteDrive(r) {
+    const host = String(r.url).match(/^ssh:\/\/([^/]+)/)?.[1] || "";
+    return {
+      path: r.url,
+      label: r.label || host,
+      fs: "ssh",
+      kind: "network",
+      media: "remote",
+      total: 0,
+      free: 0,
+    };
   }
 
   // The drive a path lives on ("c:", "\\server\share", "/"), for scheduling.
@@ -503,7 +547,7 @@
     partialCauses, dupesOutcome, latestOnly, clampInt, reclaimPlan,
     human, humanDelta, unmeasured, sizeText, countText, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
-    categorize, bucketLabel, jobsToStart, driveKey, mapItems, parentPath, isUnder, SETTINGS_VERSION,
+    categorize, bucketLabel, jobsToStart, driveKey, driveMedia, groupDrives, remoteDrive, mapItems, parentPath, isUnder, SETTINGS_VERSION,
     isProtectedPath, folderSets, protectedExcludes, dropReclaimed,
   };
 });

@@ -310,6 +310,10 @@ kbd {
 .hint { margin-top: auto; }
 
 .drives { display: flex; flex-direction: column; gap: var(--space-3xs); }
+.drive-group { display: flex; align-items: center; gap: var(--space-2xs); margin-top: var(--space-xs); padding-inline: var(--space-2xs); font-size: var(--text-xs); font-weight: var(--weight-strong); color: var(--color-muted); text-transform: uppercase; letter-spacing: .04em; }
+.drive-group:first-child { margin-top: 0; }
+.drive-group > .ic { color: var(--color-muted); }
+.drive-group-n { margin-left: auto; }
 .drive {
   display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--space-3xs) var(--space-xs);
   height: auto; padding: var(--space-xs); text-align: left; justify-content: stretch;

@@ -381,18 +381,22 @@ function renderSettings() {
 
 // --------------------------------- drives ---------------------------------
 async function loadDrives() {
+  let local = [];
   try {
-    drives = await invoke("list_drives");
+    local = await invoke("list_drives");
   } catch (e) {
-    drives = [];
     status(`${t("drivesFailed")} ${errText(e)}`, true);
   }
+  drives = [...local, ...settings.remotes.map(lib.remoteDrive)];
   renderDrives();
   if (!active()) renderMain();
 }
 
 const kindLabel = (k) => t({ fixed: "kindFixed", removable: "kindRemovable", network: "kindNetwork" }[k] || "kindOther");
-const driveIcon = (k) => ({ removable: "usb", network: "network" }[k] || "drive");
+// Row and group icons follow the media type (ssd chip, hdd platter,
+// remote host); a removable drive keeps its usb plug.
+const mediaIcon = (m) => ({ ssd: "ssd", hdd: "hdd", remote: "network" }[m] || "drive");
+const driveIcon = (d) => (d.media ? mediaIcon(lib.driveMedia(d)) : { removable: "usb", network: "network" }[d.kind] || "drive");
 const driveName = (d) => (d.label && d.label !== baseName(d.path) ? `${d.path.replace(/\\$/, "")} ${d.label}` : d.path);
 
 function driveTip(d) {
@@ -407,17 +411,45 @@ function driveTip(d) {
 function driveRow(d) {
   const used = d.total - d.free;
   const b = el("button", { type: "button", class: "drive", onclick: () => enqueue("scan", d.path), "aria-label": `${t("scan")} ${driveName(d)}` },
-    icon(driveIcon(d.kind)),
+    icon(driveIcon(d)),
     el("span", { class: "drive-name", text: driveName(d) }),
-    el("span", { class: "drive-free num", text: `${human(d.free)} ${t("free")}` }),
+    el("span", { class: "drive-free num", text: d.total ? `${human(d.free)} ${t("free")}` : d.fs }),
     bar(used / d.total, used / d.total > 0.9 ? "is-hot" : ""));
   tip(b, driveTip(d));
   return b;
 }
 
 function renderDrives() {
-  $("drives").replaceChildren(...drives.map(driveRow));
+  const box = $("drives");
+  if (settings.drive_view === "tree") {
+    const out = [];
+    for (const g of lib.groupDrives(drives)) {
+      out.push(
+        el("div", { class: "drive-group", role: "heading", "aria-level": "3" },
+          icon(mediaIcon(g.key)),
+          el("span", { class: "drive-group-name", text: t(g.labelKey) }),
+          el("span", { class: "drive-group-n num", text: String(g.items.length) })),
+      );
+      for (const d of g.items) out.push(driveRow(d));
+    }
+    box.replaceChildren(...out);
+  } else {
+    box.replaceChildren(...drives.map(driveRow));
+  }
+  const bv = $("btn-drive-view");
+  bv.replaceChildren(icon(settings.drive_view === "tree" ? "list" : "tree"));
+  bv.title = t(settings.drive_view === "tree" ? "viewFlat" : "viewTree");
+  bv.setAttribute("aria-label", bv.title);
+  bv.setAttribute("aria-pressed", String(settings.drive_view === "tree"));
   $("btn-scan-all").disabled = drives.length === 0;
+}
+
+// A finished ssh:// scan is remembered as a remote drive row, deduped by
+// its URL, so the host can be re-scanned from the sidebar.
+function rememberRemote(root) {
+  if (!root.startsWith("ssh://") || settings.remotes.some((r) => r.url === root)) return;
+  settings.remotes.push({ url: root, label: root.match(/^ssh:\/\/([^/]+)/)?.[1] || "" });
+  saveSettings();
 }
 
 // ---------------------------------- jobs ----------------------------------
@@ -538,7 +570,10 @@ async function runJob(j) {
   }
   renderFor(j);
   pump();
-  if (j.kind === "scan" && j.state === "done") loadDrives();
+  if (j.kind === "scan" && j.state === "done") {
+    rememberRemote(j.root);
+    loadDrives();
+  }
 }
 
 async function cancelJob(j) {
@@ -813,7 +848,7 @@ function welcomeView() {
   const rows = drives.map((d) => {
     const used = d.total - d.free;
     return el("tr", {},
-      el("td", { class: "cell-name" }, el("span", { class: "with-ic" }, icon(driveIcon(d.kind)), el("span", { text: driveName(d) }))),
+      el("td", { class: "cell-name" }, el("span", { class: "with-ic" }, icon(driveIcon(d)), el("span", { text: driveName(d) }))),
       el("td", { class: "muted", text: kindLabel(d.kind) }),
       el("td", { class: "cell-bar" }, bar(used / d.total, used / d.total > 0.9 ? "is-hot" : "")),
       el("td", { class: "num", text: `${human(d.free)} ${t("free")}` }),
@@ -1832,6 +1867,11 @@ $("btn-settings").addEventListener("click", () => openSettings());
 $("btn-excludes").addEventListener("click", () => openSettings(true));
 $("btn-scan-all").addEventListener("click", () => drives.forEach((d, i) => enqueue("scan", d.path, { select: i === 0 })));
 $("btn-drives-refresh").addEventListener("click", loadDrives);
+$("btn-drive-view").addEventListener("click", () => {
+  settings.drive_view = settings.drive_view === "tree" ? "flat" : "tree";
+  saveSettings();
+  renderDrives();
+});
 $("btn-clear-done").addEventListener("click", () => {
   for (const j of jobs.filter((x) => ["done", "cancelled", "error"].includes(x.state) && !x.loading)) closeJob(j);
 });

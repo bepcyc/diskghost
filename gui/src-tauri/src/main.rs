@@ -803,6 +803,9 @@ struct Drive {
     fs: String,
     /// `fixed`, `removable`, `network` or `other`.
     kind: String,
+    /// Physical media: `ssd`, `hdd`, `remote` or `other` — the sidebar's
+    /// tree view groups drives by it.
+    media: String,
     total: u64,
     free: u64,
 }
@@ -878,6 +881,11 @@ fn drives() -> Vec<Drive> {
             label: if ok { text(&name) } else { String::new() },
             fs: if ok { text(&fs) } else { String::new() },
             kind: kind.into(),
+            media: if kind == "network" {
+                "remote".into()
+            } else {
+                drive_media(diskghost_core::is_rotational(Path::new(&path))).into()
+            },
             path,
             total,
             free,
@@ -903,12 +911,16 @@ fn drives() -> Vec<Drive> {
                 };
                 (p, String::new(), kind)
             })
+            .map(|(p, fs, kind)| {
+                let media = drive_media(diskghost_core::is_rotational(&p));
+                (p, fs, kind, media)
+            })
             .collect()
     } else {
-        drive_list(&mounts)
+        drive_list(&mounts, &diskghost_core::is_rotational)
     };
     list.into_iter()
-        .map(|(p, fs, kind)| {
+        .map(|(p, fs, kind, media)| {
             let (total, free) = disk_space(&p);
             Drive {
                 label: p
@@ -917,6 +929,7 @@ fn drives() -> Vec<Drive> {
                     .unwrap_or_default(),
                 fs,
                 kind: kind.into(),
+                media: media.into(),
                 path: p.to_string_lossy().into_owned(),
                 total,
                 free,
@@ -996,9 +1009,13 @@ fn agent_binary() -> Option<diskghost_core::remote::AgentBinary> {
 
 /// The drives to offer for the real local filesystems `mounts`: `/` first
 /// (always, even when the table names it differently), then the others by
-/// mount point. (path, filesystem type, kind).
+/// mount point. (path, filesystem type, kind, media). `rotational` is the
+/// per-mount spin probe — injected so tests need no real disks.
 #[cfg(unix)]
-fn drive_list(mounts: &[diskghost_core::LocalMount]) -> Vec<(PathBuf, String, &'static str)> {
+fn drive_list(
+    mounts: &[diskghost_core::LocalMount],
+    rotational: &dyn Fn(&Path) -> bool,
+) -> Vec<(PathBuf, String, &'static str, &'static str)> {
     let root = Path::new("/");
     let root_fs = mounts
         .iter()
@@ -1008,17 +1025,37 @@ fn drive_list(mounts: &[diskghost_core::LocalMount]) -> Vec<(PathBuf, String, &'
     let mut rest: Vec<&diskghost_core::LocalMount> =
         mounts.iter().filter(|m| m.mount_point != root).collect();
     rest.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
-    std::iter::once((root.to_path_buf(), root_fs, "fixed"))
-        .chain(rest.into_iter().map(|m| {
-            let p = &m.mount_point;
-            let kind = if p.starts_with("/media") || p.starts_with("/run/media") {
-                "removable"
-            } else {
-                "other"
-            };
-            (p.clone(), m.fstype.clone(), kind)
-        }))
-        .collect()
+    std::iter::once((
+        root.to_path_buf(),
+        root_fs,
+        "fixed",
+        drive_media(rotational(root)),
+    ))
+    .chain(rest.into_iter().map(|m| {
+        let p = &m.mount_point;
+        let kind = if p.starts_with("/media") || p.starts_with("/run/media") {
+            "removable"
+        } else {
+            "other"
+        };
+        (
+            p.clone(),
+            m.fstype.clone(),
+            kind,
+            drive_media(rotational(p)),
+        )
+    }))
+    .collect()
+}
+
+/// Media label for the sidebar grouping: spinning disks are `hdd`,
+/// anything else — solid state, virtual, unknown — is `ssd`.
+fn drive_media(rotational: bool) -> &'static str {
+    if rotational {
+        "hdd"
+    } else {
+        "ssd"
+    }
 }
 
 /// Where the UI's settings are kept.
@@ -1203,11 +1240,11 @@ mod tests {
         // The media label follows the drive's own rotational flag, not its
         // mount point or filesystem: the injected probe names /data spinning.
         let rot = |p: &Path| p == Path::new("/data");
-        let got = drive_list(
-            &[mount(1, "/", "ext4"), mount(2, "/data", "ext4")],
-            &rot,
+        let got = drive_list(&[mount(1, "/", "ext4"), mount(2, "/data", "ext4")], &rot);
+        assert_eq!(
+            got[1],
+            (PathBuf::from("/data"), "ext4".into(), "other", "hdd")
         );
-        assert_eq!(got[1], (PathBuf::from("/data"), "ext4".into(), "other", "hdd"));
         assert_eq!(got[0].3, "ssd");
     }
 
@@ -1218,10 +1255,7 @@ mod tests {
         // is not `/`, so `local_mounts` drops it — `/` must stay listed.
         let ssd = |_: &Path| false;
         let got = drive_list(&[mount(2, "/d/models2", "ext4")], &ssd);
-        assert_eq!(
-            got[0],
-            (PathBuf::from("/"), String::new(), "fixed", "ssd")
-        );
+        assert_eq!(got[0], (PathBuf::from("/"), String::new(), "fixed", "ssd"));
         assert_eq!(got.len(), 2);
         assert_eq!(
             drive_list(&[], &ssd),
