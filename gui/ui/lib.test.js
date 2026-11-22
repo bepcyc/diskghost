@@ -501,3 +501,23 @@ test("app.js uses the lib helpers as bare globals", () => {
   for (const name of ["remoteDrive", "driveMedia", "groupDrives"])
     assert.equal(typeof lib[name], "function", `${name} must be exported`);
 });
+
+// A scan's "% of used space" estimate compares logical bytes found to the
+// drive's physically used space. On compressing filesystems (btrfs, zfs,
+// bcachefs) logical > physical, so the estimate saturates at the 99% cap
+// early and looks frozen — there it must honestly report "no estimate".
+test("estimateScan: a drive-root estimate, honest on compressing filesystems", () => {
+  const ext4 = { fs: "ext4", total: 200, free: 100 };
+  assert.equal(lib.estimateScan(50, ext4), 0.5);
+  assert.equal(lib.estimateScan(500, ext4), 0.99);
+  for (const fs of ["btrfs", "zfs", "bcachefs", "BTRFS"])
+    assert.equal(lib.estimateScan(50, { ...ext4, fs }), null, fs);
+  assert.equal(lib.estimateScan(50, { ...ext4, free: 200 }), null);
+  assert.equal(lib.estimateScan(50, null), null);
+});
+
+test("exceedsUsed marks scans larger than the physical used space", () => {
+  assert.equal(lib.exceedsUsed(102, 100), true);
+  assert.equal(lib.exceedsUsed(100, 100), false);
+  assert.equal(lib.exceedsUsed(10, 0), false);
+});

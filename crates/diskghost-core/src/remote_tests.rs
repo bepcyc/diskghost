@@ -1979,3 +1979,98 @@ fn the_agent_tier_and_the_shell_tier_build_the_same_tree() {
     assert_eq!(rs.total_dirs, 2);
     assert!(ts.complete() && ta.complete());
 }
+
+// ---- live progress while a remote listing streams --------------------
+
+/// Delivers its stdout in `chunks` through `exec_live` and records the
+/// progress counter after every chunk: a streamed listing must count what
+/// arrived so far, not only store totals at the end.
+struct Chunked {
+    chunks: Vec<Vec<u8>>,
+    progress: Progress,
+    seen: std::sync::Mutex<Vec<u64>>,
+}
+
+impl RemoteExec for Chunked {
+    fn exec(&self, _argv: &[&str]) -> io::Result<ExecOut> {
+        Err(io::Error::other("Chunked answers exec_live only"))
+    }
+    fn exec_live(
+        &self,
+        _argv: &[&str],
+        _stdin: Option<&[u8]>,
+        on_chunk: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<ExecOut> {
+        let mut all = Vec::new();
+        for ch in &self.chunks {
+            all.extend_from_slice(ch);
+            on_chunk(ch);
+            self.seen.lock().unwrap().push(self.progress.files());
+        }
+        Ok(ExecOut {
+            stdout: all,
+            stderr: Vec::new(),
+            code: 0,
+        })
+    }
+}
+
+#[test]
+fn a_streamed_find_listing_ticks_progress_as_records_arrive() {
+    let rec = |p: &str, s: u64| format!("{s}\t1700000000\t9\t/r/{p}\0").into_bytes();
+    let progress = Progress::default();
+    let x = Chunked {
+        chunks: vec![rec("a.bin", 5), rec("b.bin", 7)],
+        progress: progress.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let caps = Capabilities {
+        os: "Linux".into(),
+        tools: vec![],
+        find_printf: true,
+        stat: StatFlavor::Gnu,
+        hash: HashAlgo::Md5,
+    };
+    let l = enum_remote_live(&x, &caps, "/r", &progress).unwrap();
+    assert_eq!(l.files.len(), 2);
+    // The progress counter already held the first chunk's record.
+    assert_eq!(*x.seen.lock().unwrap(), vec![1, 2]);
+    assert_eq!((progress.files(), progress.bytes()), (2, 12));
+}
+
+#[test]
+fn an_agent_enumerate_ticks_progress_per_file_frame() {
+    let progress = Progress::default();
+    let f1 = r#"{"f":{"p":"a.bin","s":5,"m":7,"i":9}}"#;
+    let f2 = r#"{"f":{"p":"b.bin","s":7,"m":7,"i":10}}"#;
+    let x = Chunked {
+        chunks: vec![
+            format!("{f1}\n").into_bytes(),
+            format!("{f2}\n{{\"end\":{{\"n\":2,\"complete\":true}}}}\n").into_bytes(),
+        ],
+        progress: progress.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let a = AgentExec {
+        exec: &x,
+        agent: "agent".into(),
+    };
+    let l = a.enumerate_live("/r", &progress).unwrap();
+    assert_eq!(l.files.len(), 2);
+    assert_eq!(*x.seen.lock().unwrap(), vec![1, 2]);
+    assert_eq!((progress.files(), progress.bytes()), (2, 12));
+}
+
+#[test]
+fn a_live_listing_on_real_tools_ends_with_exact_counts() {
+    let e = Estate::new("remote-live-exec");
+    let root = e.loc("r");
+    write(&root.join("a.bin"), &content(1));
+    write(&root.join("b.bin"), &content(2));
+    let c = probe(&LocalExec).unwrap();
+    let p = Progress::default();
+    let l = enum_remote_live(&LocalExec, &c, root.to_str().unwrap(), &p).unwrap();
+    assert_eq!(l.files.len(), 2);
+    assert_eq!(p.files(), 2);
+    assert_eq!(p.bytes(), l.files.iter().map(|f| f.size).sum::<u64>());
+}
