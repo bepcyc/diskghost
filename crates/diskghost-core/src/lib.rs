@@ -47,7 +47,7 @@ pub use index::{
 };
 pub use index_report::{
     index_dupes, GroupCopy, HashStats, IndexDupesReport, IndexGroup, IndexReportOptions,
-    LocationSingles, ReportLocation, Suggest,
+    LocationSingles, ReportLocation, Suggest, Unverifiable, UnverifiableCopy,
 };
 pub use plan::{make_plan, Plan, PLAN_VERSION};
 pub use policy::{Distinct, Policy};

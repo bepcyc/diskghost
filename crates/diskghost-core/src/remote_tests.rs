@@ -859,3 +859,32 @@ fn every_remote_command_of_a_whole_run_is_read_only() {
         }
     }
 }
+
+#[test]
+fn the_real_fallback_commands_list_a_local_folder_without_printf() {
+    use std::os::unix::fs::MetadataExt;
+    let e = Estate::new("remote-local-fallback");
+    let root = e.loc("r");
+    write(&root.join("a.bin"), &content(1));
+    write(&root.join("sub dir/it's\nb.bin"), &content(2));
+    let mut c = probe(&LocalExec).unwrap();
+    if c.stat != StatFlavor::Gnu {
+        return; // this machine's stat is not GNU-style: nothing to run
+    }
+    c.find_printf = false; // force `-print0` + the real STAT_SCRIPT
+    let mut l = enum_remote(&LocalExec, &c, root.to_str().unwrap()).unwrap();
+    assert!(l.complete);
+    assert_eq!(l.skipped, 0);
+    l.files.sort_by(|a, b| a.path.cmp(&b.path));
+    let names: Vec<&str> = l.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(names, ["a.bin", "sub dir/it's\nb.bin"]);
+    for f in &l.files {
+        let m = std::fs::metadata(root.join(&f.path)).unwrap();
+        assert_eq!((f.size, f.ino), (m.len(), m.ino()));
+        assert_eq!(
+            f.mtime_ns,
+            m.mtime() as u64 * 1_000_000_000,
+            "whole seconds"
+        );
+    }
+}
