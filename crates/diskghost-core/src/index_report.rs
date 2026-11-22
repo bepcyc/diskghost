@@ -182,40 +182,41 @@ pub(crate) fn report_with(
     let buckets = by_size(&phys);
 
     // 3. Whole-file hashes, only where a copy is still possible.
+    // Planned files only — all reachable, so no two share a path (an
+    // offline volume's last root may well be a reachable one's mountpoint:
+    // its rows must never take a hash read from another disk).
     let mut items = Vec::new();
+    let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     for members in buckets.values() {
         for &p in members {
             if needs_full(&phys, members, p) {
                 let r = &rows[phys[p].rows[0]];
-                items.push(HashItem {
-                    path: abs(&locs[r.loc].root, &r.path),
-                    size: phys[p].size,
-                    rotational: locs[r.loc].rotational,
-                    location: r.loc,
-                });
+                let path = abs(&locs[r.loc].root, &r.path);
+                if by_path.insert(path.clone(), p).is_none() {
+                    items.push(HashItem {
+                        path,
+                        size: phys[p].size,
+                        rotational: locs[r.loc].rotational,
+                        location: r.loc,
+                    });
+                }
             }
-        }
-    }
-    let mut by_path: HashMap<PathBuf, Vec<usize>> = HashMap::new();
-    for members in buckets.values() {
-        for &p in members {
-            let r = &rows[phys[p].rows[0]];
-            by_path
-                .entry(abs(&locs[r.loc].root, &r.path))
-                .or_default()
-                .push(p);
         }
     }
     let hashed = hash_all(items, &stats, progress, probe);
     let mut unreadable = 0u64;
     for (path, h) in hashed {
-        for &p in by_path.get(&path).map(Vec::as_slice).unwrap_or_default() {
+        if let Some(&p) = by_path.get(&path) {
             match h {
                 Some(full) => {
                     phys[p].full = Some(full);
+                    // Every reachable name of that inode; an offline name
+                    // keeps what it had (it was not read).
                     for &r in &phys[p].rows {
-                        rows[r].full = Some(full);
-                        rows[r].dirty = true;
+                        if locs[rows[r].loc].available {
+                            rows[r].full = Some(full);
+                            rows[r].dirty = true;
+                        }
                     }
                 }
                 None => {
