@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use diskghost_core::{
     diff, disk_space, find_duplicates_cached, is_mount_point, reclaim, remove_path, validate_globs,
     DiffReport, DirSize, DupGroup, FileStats, HashCache, Options, Progress, ReclaimAction,
-    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
+    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager};
@@ -546,13 +546,17 @@ async fn find_dupes(
             slot.get_or_insert_with(|| Arc::new(HashCache::load(&file)))
                 .clone()
         };
-        let groups = find_duplicates_cached(
-            &p,
-            mb * 1024 * 1024,
-            &opts.to_options(),
-            &running.progress,
-            &cache,
-        );
+        // Checkpoint hashes.bin while the search runs, so a crash or kill
+        // keeps what it hashed; the checkpoint thread ends with the search.
+        let groups = cache.checkpoint_while(&file, CHECKPOINT_INTERVAL, || {
+            find_duplicates_cached(
+                &p,
+                mb * 1024 * 1024,
+                &opts.to_options(),
+                &running.progress,
+                &cache,
+            )
+        });
         drop(running);
         // Persist in the background; the result is shown right away.
         std::thread::spawn(move || {

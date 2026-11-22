@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
     diff, find_duplicates_cached, format_timestamp, human_delta, human_size, phase, reclaim,
     remove_path, validate_globs, DiffReport, DupGroup, HashCache, Options, Progress, ReclaimAction,
-    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
+    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
 };
 use serde::Serialize;
 
@@ -342,7 +342,14 @@ fn main() -> ExitCode {
             let opts = walk.to_options();
             let hashes = cache.as_deref().map(HashCache::load).unwrap_or_default();
             let groups = with_progress(|p| {
-                find_duplicates_cached(&path, min_mb * 1024 * 1024, &opts, p, &hashes)
+                let search =
+                    || find_duplicates_cached(&path, min_mb * 1024 * 1024, &opts, p, &hashes);
+                // Checkpoint the cache while the search runs, so an
+                // interrupted search keeps what it hashed.
+                match &cache {
+                    Some(file) => hashes.checkpoint_while(file, CHECKPOINT_INTERVAL, search),
+                    None => search(),
+                }
             });
             // With --json, warnings go into the output instead of stderr.
             let mut warnings = Vec::new();

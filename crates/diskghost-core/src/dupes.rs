@@ -12,15 +12,17 @@
 //!
 //! A [`HashCache`] remembers identity and hashes by path, size and
 //! modification time, so searching the same place again reads only files
-//! that changed.
+//! that changed. A running search hands what it learns to the cache every
+//! [`MERGE_INTERVAL`], so a frontend saving the cache meanwhile (see
+//! [`HashCache::checkpoint_while`]) keeps a killed or crashed search's work.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
@@ -49,11 +51,15 @@ const PARALLEL_HASH_MIN: u64 = 64 << 20;
 const CACHE_MAGIC: &[u8; 8] = b"DGHASH01";
 
 /// How often a running search hands what it has learned to the shared
-/// [`HashCache`].
+/// [`HashCache`] — one batch per interval, never one lock per file. Kept well
+/// below [`CHECKPOINT_INTERVAL`] so each checkpoint sees recent work.
 pub const MERGE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How often a frontend writes the [`HashCache`] to disk while a search runs
-/// (see [`HashCache::checkpoint_while`]).
+/// (see [`HashCache::checkpoint_while`]). A kill or crash loses at most about
+/// this plus [`MERGE_INTERVAL`] of hashing; a shorter interval would rewrite
+/// a cache of possibly hundreds of MB more often for little gain on a search
+/// that runs for hours.
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What is known about one file's content.
@@ -74,9 +80,19 @@ struct Known {
 /// Hashes of files seen by earlier duplicate searches, keyed by path. Share
 /// one between searches (it is internally synchronised) and persist it with
 /// [`HashCache::save`] / [`HashCache::load`].
+///
+/// Locking order: `saved` before `entries`, never the other way round.
+/// Lookups and merges take only `entries`; a save holds `saved` throughout
+/// and `entries` only while it encodes, so a checkpoint racing a running
+/// search cannot deadlock and saves never interleave.
 #[derive(Default)]
 pub struct HashCache {
     entries: Mutex<HashMap<PathBuf, Known>>,
+    /// Bumped (while `entries` is held) whenever an entry changes.
+    generation: AtomicU64,
+    /// The `generation` last written by a save; held for a whole save so
+    /// saves run one at a time and the newest knowledge is written last.
+    saved: Mutex<u64>,
 }
 
 impl HashCache {
@@ -111,25 +127,54 @@ impl HashCache {
         if let Ok(mut e) = self.entries.lock() {
             e.retain(|p, _| !p.starts_with(root));
             e.extend(fresh);
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Add `fresh` to what is known, replacing older entries for the same
-    /// paths; everything else stays.
+    /// paths; everything else stays. Unlike [`HashCache::replace_under`] it
+    /// never forgets, so it is safe to call while a search is half done.
     fn merge(&self, fresh: Vec<(PathBuf, Known)>) {
-        let _ = fresh; // RED stub
+        if fresh.is_empty() {
+            return;
+        }
+        if let Ok(mut e) = self.entries.lock() {
+            let mut changed = false;
+            for (p, k) in fresh {
+                changed |= e.insert(p, k) != Some(k);
+            }
+            if changed {
+                self.generation.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
-    /// [`HashCache::save`], skipped when nothing changed since the last save.
-    /// Returns whether the file was written.
+    /// [`HashCache::save`], skipped when nothing changed since the last save
+    /// (to any file) or since [`HashCache::load`]. Returns whether the file
+    /// was written.
     pub fn save_if_changed(&self, path: &Path) -> std::io::Result<bool> {
-        self.save(path).map(|()| true) // RED stub
+        self.save_inner(path, true)
     }
 
-    /// Run `job`, saving the cache to `path` every `every` meanwhile.
+    /// Run `job` while a scoped thread saves the cache to `path` every
+    /// `every` (only when it changed, see [`HashCache::save_if_changed`]) —
+    /// the frontend side of incremental checkpoints. The thread stops as soon
+    /// as `job` returns or panics and is joined before this returns (at worst
+    /// after the save it is in the middle of). Checkpoint errors are ignored:
+    /// the caller's final [`HashCache::save`] reports a lasting problem.
     pub fn checkpoint_while<T>(&self, path: &Path, every: Duration, job: impl FnOnce() -> T) -> T {
-        let _ = (path, every); // RED stub
-        job()
+        let (stop, stopped) = mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                // Dropping `stop` (job done or unwinding) ends the wait at once.
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                    let _ = self.save_if_changed(path);
+                }
+            });
+            let out = job();
+            drop(stop);
+            out
+        })
     }
 
     /// Read a cache written by [`HashCache::save`]. A missing, foreign or
@@ -186,12 +231,23 @@ impl HashCache {
         Ok(map)
     }
 
-    /// Write the cache (zstd-compressed), replacing `path` atomically.
+    /// Write the cache (zstd-compressed), replacing `path` atomically: the
+    /// bytes go to a temporary file next to it, are flushed to disk and only
+    /// then renamed over `path`, so a crash at any moment leaves either the
+    /// old or the new cache, never a torn one. Concurrent saves (a checkpoint
+    /// timer and a final save) are serialised.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let entries = self
-            .entries
-            .lock()
-            .map_err(|_| std::io::Error::other("hash cache poisoned"))?;
+        self.save_inner(path, false).map(|_| ())
+    }
+
+    fn save_inner(&self, path: &Path, only_if_changed: bool) -> std::io::Result<bool> {
+        let poisoned = || std::io::Error::other("hash cache poisoned");
+        let mut saved = self.saved.lock().map_err(|_| poisoned())?;
+        let entries = self.entries.lock().map_err(|_| poisoned())?;
+        let generation = self.generation.load(Ordering::Relaxed);
+        if only_if_changed && generation == *saved {
+            return Ok(false);
+        }
         let mut raw = Vec::with_capacity(entries.len() * 96);
         let named: Vec<(&str, &Known)> = entries
             .iter()
@@ -218,13 +274,53 @@ impl HashCache {
         drop(entries);
         let mut out = CACHE_MAGIC.to_vec();
         out.extend(zstd::bulk::compress(&raw, 3)?);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("tmp");
-        std::fs::File::create(&tmp)?.write_all(&out)?;
-        std::fs::rename(tmp, path)
+        write_atomically(path, &out)?;
+        *saved = generation;
+        Ok(true)
     }
+}
+
+/// Replace `path` with `bytes` so that a crash or power loss at any point
+/// leaves either the old or the new content: write a temporary file in the
+/// same directory, flush it to disk, rename it over `path`, then (on Unix)
+/// flush the directory so the rename itself is durable. The temporary name
+/// is unique per process and call; it is removed again if anything fails.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("hash cache path has no file name"))?
+        .to_os_string();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = path.with_file_name(name);
+    let written = (|| {
+        let mut f = std::fs::File::create_new(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
+    }
+    // The new content is in place; making the rename survive a power cut is
+    // best effort (some filesystems cannot sync a directory).
+    #[cfg(unix)]
+    if let Some(dir) = dir {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// One same-size candidate.
@@ -329,18 +425,55 @@ fn full_hash(path: &Path, size: u64) -> Option<[u8; 32]> {
     Some(*h.finalize().as_bytes())
 }
 
-/// Run `run` with a sender for learned entries, merging them into `cache`.
+/// Run `run` on a scoped thread, handing it a sender for the entries it
+/// learns, while the calling thread merges them into `cache`: in one batch at
+/// most `every` after the oldest unmerged entry arrived (at once for
+/// [`Duration::ZERO`]), and whatever is left when `run` is done. Workers thus
+/// pay a channel send per file, never the cache lock — a per-file lock on the
+/// shared cache serialises the parallel phases into a convoy. With nothing
+/// pending the merger sleeps on the channel instead of waking on a timer.
 fn with_merger<R: Send>(
     cache: &HashCache,
     every: Duration,
     run: impl FnOnce(Sender<(PathBuf, Known)>) -> R + Send,
 ) -> R {
-    let _ = (cache, every); // RED stub
-    let (tx, _rx) = mpsc::channel();
-    run(tx)
+    let (learned, arrivals) = mpsc::channel();
+    std::thread::scope(|s| {
+        let worker = s.spawn(move || run(learned));
+        let mut batch = Vec::new();
+        let mut due = Instant::now();
+        loop {
+            let next = if batch.is_empty() {
+                arrivals.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            } else {
+                arrivals.recv_timeout(due.saturating_duration_since(Instant::now()))
+            };
+            match next {
+                Ok(entry) => {
+                    if batch.is_empty() {
+                        due = Instant::now() + every;
+                    }
+                    batch.push(entry);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                // Every sender is gone: `run` returned or unwound.
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            if !batch.is_empty() && Instant::now() >= due {
+                cache.merge(std::mem::take(&mut batch));
+            }
+        }
+        cache.merge(batch);
+        worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
-/// See the module docs. `cache` is read and updated.
+/// See the module docs. `cache` is read and updated while the search runs:
+/// what it learns is merged every [`MERGE_INTERVAL`], so even a cancelled
+/// search keeps every sample and full hash it finished. Only a complete
+/// search also drops entries under `root` that it no longer saw.
 pub(crate) fn find(
     root: &Path,
     min_size: u64,
@@ -370,8 +503,6 @@ fn find_inner(
     merge_every: Duration,
     entered: &dyn Fn(u64),
 ) -> Vec<DupGroup> {
-    // RED stub: merge_every is not used yet.
-    let _ = merge_every;
     // 1. Every file big enough; duplicates group by *logical* (content) size.
     // Trash folders hold what was just reclaimed: never duplicates to act on.
     let opts = &Options {
@@ -406,19 +537,26 @@ fn find_inner(
     cands.retain(|c| per_size[&c.size] > 1);
     drop(per_size);
 
-    // 2. Identity and both ends, file by file in parallel (cache first).
+    // 2. Identity and both ends, file by file in parallel (cache first);
+    // what had to be read is handed to the cache as it is learned.
     let sample_bytes = cands.iter().map(|c| c.size.min(2 * SAMPLE)).sum();
     progress.enter(phase::SAMPLE, cands.len() as u64, sample_bytes);
     entered(phase::SAMPLE);
-    cands.par_iter_mut().for_each(|c| {
-        if progress.cancelled() {
-            return;
-        }
-        c.known = cache.get(&c.path, c.size, c.modified).or_else(|| sample(c));
-        progress.files.fetch_add(1, Ordering::Relaxed);
-        progress
-            .bytes
-            .fetch_add(c.size.min(2 * SAMPLE), Ordering::Relaxed);
+    with_merger(cache, merge_every, |learned| {
+        cands.par_iter_mut().for_each_with(learned, |learned, c| {
+            if progress.cancelled() {
+                return;
+            }
+            c.known = cache.get(&c.path, c.size, c.modified).or_else(|| {
+                let k = sample(c)?;
+                let _ = learned.send((c.path.clone(), k));
+                Some(k)
+            });
+            progress.files.fetch_add(1, Ordering::Relaxed);
+            progress
+                .bytes
+                .fetch_add(c.size.min(2 * SAMPLE), Ordering::Relaxed);
+        });
     });
     if progress.cancelled() {
         return Vec::new();
@@ -450,37 +588,47 @@ fn find_inner(
     let need_bytes = need.iter().map(|&i| cands[i].size).sum();
     progress.enter(phase::HASH, need.len() as u64, need_bytes);
     entered(phase::HASH);
-    let fulls: Vec<(usize, Option<[u8; 32]>)> = need
-        .par_iter()
-        .map(|&i| {
-            if progress.cancelled() {
-                return (i, None);
-            }
-            let c = &cands[i];
-            let h = full_hash(&c.path, c.size);
-            progress.files.fetch_add(1, Ordering::Relaxed);
-            progress.bytes.fetch_add(c.size, Ordering::Relaxed);
-            (i, h)
-        })
-        .collect();
+    let fulls: Vec<(usize, Option<[u8; 32]>)> = with_merger(cache, merge_every, |learned| {
+        need.par_iter()
+            .map_with(learned, |learned, &i| {
+                if progress.cancelled() {
+                    return (i, None);
+                }
+                let c = &cands[i];
+                let h = full_hash(&c.path, c.size);
+                if let (Some(full), Some(k)) = (h, c.known) {
+                    let k = Known {
+                        full: Some(full),
+                        ..k
+                    };
+                    let _ = learned.send((c.path.clone(), k));
+                }
+                progress.files.fetch_add(1, Ordering::Relaxed);
+                progress.bytes.fetch_add(c.size, Ordering::Relaxed);
+                (i, h)
+            })
+            .collect()
+    });
     for (i, h) in fulls {
         if let Some(k) = cands[i].known.as_mut() {
             k.full = h;
         }
     }
 
-    // Remember what was learned (also for files that turned out unique).
+    // Everything learned is in the cache by now. A cancelled search has not
+    // seen everything under `root`, so nothing it missed counts as stale;
+    // a complete one replaces what is known there with what it found (also
+    // for files that turned out unique), dropping files gone or changed.
+    if progress.cancelled() {
+        return Vec::new();
+    }
     cache.replace_under(
         root,
         cands
             .iter()
-            .filter(|c| !progress.cancelled() || c.known.is_some_and(|k| k.full.is_some()))
             .filter_map(|c| Some((c.path.clone(), c.known?)))
             .collect(),
     );
-    if progress.cancelled() {
-        return Vec::new();
-    }
 
     // Group by size and full hash.
     alike.sort_unstable();
