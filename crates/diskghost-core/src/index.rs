@@ -1,15 +1,98 @@
-//! Persistent duplicate-search index (SQLite) — RED stage: API stubs only.
+//! The persistent duplicate-search index: one SQLite database that knows
+//! every file on every registered volume, so a re-scan only re-reads what
+//! changed (the git-annex model).
+//!
+//! # Model
+//!
+//! A **location** is a volume — a filesystem — not a folder. It is named by
+//! the filesystem UUID (see [`volume_uuid`]), so a disk keeps its identity
+//! whatever it is mounted as, and an unplugged disk keeps its rows: its
+//! copies still count while it is away. Paths are stored relative to the
+//! volume's mountpoint (`locations.root`), so scanning two folders of one
+//! disk fills one location, and each scan only answers for the subtree it
+//! walked.
+//!
+//! # Schema (version 1, `PRAGMA user_version`)
+//!
+//! ```sql
+//! meta      (key TEXT PRIMARY KEY, value INTEGER NOT NULL)
+//!           -- 'schema_version', 'scan_generation'
+//! locations (id INTEGER PRIMARY KEY,
+//!            uuid TEXT NOT NULL UNIQUE,   -- fs UUID[:subtree] | dev:<major>:<minor>
+//!            host TEXT NOT NULL DEFAULT 'local',  -- seam for remote hosts
+//!            root TEXT NOT NULL,          -- last known mountpoint
+//!            role TEXT NOT NULL DEFAULT 'normal'  -- normal | master | scratch
+//!            online INTEGER NOT NULL,     -- reachable at its last scan
+//!            last_seen INTEGER NOT NULL)  -- unix seconds of that scan
+//! files     (location_id → locations(id) ON DELETE CASCADE,
+//!            path TEXT,                   -- relative to locations.root
+//!            size, mtime_ns, dev, ino INTEGER,
+//!            sample BLOB,  -- BLAKE3 of first+last 16 KiB; NULL = not computed
+//!            full BLOB,    -- BLAKE3 of the whole file; NULL = not computed
+//!            seen INTEGER, -- scan generation that last saw the row
+//!            PRIMARY KEY (location_id, path)) WITHOUT ROWID
+//! INDEX files_size ON files(size); INDEX files_full ON files(full)
+//! ```
+//!
+//! # Safety
+//!
+//! The index only ever *reads* user files. The only deletions in this module
+//! are of index rows (vanished files, `forget`); no user file is unlinked,
+//! renamed or written here. Later milestones that act on duplicates
+//! quarantine — they never unlink.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
-use rusqlite::Connection;
+use rayon::prelude::*;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use crate::walk::MountEntry;
-use crate::{Options, Progress};
+use crate::dupes::{sample_file, Sampled};
+use crate::walk::{walk, MountEntry};
+use crate::{phase, Options, Progress};
 
-/// Role of a location in later copy policies.
+/// Schema version this build reads and writes.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Version 0 → 1. Each later migration is one more entry; never edit one
+/// that has shipped.
+const MIGRATIONS: &[&str] = &[r"
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+INSERT INTO meta (key, value) VALUES ('schema_version', 1), ('scan_generation', 0);
+CREATE TABLE locations (
+    id        INTEGER PRIMARY KEY,
+    uuid      TEXT NOT NULL UNIQUE,
+    host      TEXT NOT NULL DEFAULT 'local',
+    root      TEXT NOT NULL,
+    role      TEXT NOT NULL DEFAULT 'normal'
+              CHECK (role IN ('normal', 'master', 'scratch')),
+    online    INTEGER NOT NULL DEFAULT 0 CHECK (online IN (0, 1)),
+    last_seen INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE files (
+    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    mtime_ns    INTEGER NOT NULL,
+    dev         INTEGER NOT NULL,
+    ino         INTEGER NOT NULL,
+    sample      BLOB CHECK (sample IS NULL OR length(sample) = 32),
+    full        BLOB CHECK (full IS NULL OR length(full) = 32),
+    seen        INTEGER NOT NULL,
+    PRIMARY KEY (location_id, path)
+) WITHOUT ROWID;
+CREATE INDEX files_size ON files(size);
+CREATE INDEX files_full ON files(full) WHERE full IS NOT NULL;
+"];
+
+/// Role of a location in later copy policies: which copy to keep
+/// (`master`), which copies are expendable (`scratch`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -18,24 +101,53 @@ pub enum Role {
     Scratch,
 }
 
-/// The persistent index.
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Normal => "normal",
+            Role::Master => "master",
+            Role::Scratch => "scratch",
+        }
+    }
+
+    fn parse(s: &str) -> Role {
+        match s {
+            "master" => Role::Master,
+            "scratch" => Role::Scratch,
+            _ => Role::Normal,
+        }
+    }
+}
+
+/// The persistent index: an open SQLite database.
 pub struct Index {
-    #[allow(dead_code)]
     conn: Connection,
 }
 
 /// What one [`index_scan`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ScanSummary {
+    /// The location (volume) the scanned folder belongs to.
     pub uuid: String,
+    /// That volume's mountpoint.
     pub root: PathBuf,
+    /// Files the walk met (and indexed).
     pub seen: u64,
+    /// Of those, not in the index before.
     pub new: u64,
+    /// Of those, indexed with another size, time or inode: hashes reset.
     pub changed: u64,
+    /// Of those, unchanged: not read, only marked seen.
     pub unchanged: u64,
+    /// Rows dropped because their file is gone (index rows only).
     pub vanished: u64,
+    /// Files whose two ends were read because their size collides.
     pub sampled: u64,
+    /// Entries not indexed: unreadable, a path that is not UTF-8, or on
+    /// another device than the scanned folder.
     pub skipped: u64,
+    /// The walk covered the whole subtree. Vanished rows are only dropped
+    /// after a complete walk: unreadable or cut-off is not gone.
     pub complete: bool,
 }
 
@@ -45,60 +157,363 @@ pub struct LocationStatus {
     pub uuid: String,
     pub host: String,
     pub role: Role,
+    /// Last known mountpoint.
     pub root: PathBuf,
+    /// Reachable now: the mountpoint holds this very volume.
     pub online: bool,
+    /// Indexed files and their bytes — kept while the volume is away.
     pub files: u64,
     pub bytes: u64,
+    /// Unix seconds of the last scan.
     pub last_seen: i64,
 }
 
+fn db_err(e: rusqlite::Error) -> io::Error {
+    io::Error::other(e)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// SQLite integers are signed 64-bit: device and inode numbers are stored by
+/// bit pattern, so every `u64` round-trips.
+fn to_sql(v: u64) -> i64 {
+    v as i64
+}
+
 impl Index {
-    pub fn open(_path: &Path) -> io::Result<Index> {
-        unimplemented!("M1")
+    /// Open the index at `path`, creating it (and migrating an older one).
+    pub fn open(path: &Path) -> io::Result<Index> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
+        }
+        let conn = Connection::open(path).map_err(db_err)?;
+        Index::init(conn)
     }
+
+    fn init(mut conn: Connection) -> io::Result<Index> {
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(db_err)?;
+        // `journal_mode` answers with the mode it set: read, don't execute.
+        let _: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .map_err(db_err)?;
+        // Per connection, not stored: without it `forget` would not cascade.
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(db_err)?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(db_err)?;
+        if version > SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "index schema version {version} is newer than this diskghost \
+                     understands ({SCHEMA_VERSION}); upgrade diskghost"
+                ),
+            ));
+        }
+        let from = usize::try_from(version).unwrap_or(0);
+        if from < MIGRATIONS.len() {
+            let tx = conn.transaction().map_err(db_err)?;
+            for sql in &MIGRATIONS[from..] {
+                tx.execute_batch(sql).map_err(db_err)?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(db_err)?;
+            tx.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [SCHEMA_VERSION],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+        }
+        Ok(Index { conn })
+    }
+
+    /// Every location with its file count and bytes, and whether it is
+    /// reachable *now*. Read-only: an offline location keeps all its rows.
     pub fn status(&self) -> io::Result<Vec<LocationStatus>> {
-        unimplemented!("M1")
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT l.uuid, l.host, l.role, l.root, l.last_seen, \
+                        COUNT(f.path), COALESCE(SUM(f.size), 0) \
+                 FROM locations l LEFT JOIN files f ON f.location_id = l.id \
+                 GROUP BY l.id ORDER BY l.root, l.uuid",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (uuid, host, role, root, last_seen, files, bytes) = row.map_err(db_err)?;
+            let root = PathBuf::from(root);
+            out.push(LocationStatus {
+                online: is_online(&root, &uuid),
+                uuid,
+                host,
+                role: Role::parse(&role),
+                root,
+                files: files.max(0) as u64,
+                bytes: bytes.max(0) as u64,
+                last_seen,
+            });
+        }
+        Ok(out)
     }
-    pub fn forget(&self, _uuid: &str) -> io::Result<bool> {
-        unimplemented!("M1")
+
+    /// Drop a location and all its rows from the index. Files on disk are
+    /// not touched. `false` when no such location exists.
+    pub fn forget(&self, uuid: &str) -> io::Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM locations WHERE uuid = ?1", [uuid])
+            .map_err(db_err)?;
+        Ok(n > 0)
     }
-    pub fn configure(&self, _uuid: &str, _role: Option<Role>, _host: &str) -> io::Result<()> {
-        unimplemented!("M1")
+
+    /// Set a location's host (stored verbatim) and, when given, its role.
+    pub fn configure(&self, uuid: &str, role: Option<Role>, host: &str) -> io::Result<()> {
+        validate_host(host).map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
+        let n = self
+            .conn
+            .execute(
+                "UPDATE locations SET host = ?2, role = COALESCE(?3, role) WHERE uuid = ?1",
+                params![uuid, host, role.map(Role::as_str)],
+            )
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no location {uuid} in the index"),
+            ));
+        }
+        Ok(())
     }
 }
 
-pub fn validate_host(_host: &str) -> Result<(), String> {
-    unimplemented!("M1")
+/// A location is online when its mountpoint exists *and* holds the same
+/// volume: an unplugged disk usually leaves its empty mountpoint directory
+/// behind on the parent filesystem, so existence alone proves nothing.
+fn is_online(root: &Path, uuid: &str) -> bool {
+    root.is_dir() && volume(root).is_ok_and(|v| v.key == uuid && v.mount_point == root)
 }
 
-pub fn volume_uuid(_path: &Path) -> io::Result<String> {
-    unimplemented!("M1")
+/// Hosts a location may live on. Only this machine for now: remote
+/// locations are a later milestone, and the flag exists so the seam does.
+pub fn validate_host(host: &str) -> Result<(), String> {
+    match host {
+        "local" | "localhost" => Ok(()),
+        other => Err(format!(
+            "remote locations not yet supported (host {other:?}); use local"
+        )),
+    }
 }
 
-pub fn is_cow_fs(_path: &Path) -> bool {
-    unimplemented!("M1")
+/// The index's name for the volume holding `path`: the filesystem UUID when
+/// the volume is a block device listed in `/dev/disk/by-uuid`, followed by
+/// `:<subtree>` when the mount shows only part of the filesystem (a bind
+/// mount, a btrfs subvolume); otherwise `dev:<major>:<minor>`.
+///
+/// Resolution: `stat(path).st_dev` → the `/proc/self/mountinfo` line of that
+/// device whose mountpoint is the longest prefix of `path` → its mount
+/// source → the `/dev/disk/by-uuid` link pointing at the same device node.
+/// A nested btrfs subvolume (an anonymous `st_dev` mountinfo never lists)
+/// belongs to the btrfs mount enclosing it.
+///
+/// The `dev:` fallback (tmpfs, overlay, ZFS datasets, NFS…) is only as
+/// stable as the device number, which may change across reboots.
+pub fn volume_uuid(path: &Path) -> io::Result<String> {
+    volume(path).map(|v| v.key)
 }
 
-fn is_cow_magic(_f_type: u64) -> bool {
-    unimplemented!("M1")
-}
-
-/// A volume as named by the index.
+/// A volume as named by the index, with the mountpoint paths are relative to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Volume {
     pub(crate) key: String,
     pub(crate) mount_point: PathBuf,
 }
 
-fn resolve_volume(
-    _mounts: &[MountEntry],
-    _dev: u64,
-    _path: &Path,
-    _uuid_of: &dyn Fn(&str) -> Option<String>,
-) -> Option<Volume> {
-    unimplemented!("M1")
+#[cfg(unix)]
+fn volume(path: &Path) -> io::Result<Volume> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(path)?;
+    let dev = std::fs::metadata(&path)?.dev();
+    let mounts: Vec<MountEntry> = std::fs::read("/proc/self/mountinfo")
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .filter_map(crate::walk::parse_mountinfo_entry)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(v) = resolve_volume(&mounts, dev, &path, &uuid_of_source) {
+        return Ok(v);
+    }
+    // No mount table (not Linux, or a sandbox without /proc): the device
+    // number names the volume, and its top is where the device changes.
+    let mut top = path.as_path();
+    while let Some(parent) = top.parent() {
+        match std::fs::metadata(parent) {
+            Ok(m) if m.dev() == dev => top = parent,
+            _ => break,
+        }
+    }
+    Ok(Volume {
+        key: dev_key(dev_major(dev), dev_minor(dev)),
+        mount_point: top.to_path_buf(),
+    })
 }
 
+#[cfg(not(unix))]
+fn volume(path: &Path) -> io::Result<Volume> {
+    let _ = path;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the persistent index needs a Unix volume table",
+    ))
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn dev_key(major: u64, minor: u64) -> String {
+    format!("dev:{major}:{minor}")
+}
+
+/// glibc's `major()` (inverse of [`crate::walk::makedev`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn dev_major(dev: u64) -> u64 {
+    ((dev >> 8) & 0x0000_0fff) | ((dev >> 32) & 0xffff_f000)
+}
+
+/// glibc's `minor()`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn dev_minor(dev: u64) -> u64 {
+    (dev & 0x0000_00ff) | ((dev >> 12) & 0xffff_ff00)
+}
+
+/// The pure half of [`volume_uuid`]: pick the mount of `path` (canonical)
+/// on device `dev` among `mounts`, and name it, asking `uuid_of` for the
+/// filesystem UUID of a mount source. `None` when no mount fits.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn resolve_volume(
+    mounts: &[MountEntry],
+    dev: u64,
+    path: &Path,
+    uuid_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<Volume> {
+    // Longest mountpoint that is a prefix of `path`; later lines win ties
+    // (a later mount covers an earlier one on the same directory).
+    let longest = |pred: &dyn Fn(&MountEntry) -> bool| {
+        let mut best: Option<&MountEntry> = None;
+        for m in mounts
+            .iter()
+            .filter(|m| pred(m) && path.starts_with(&m.mount_point))
+        {
+            if best.map_or(true, |b| {
+                m.mount_point.as_os_str().len() >= b.mount_point.as_os_str().len()
+            }) {
+                best = Some(m);
+            }
+        }
+        best
+    };
+    let m = longest(&|m| m.dev == dev).or_else(|| {
+        // A nested btrfs subvolume has its own anonymous st_dev that no
+        // mountinfo line carries; it is part of the enclosing btrfs mount.
+        longest(&|_| true).filter(|m| m.fstype == "btrfs")
+    })?;
+    let key = match uuid_of(&m.source) {
+        Some(uuid) if m.root == "/" => uuid,
+        Some(uuid) => format!("{uuid}:{}", m.root),
+        None => dev_key(m.major, m.minor),
+    };
+    Some(Volume {
+        key,
+        mount_point: m.mount_point.clone(),
+    })
+}
+
+/// Filesystem UUID of a mount source such as `/dev/sda1` or
+/// `/dev/mapper/root`: the `/dev/disk/by-uuid` entry resolving to the same
+/// device node. Pseudo sources (`tmpfs`, `overlay`, `pool/dataset`) have none.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn uuid_of_source(source: &str) -> Option<String> {
+    if !source.starts_with("/dev/") {
+        return None;
+    }
+    let node = std::fs::canonicalize(source).ok()?;
+    std::fs::read_dir("/dev/disk/by-uuid")
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|e| std::fs::canonicalize(e.path()).is_ok_and(|t| t == node))
+        .and_then(|e| e.file_name().into_string().ok())
+}
+
+/// Whether `path` sits on a copy-on-write filesystem (btrfs, ZFS, XFS with
+/// reflinks, bcachefs) or on overlayfs, where two "copies" may already share
+/// their blocks — so deleting one may free nothing. `false` when unknown.
+pub fn is_cow_fs(path: &Path) -> bool {
+    statfs_magic(path).is_some_and(is_cow_magic)
+}
+
+#[cfg(target_os = "linux")]
+fn statfs_magic(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c` is a valid NUL-terminated path; `buf` is written by the
+    // kernel on success and only read then.
+    let rc = unsafe { libc::statfs(c.as_ptr(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: statfs returned 0, so the struct is initialised.
+    let st = unsafe { buf.assume_init() };
+    // `f_type` is signed on some targets: keep the low 32 bits the magic uses.
+    #[allow(clippy::unnecessary_cast)]
+    Some((st.f_type as u64) & 0xffff_ffff)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn statfs_magic(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// `statfs.f_type` magics of copy-on-write (and overlay) filesystems.
+fn is_cow_magic(f_type: u64) -> bool {
+    matches!(
+        f_type,
+        0x9123_683e // btrfs
+            | 0x2fc1_2fc1 // zfs
+            | 0x5846_5342 // xfs (reflink-capable)
+            | 0xca45_1a4e // bcachefs
+            | 0x794c_7630 // overlayfs
+    )
+}
+
+/// Index the files under `root` (a folder on one volume): record new and
+/// changed files, mark unchanged ones seen without reading them, drop rows of
+/// files that vanished from the walked subtree, then read the two ends of
+/// every indexed file whose size collides with another indexed file.
+///
+/// A file whose (size, mtime_ns, inode) matches its row is never re-read.
+/// The walk stays on `root`'s filesystem (a location is one volume) and
+/// reuses the shared walker with its remote/FUSE guards.
 pub fn index_scan(
     idx: &Index,
     root: &Path,
@@ -108,14 +523,332 @@ pub fn index_scan(
     scan_observed(idx, root, opts, progress, &|_| {})
 }
 
+/// A file as `stat` sees it, in the index's terms.
+struct Stat {
+    size: u64,
+    mtime_ns: u64,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn stat_of(meta: &std::fs::Metadata) -> Stat {
+    use std::os::unix::fs::MetadataExt;
+    Stat {
+        size: meta.len(),
+        mtime_ns: crate::walk::modified_ns(meta),
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn stat_of(meta: &std::fs::Metadata) -> Stat {
+    Stat {
+        size: meta.len(),
+        mtime_ns: crate::walk::modified_ns(meta),
+        dev: 0,
+        ino: 0,
+    }
+}
+
+/// [`index_scan`] with `on_read` called for every file whose content is
+/// read — the seam that lets tests prove what is (not) re-read.
 fn scan_observed(
-    _idx: &Index,
-    _root: &Path,
-    _opts: &Options,
-    _progress: &Progress,
-    _on_read: &(dyn Fn(&Path) + Sync),
+    idx: &Index,
+    root: &Path,
+    opts: &Options,
+    progress: &Progress,
+    on_read: &(dyn Fn(&Path) + Sync),
 ) -> io::Result<ScanSummary> {
-    unimplemented!("M1")
+    let root = std::fs::canonicalize(root)?;
+    let root_meta = std::fs::metadata(&root)?;
+    if !root_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a directory: {}", root.display()),
+        ));
+    }
+    let root_dev = stat_of(&root_meta).dev;
+    let vol = volume(&root)?;
+    let mount = vol
+        .mount_point
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mountpoint is not UTF-8"))?;
+    let prefix = root
+        .strip_prefix(&vol.mount_point)
+        .ok()
+        .and_then(Path::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path is not UTF-8"))?
+        .to_string();
+    let mut sum = ScanSummary {
+        uuid: vol.key.clone(),
+        root: vol.mount_point.clone(),
+        ..ScanSummary::default()
+    };
+
+    // One transaction for the whole walk: per-row autocommit would fsync per
+    // file. The walk sink runs on this thread, so the writes overlap the I/O.
+    let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
+    let loc: i64 = tx
+        .query_row(
+            "INSERT INTO locations (uuid, root, online, last_seen) VALUES (?1, ?2, 1, ?3) \
+             ON CONFLICT(uuid) DO UPDATE SET root = excluded.root, online = 1, \
+             last_seen = excluded.last_seen RETURNING id",
+            params![vol.key, mount, now_secs()],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let gen: i64 = tx
+        .query_row(
+            "UPDATE meta SET value = value + 1 WHERE key = 'scan_generation' RETURNING value",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+
+    // A location is one volume: never cross into another mount. The MFT
+    // engine is Windows-only and yields no inode identity.
+    let walk_opts = Options {
+        same_file_system: true,
+        mft: false,
+        ..opts.clone()
+    };
+    let mut failed: Option<rusqlite::Error> = None;
+    {
+        let mut get = tx
+            .prepare_cached(
+                "SELECT size, mtime_ns, ino FROM files WHERE location_id = ?1 AND path = ?2",
+            )
+            .map_err(db_err)?;
+        let mut insert = tx
+            .prepare_cached(
+                "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, seen) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(db_err)?;
+        let mut touch = tx
+            .prepare_cached(
+                "UPDATE files SET seen = ?3, dev = ?4 WHERE location_id = ?1 AND path = ?2",
+            )
+            .map_err(db_err)?;
+        let mut reset = tx
+            .prepare_cached(
+                "UPDATE files SET size = ?3, mtime_ns = ?4, dev = ?5, ino = ?6, \
+                 sample = NULL, full = NULL, seen = ?7 WHERE location_id = ?1 AND path = ?2",
+            )
+            .map_err(db_err)?;
+        let follow = walk_opts.follow_symlinks;
+        let mut record = |path: &Path, sum: &mut ScanSummary| -> rusqlite::Result<()> {
+            let meta = if follow {
+                std::fs::metadata(path)
+            } else {
+                std::fs::symlink_metadata(path)
+            };
+            let Ok(meta) = meta else {
+                sum.skipped += 1;
+                return Ok(());
+            };
+            let st = stat_of(&meta);
+            let rel = path
+                .strip_prefix(&vol.mount_point)
+                .ok()
+                .and_then(Path::to_str);
+            // A followed link may lead off the volume; a non-UTF-8 name cannot
+            // be stored losslessly in a TEXT column. Neither is indexed.
+            let (Some(rel), true) = (rel, st.dev == root_dev) else {
+                sum.skipped += 1;
+                return Ok(());
+            };
+            sum.seen += 1;
+            let old: Option<(i64, i64, i64)> = get
+                .query_row(params![loc, rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            let (size, mtime, dev, ino) = (
+                to_sql(st.size),
+                to_sql(st.mtime_ns),
+                to_sql(st.dev),
+                to_sql(st.ino),
+            );
+            match old {
+                None => {
+                    insert.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
+                    sum.new += 1;
+                }
+                Some(o) if o == (size, mtime, ino) => {
+                    touch.execute(params![loc, rel, gen, dev])?;
+                    sum.unchanged += 1;
+                }
+                Some(_) => {
+                    reset.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
+                    sum.changed += 1;
+                }
+            }
+            Ok(())
+        };
+        let mut unreadable = 0u64;
+        let _ = walk(&root, &walk_opts, progress, |b| {
+            unreadable += b.skipped;
+            if failed.is_some() {
+                return;
+            }
+            for f in &b.files {
+                if let Err(e) = record(&f.path, &mut sum) {
+                    failed = Some(e);
+                    progress.cancel(); // stop the walk; the error is reported
+                    return;
+                }
+            }
+        });
+        if let Some(e) = failed.take() {
+            return Err(db_err(e)); // the transaction rolls back on drop
+        }
+        sum.skipped += unreadable;
+        sum.complete = !progress.cancelled() && unreadable == 0 && opts.max_depth.is_none();
+    }
+
+    // Vanished: rows under the walked subtree this walk did not see. Only
+    // after a complete walk — a folder that could not be read is not gone.
+    // Prefix match by `substr`, not LIKE: `_` and `%` occur in file names.
+    if sum.complete {
+        sum.vanished = tx
+            .execute(
+                "DELETE FROM files WHERE location_id = ?1 AND seen <> ?2 AND \
+                 (?3 = '' OR path = ?3 OR substr(path, 1, length(?3) + 1) = ?3 || '/')",
+                params![loc, gen, prefix],
+            )
+            .map_err(db_err)? as u64;
+    }
+    tx.commit().map_err(db_err)?;
+
+    if !progress.cancelled() {
+        sum.sampled = sample_collisions(idx, progress, on_read)?;
+    }
+    Ok(sum)
+}
+
+/// A row whose content has to be sampled.
+struct Pending {
+    location_id: i64,
+    path: String,
+    abs: PathBuf,
+    size: i64,
+    mtime_ns: i64,
+    ino: i64,
+}
+
+/// Read the two ends of every indexed file that has no sample yet and whose
+/// size collides with another indexed file (same size = potential copy),
+/// on every location that is online now. Each file is re-`stat`ed first and
+/// only read while it still matches its row; anything else waits for the
+/// next scan of its volume. Returns how many files were sampled.
+fn sample_collisions(
+    idx: &Index,
+    progress: &Progress,
+    on_read: &(dyn Fn(&Path) + Sync),
+) -> io::Result<u64> {
+    let mut pending = Vec::new();
+    {
+        let mut st = idx
+            .conn
+            .prepare(
+                "SELECT l.id, l.uuid, l.root, f.path, f.size, f.mtime_ns, f.ino \
+                 FROM files f JOIN locations l ON l.id = f.location_id \
+                 WHERE f.sample IS NULL AND f.size > 0 AND f.size IN \
+                   (SELECT size FROM files WHERE size > 0 GROUP BY size HAVING COUNT(*) > 1) \
+                 ORDER BY l.id, f.path",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut online: HashMap<i64, bool> = HashMap::new();
+        for row in rows {
+            let (location_id, uuid, root, path, size, mtime_ns, ino) = row.map_err(db_err)?;
+            let root = PathBuf::from(root);
+            if !*online
+                .entry(location_id)
+                .or_insert_with(|| is_online(&root, &uuid))
+            {
+                continue; // an offline volume keeps its NULLs until it is back
+            }
+            pending.push(Pending {
+                location_id,
+                abs: root.join(&path),
+                path,
+                size,
+                mtime_ns,
+                ino,
+            });
+        }
+    }
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let bytes = pending
+        .iter()
+        .map(|p| (p.size as u64).min(2 * 16 * 1024))
+        .sum();
+    progress.enter(phase::SAMPLE, pending.len() as u64, bytes);
+    let read: Vec<(&Pending, Sampled)> = pending
+        .par_iter()
+        .filter_map(|p| {
+            if progress.cancelled() {
+                return None;
+            }
+            // Still the file the row describes? Otherwise leave it NULL.
+            let st = stat_of(&std::fs::metadata(&p.abs).ok()?);
+            if (to_sql(st.size), to_sql(st.mtime_ns), to_sql(st.ino)) != (p.size, p.mtime_ns, p.ino)
+            {
+                return None;
+            }
+            on_read(&p.abs);
+            let sampled = sample_file(&p.abs, st.size)?;
+            progress.files.fetch_add(1, Ordering::Relaxed);
+            progress
+                .bytes
+                .fetch_add(st.size.min(2 * 16 * 1024), Ordering::Relaxed);
+            Some((p, sampled))
+        })
+        .collect();
+    let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
+    let mut n = 0;
+    {
+        // The row must still be the one that was read (a concurrent scan may
+        // have reset it meanwhile).
+        let mut set = tx
+            .prepare_cached(
+                "UPDATE files SET sample = ?3, full = COALESCE(?4, full) \
+                 WHERE location_id = ?1 AND path = ?2 AND size = ?5 AND mtime_ns = ?6 \
+                 AND ino = ?7",
+            )
+            .map_err(db_err)?;
+        for (p, s) in &read {
+            n += set
+                .execute(params![
+                    p.location_id,
+                    p.path,
+                    &s.sample[..],
+                    s.full.as_ref().map(|f| &f[..]),
+                    p.size,
+                    p.mtime_ns,
+                    p.ino
+                ])
+                .map_err(db_err)? as u64;
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -173,7 +906,10 @@ mod tests {
     }
 
     /// (sample, full) of one indexed file, by absolute path.
-    fn hashes(idx: &Index, abs: &Path) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    /// (sample, full) as stored.
+    type Hashes = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+    fn hashes(idx: &Index, abs: &Path) -> Option<Hashes> {
         let mut st = idx
             .conn
             .prepare(

@@ -381,26 +381,32 @@ fn file_id(_file: &std::fs::File) -> Option<(u64, u64)> {
 /// Open the file once: identity plus the hash of both ends (the whole file
 /// when it is small enough).
 fn sample(c: &Cand) -> Option<Known> {
-    let (id, sample, full) = sample_file(&c.path, c.size)?;
+    let s = sample_file(&c.path, c.size)?;
     Some(Known {
         size: c.size,
         modified: c.modified,
-        id,
-        sample,
-        full,
+        id: s.id,
+        sample: s.sample,
+        full: s.full,
     })
 }
 
-/// What one read of a file's two ends yields: its identity, the BLAKE3 of
-/// the first and last [`SAMPLE`] bytes, and — when the file is at most two
-/// samples long, so that read covered all of it — the BLAKE3 of the whole
-/// file. `None` when the file cannot be read or its length is no longer
-/// `size` (it changed under us). Shared by the duplicate search and the
-/// persistent index, so both compute the very same sample.
-pub(crate) fn sample_file(
-    path: &Path,
-    size: u64,
-) -> Option<((u64, u64), [u8; 32], Option<[u8; 32]>)> {
+/// What one read of a file's two ends yields.
+pub(crate) struct Sampled {
+    /// (volume, file index) on Windows, (device, inode) elsewhere.
+    pub(crate) id: (u64, u64),
+    /// BLAKE3 of the first and last [`SAMPLE`] bytes.
+    pub(crate) sample: [u8; 32],
+    /// BLAKE3 of the whole file, when the file is at most two samples long
+    /// (so the read covered all of it).
+    pub(crate) full: Option<[u8; 32]>,
+}
+
+/// Read a file's two ends (the whole file when it is small enough). `None`
+/// when the file cannot be read or its length is no longer `size` (it
+/// changed under us). Shared by the duplicate search and the persistent
+/// index, so both compute the very same sample.
+pub(crate) fn sample_file(path: &Path, size: u64) -> Option<Sampled> {
     let mut f = std::fs::File::open(path).ok()?;
     let id = file_id(&f).unwrap_or((u64::MAX, 0));
     let mut h = blake3::Hasher::new();
@@ -419,7 +425,11 @@ pub(crate) fn sample_file(
         h.update(&buf);
     }
     let sample = *h.finalize().as_bytes();
-    Some((id, sample, whole.then_some(sample)))
+    Some(Sampled {
+        id,
+        sample,
+        full: whole.then_some(sample),
+    })
 }
 
 /// BLAKE3 of the whole file: memory-mapped (several threads for big files),

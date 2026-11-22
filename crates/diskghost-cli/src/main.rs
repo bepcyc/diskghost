@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
-    diff, find_duplicates_cached, format_timestamp, human_delta, human_size, phase, reclaim,
-    remove_path, validate_globs, DiffReport, DupGroup, HashCache, Options, Progress, ReclaimAction,
-    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
+    diff, find_duplicates_cached, format_timestamp, human_delta, human_size, index_scan, phase,
+    reclaim, remove_path, validate_globs, validate_host, DiffReport, DupGroup, HashCache, Index,
+    LocationStatus, Options, Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport,
+    Role, ScanReport, ScanSummary, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
 };
 use serde::Serialize;
 
@@ -138,6 +139,18 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         cache: Option<PathBuf>,
     },
+    /// Persistent index of every file on registered volumes: a re-scan only
+    /// re-reads files whose size, time or inode changed. Volumes are known by
+    /// filesystem UUID, so an unplugged disk keeps its entries. Read-only:
+    /// indexed files are never modified or deleted.
+    Index {
+        /// Index database (default: $XDG_DATA_HOME/diskghost/index.db, else
+        /// ~/.local/share/diskghost/index.db).
+        #[arg(long, value_name = "FILE", global = true)]
+        db: Option<PathBuf>,
+        #[command(subcommand)]
+        action: IndexAction,
+    },
     /// Delete a file or folder — permanently, or to the OS trash. Dry-run by default.
     Rm {
         /// File or directory to remove.
@@ -149,6 +162,55 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Index folders (each on one volume; other mounts below are not
+    /// entered): new and changed files are recorded, unchanged ones are not
+    /// read, files gone from the folder are dropped from the index, and files
+    /// whose size matches another indexed file get their ends hashed.
+    Add {
+        /// Folders to index.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Role of the volume in later copy policies.
+        #[arg(long, value_enum)]
+        role: Option<RoleArg>,
+        /// Host the volume lives on. Only this machine (local / localhost)
+        /// for now.
+        #[arg(long, default_value = "local")]
+        host: String,
+        #[command(flatten)]
+        walk: WalkArgs,
+    },
+    /// List indexed volumes: role, whether reachable now, files and bytes.
+    /// An unplugged volume is shown offline; its entries are kept.
+    Status,
+    /// Drop a volume and all its entries from the index (files untouched).
+    Forget {
+        /// The volume's id as `status` shows it.
+        uuid: String,
+    },
+}
+
+#[derive(Clone, ValueEnum)]
+enum RoleArg {
+    Normal,
+    /// The copy to keep.
+    Master,
+    /// Copies here are expendable.
+    Scratch,
+}
+
+impl From<RoleArg> for Role {
+    fn from(r: RoleArg) -> Self {
+        match r {
+            RoleArg::Normal => Role::Normal,
+            RoleArg::Master => Role::Master,
+            RoleArg::Scratch => Role::Scratch,
+        }
+    }
 }
 
 /// Flags shared by scan + dupes that control how the tree is walked.
@@ -381,6 +443,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+        Command::Index { db, action } => return run_index(cli.json, db, action),
         Command::Rm { path, trash, apply } => {
             if !path.exists() {
                 eprintln!("error: no such path: {}", path.display());
@@ -418,6 +481,159 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Where the index lives without `--db`: the XDG data directory.
+fn default_index_db() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))?;
+    Some(base.join("diskghost").join("index.db"))
+}
+
+fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
+    // Check what can be checked before the database is even opened.
+    if let IndexAction::Add {
+        paths, host, walk, ..
+    } = &action
+    {
+        if let Err(e) = validate_host(host) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        if !check_globs(&walk.exclude) {
+            return ExitCode::FAILURE;
+        }
+        if let Some(p) = paths.iter().find(|p| !p.is_dir()) {
+            eprintln!("error: not a directory: {}", p.display());
+            return ExitCode::FAILURE;
+        }
+    }
+    let Some(db) = db.or_else(default_index_db) else {
+        eprintln!("error: no data directory (set HOME or XDG_DATA_HOME, or pass --db)");
+        return ExitCode::FAILURE;
+    };
+    let idx = match Index::open(&db) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error: cannot open index {}: {e}", db.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    match action {
+        IndexAction::Add {
+            paths,
+            role,
+            host,
+            walk,
+        } => {
+            let opts = walk.to_options();
+            let role = role.map(Role::from);
+            let mut done = Vec::new();
+            for path in &paths {
+                let scanned = with_progress(|p| index_scan(&idx, path, &opts, p))
+                    .and_then(|s| idx.configure(&s.uuid, role, &host).map(|()| s));
+                match scanned {
+                    Ok(s) => {
+                        if !json {
+                            print_index_add(path, &s);
+                        }
+                        done.push(s);
+                    }
+                    Err(e) => {
+                        eprintln!("error: indexing {}: {e}", path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&done).unwrap());
+            }
+        }
+        IndexAction::Status => match idx.status() {
+            Ok(st) if json => println!("{}", serde_json::to_string_pretty(&st).unwrap()),
+            Ok(st) => print_index_status(&st),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        IndexAction::Forget { uuid } => match idx.forget(&uuid) {
+            Ok(true) => {
+                if json {
+                    println!("{}", serde_json::json!({ "forgotten": uuid }));
+                } else {
+                    println!("forgot {uuid} (index entries only; no file was touched)");
+                }
+            }
+            Ok(false) => {
+                eprintln!("error: no location {uuid} in the index");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_index_add(path: &Path, s: &ScanSummary) {
+    println!(
+        "{}  →  volume {} ({})",
+        path.display(),
+        s.uuid,
+        s.root.display()
+    );
+    println!(
+        "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} sampled",
+        s.seen, s.new, s.changed, s.unchanged, s.vanished, s.sampled
+    );
+    if s.skipped > 0 {
+        println!(
+            "  {} entries skipped (unreadable, non-UTF-8 name, or another device)",
+            s.skipped
+        );
+    }
+    if !s.complete {
+        println!("  incomplete walk: vanished entries were kept");
+    }
+}
+
+fn print_index_status(st: &[LocationStatus]) {
+    if st.is_empty() {
+        println!("index is empty — add a folder with `diskghost index add PATH`");
+        return;
+    }
+    println!(
+        "{:<40} {:<8} {:<8} {:>10} {:>10}  {:<20}  ROOT",
+        "UUID", "ROLE", "ONLINE", "FILES", "SIZE", "LAST SEEN"
+    );
+    for l in st {
+        let role = match l.role {
+            Role::Normal => "normal",
+            Role::Master => "master",
+            Role::Scratch => "scratch",
+        };
+        println!(
+            "{:<40} {:<8} {:<8} {:>10} {:>10}  {:<20}  {}{}",
+            l.uuid,
+            role,
+            if l.online { "yes" } else { "no" },
+            l.files,
+            human_size(l.bytes),
+            format_timestamp(u64::try_from(l.last_seen).unwrap_or(0)),
+            l.root.display(),
+            if l.host == "local" {
+                String::new()
+            } else {
+                format!("  (host {})", l.host)
+            },
+        );
+    }
 }
 
 /// `scan --json` output: the report's fields at the top level, plus `diff`
