@@ -130,11 +130,13 @@ function status(msg, isError = false) {
 const errText = (e) => (typeof e === "string" ? e : e?.message ?? JSON.stringify(e));
 
 // ------------------------------- tooltip -------------------------------
-// One shared hover card, built lazily. Hover follows the pointer; keyboard
-// focus shows it beside the element at once (no delay on focus).
-function tip(node, content) {
+// One shared hover card, built lazily. Hover follows the pointer after
+// `delay` ms (800 for controls; 0 for map tiles and chart columns, whose
+// card IS the data being explored); keyboard focus shows it at once.
+let tipTimer = 0;
+function tip(node, content, delay = 800) {
   const box = $("tooltip");
-  let w = 0, h = 0;
+  let w = 0, h = 0, at = [0, 0];
   const place = (x, y) => {
     const pad = 14;
     let px = x + pad, py = y + pad;
@@ -147,8 +149,13 @@ function tip(node, content) {
     box.classList.add("show");
     ({ width: w, height: h } = box.getBoundingClientRect());
   };
-  node.addEventListener("mouseenter", (ev) => { show(); place(ev.clientX, ev.clientY); });
-  node.addEventListener("mousemove", (ev) => place(ev.clientX, ev.clientY));
+  node.addEventListener("mouseenter", (ev) => {
+    at = [ev.clientX, ev.clientY];
+    clearTimeout(tipTimer);
+    if (!delay) { show(); place(...at); return; }
+    tipTimer = setTimeout(() => { show(); place(...at); }, delay);
+  });
+  node.addEventListener("mousemove", (ev) => { at = [ev.clientX, ev.clientY]; if (box.classList.contains("show")) place(...at); });
   node.addEventListener("mouseleave", hideTip);
   node.addEventListener("focus", () => {
     if (!node.matches(":focus-visible")) return;
@@ -158,7 +165,7 @@ function tip(node, content) {
   });
   node.addEventListener("blur", hideTip);
 }
-function hideTip() { $("tooltip").classList.remove("show"); }
+function hideTip() { clearTimeout(tipTimer); $("tooltip").classList.remove("show"); }
 const tipRow = (label, value) => el("div", { class: "tip-row" }, el("span", { text: label }), el("span", { text: value }));
 
 // ------------------------------- dialogs -------------------------------
@@ -1183,7 +1190,7 @@ function drawTreemap(container, j) {
       it.label = it.rest === "files" ? `${num(v.root_files_count)} ${t("filesHere")}` : t("otherFolders");
       const node = el("div", { class: "tile l1 is-leaf is-rest" });
       node.append(el("div", { class: "tile-head" }, label(it.label, it, pct(it.size, v.total_size), w, h, true)));
-      tip(node, folderTip(it));
+      tip(node, folderTip(it), 0);
       place(node, x, y, w, h);
       continue;
     }
@@ -1192,7 +1199,7 @@ function drawTreemap(container, j) {
     node.style.setProperty("--s", String(Math.sqrt(it.size / maxL1)));
     node.append(el("div", { class: "tile-head" }, label(baseName(it.path), it, pct(it.size, v.total_size), w, h, !framed)));
     decorate(node, it.path);
-    tip(node, folderTip(it));
+    tip(node, folderTip(it), 0);
     place(node, x, y, w, h);
     if (!framed) continue;
 
@@ -1204,7 +1211,7 @@ function drawTreemap(container, j) {
       if (!n2.path) {
         n2.label = t("filesSmaller");
         const rest = el("div", { class: "tile l2 is-rest" }, label(n2.label, n2, null, w2, h2, true));
-        tip(rest, folderTip(n2, it.size));
+        tip(rest, folderTip(n2, it.size), 0);
         place(rest, x2, y2, w2, h2);
         continue;
       }
@@ -1213,7 +1220,7 @@ function drawTreemap(container, j) {
         onclick: (e) => { e.stopPropagation(); navigate(j, n2.path); },
       }, label(baseName(n2.path), n2, null, w2, h2, true));
       t2.style.setProperty("--s", String(Math.sqrt(n2.size / maxL2)));
-      tip(t2, folderTip(n2, it.size));
+      tip(t2, folderTip(n2, it.size), 0);
       place(t2, x2, y2, w2, h2);
     }
   }
@@ -1235,6 +1242,8 @@ function tabStrip(items, current, onpick, fkPrefix) {
     e.preventDefault();
     const n = (to + tabs.length) % tabs.length;
     onpick(items[n][0]);
+    // The strip was rebuilt: keep the keyboard on the tab just selected.
+    document.querySelector(`[data-fk="${fkPrefix}-${items[n][0]}"]`)?.focus();
   });
   list.append(...tabs);
   return list;
@@ -1399,7 +1408,7 @@ function sizesTab(v, body) {
           el("span", { class: "col-bar", vars: { h: `${(100 * val) / max}%` } }));
         tip(col, () => [el("b", { text: bucketLabel(b, i) }),
           tipRow(t("colFiles"), `${num(b[i].count)} (${pct(b[i].count, v.total_files)})`),
-          tipRow(t("colSize"), `${human(b[i].size)} (${pct(b[i].size, v.total_size)})`)]);
+          tipRow(t("colSize"), `${human(b[i].size)} (${pct(b[i].size, v.total_size)})`)], 0);
         return col;
       })),
       el("div", { class: "axis" }, b.map((_, i) => el("span", { text: bucketLabel(b, i) }))));

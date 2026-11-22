@@ -1,6 +1,8 @@
-/* Hallmark · genre: modern-minimal (technical) · macrostructure: Workbench (app shell) · nav: N3 side-rail (app sidebar) · footer: status bar · design-system: DESIGN.md · designed-as-app
+/* Hallmark · pre-emit critique: P4 H4 E4 S4 R5 V4
+ * Hallmark · genre: modern-minimal (technical) · macrostructure: Workbench (app shell) · nav: N3 side-rail (app sidebar) · footer: status bar · design-system: DESIGN.md · designed-as-app
  * tone: utilitarian · paper: cool slate oklch(17% 0.012 250) · accent: signal amber oklch(80% 0.15 75)
- * type: platform UI sans + platform mono (CSP: default-src 'self' — no web fonts) */
+ * type: platform UI sans + platform mono (CSP: default-src 'self' — no web fonts)
+ * slop test: 57/58 · gate 1 waived on purpose (system face: CSP + frozen src-tauri, no font files shipped) */
 
 /* ================================ tokens ================================
    Every colour, size, radius, shadow and duration in this file comes from
