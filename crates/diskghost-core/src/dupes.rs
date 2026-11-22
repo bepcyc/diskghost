@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use rayon::prelude::*;
 
@@ -45,6 +47,14 @@ const SAMPLE: u64 = 16 * 1024;
 const PARALLEL_HASH_MIN: u64 = 64 << 20;
 
 const CACHE_MAGIC: &[u8; 8] = b"DGHASH01";
+
+/// How often a running search hands what it has learned to the shared
+/// [`HashCache`].
+pub const MERGE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often a frontend writes the [`HashCache`] to disk while a search runs
+/// (see [`HashCache::checkpoint_while`]).
+pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What is known about one file's content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +112,24 @@ impl HashCache {
             e.retain(|p, _| !p.starts_with(root));
             e.extend(fresh);
         }
+    }
+
+    /// Add `fresh` to what is known, replacing older entries for the same
+    /// paths; everything else stays.
+    fn merge(&self, fresh: Vec<(PathBuf, Known)>) {
+        let _ = fresh; // RED stub
+    }
+
+    /// [`HashCache::save`], skipped when nothing changed since the last save.
+    /// Returns whether the file was written.
+    pub fn save_if_changed(&self, path: &Path) -> std::io::Result<bool> {
+        self.save(path).map(|()| true) // RED stub
+    }
+
+    /// Run `job`, saving the cache to `path` every `every` meanwhile.
+    pub fn checkpoint_while<T>(&self, path: &Path, every: Duration, job: impl FnOnce() -> T) -> T {
+        let _ = (path, every); // RED stub
+        job()
     }
 
     /// Read a cache written by [`HashCache::save`]. A missing, foreign or
@@ -301,6 +329,17 @@ fn full_hash(path: &Path, size: u64) -> Option<[u8; 32]> {
     Some(*h.finalize().as_bytes())
 }
 
+/// Run `run` with a sender for learned entries, merging them into `cache`.
+fn with_merger<R: Send>(
+    cache: &HashCache,
+    every: Duration,
+    run: impl FnOnce(Sender<(PathBuf, Known)>) -> R + Send,
+) -> R {
+    let _ = (cache, every); // RED stub
+    let (tx, _rx) = mpsc::channel();
+    run(tx)
+}
+
 /// See the module docs. `cache` is read and updated.
 pub(crate) fn find(
     root: &Path,
@@ -309,6 +348,30 @@ pub(crate) fn find(
     progress: &Progress,
     cache: &HashCache,
 ) -> Vec<DupGroup> {
+    find_inner(
+        root,
+        min_size,
+        opts,
+        progress,
+        cache,
+        MERGE_INTERVAL,
+        &|_| {},
+    )
+}
+
+/// [`find`] with the merge interval and a hook told each [`phase`] as it is
+/// entered (the seam tests use to cancel at a known point).
+fn find_inner(
+    root: &Path,
+    min_size: u64,
+    opts: &Options,
+    progress: &Progress,
+    cache: &HashCache,
+    merge_every: Duration,
+    entered: &dyn Fn(u64),
+) -> Vec<DupGroup> {
+    // RED stub: merge_every is not used yet.
+    let _ = merge_every;
     // 1. Every file big enough; duplicates group by *logical* (content) size.
     // Trash folders hold what was just reclaimed: never duplicates to act on.
     let opts = &Options {
@@ -346,6 +409,7 @@ pub(crate) fn find(
     // 2. Identity and both ends, file by file in parallel (cache first).
     let sample_bytes = cands.iter().map(|c| c.size.min(2 * SAMPLE)).sum();
     progress.enter(phase::SAMPLE, cands.len() as u64, sample_bytes);
+    entered(phase::SAMPLE);
     cands.par_iter_mut().for_each(|c| {
         if progress.cancelled() {
             return;
@@ -385,6 +449,7 @@ pub(crate) fn find(
         .collect();
     let need_bytes = need.iter().map(|&i| cands[i].size).sum();
     progress.enter(phase::HASH, need.len() as u64, need_bytes);
+    entered(phase::HASH);
     let fulls: Vec<(usize, Option<[u8; 32]>)> = need
         .par_iter()
         .map(|&i| {
@@ -554,6 +619,326 @@ mod tests {
         std::fs::write(&file, b"garbage").unwrap();
         assert!(HashCache::load(&file).is_empty());
         assert!(HashCache::load(&d.join("missing")).is_empty());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A made-up entry: only the fields the cache compares matter here.
+    fn known(size: u64, tag: u8) -> Known {
+        Known {
+            size,
+            modified: 1,
+            id: (1, u64::from(tag)),
+            sample: [tag; 32],
+            full: None,
+        }
+    }
+
+    fn paths(cache: &HashCache) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = cache.entries.lock().unwrap().keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Poll `cond` until it holds or `limit` passes — the limit only bounds
+    /// a failing test, a passing one returns as soon as `cond` is true.
+    fn eventually(limit: Duration, cond: impl Fn() -> bool) -> bool {
+        let end = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        cond()
+    }
+
+    #[test]
+    fn merge_keeps_entries_it_does_not_mention() {
+        // A checkpoint must not forget what the run has not reached yet;
+        // only the final clean-up (replace_under) drops entries under root.
+        let root = Path::new("/r");
+        let seed = || {
+            let c = HashCache::new();
+            c.replace_under(
+                Path::new("/"),
+                vec![
+                    (root.join("a"), known(10, 1)),
+                    (root.join("b"), known(10, 2)),
+                    (PathBuf::from("/elsewhere/c"), known(10, 3)),
+                ],
+            );
+            c
+        };
+        let merged = seed();
+        merged.merge(vec![(root.join("a"), known(10, 9))]);
+        assert_eq!(
+            paths(&merged),
+            vec![
+                PathBuf::from("/elsewhere/c"),
+                root.join("a"),
+                root.join("b")
+            ]
+        );
+        assert_eq!(merged.get(&root.join("a"), 10, 1), Some(known(10, 9)));
+
+        let replaced = seed();
+        replaced.replace_under(root, vec![(root.join("a"), known(10, 9))]);
+        assert_eq!(
+            paths(&replaced),
+            vec![PathBuf::from("/elsewhere/c"), root.join("a")]
+        );
+    }
+
+    /// Three 200 KB candidates: a and b are duplicates, c shares their ends
+    /// but not its middle, so all three need the full hash.
+    fn big_trio(label: &str) -> PathBuf {
+        let d = tmpdir(label);
+        let mut a = vec![7u8; 200_000];
+        write(&d.join("a.bin"), &a);
+        write(&d.join("b.bin"), &a);
+        a[100_000] = 8;
+        write(&d.join("c.bin"), &a);
+        d
+    }
+
+    #[test]
+    fn cancel_after_sampling_keeps_the_samples() {
+        // Sampling a big tree is hours of seeks; a cancel (or crash) after it
+        // must not throw that away just because no full hash was taken yet.
+        // Cancelling as the hash phase starts: every sample is taken, no
+        // full hash is.
+        let d = big_trio("cancel-sample");
+        let cache = HashCache::new();
+        let p = Progress::default();
+        let g = find_inner(
+            &d,
+            1,
+            &Options::default(),
+            &p,
+            &cache,
+            MERGE_INTERVAL,
+            &|ph| {
+                if ph == phase::HASH {
+                    p.cancel()
+                }
+            },
+        );
+        assert!(g.is_empty());
+        assert_eq!(cache.len(), 3, "{:?}", paths(&cache));
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            let path = d.join(name);
+            let k = cache.entries.lock().unwrap()[&path];
+            assert_eq!(k.size, 200_000);
+            assert_eq!(k.full, None, "{name} was never fully hashed");
+            // The next search takes it from the cache instead of reopening it.
+            assert_eq!(cache.get(&path, k.size, k.modified), Some(k));
+        }
+
+        // Finishing later gives exactly the uncached result.
+        let resumed = find(&d, 1, &Options::default(), &Progress::default(), &cache);
+        let fresh = find(
+            &d,
+            1,
+            &Options::default(),
+            &Progress::default(),
+            &HashCache::new(),
+        );
+        assert_eq!(resumed, fresh);
+        assert_eq!(resumed.len(), 1);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_cancelled_search_never_drops_earlier_knowledge() {
+        // Without a complete walk and hash pass nothing proves an old entry
+        // under the root stale, so a cancelled run only ever adds.
+        let d = big_trio("cancel-keep");
+        let old = d.join("sub/old.bin");
+        for cancel_at in [phase::SAMPLE, phase::HASH] {
+            let cache = HashCache::new();
+            cache.replace_under(Path::new("/"), vec![(old.clone(), known(5, 4))]);
+            let p = Progress::default();
+            find_inner(
+                &d,
+                1,
+                &Options::default(),
+                &p,
+                &cache,
+                MERGE_INTERVAL,
+                &|ph| {
+                    if ph == cancel_at {
+                        p.cancel()
+                    }
+                },
+            );
+            assert!(
+                paths(&cache).contains(&old),
+                "cancel in phase {cancel_at}: {:?}",
+                paths(&cache)
+            );
+
+            // A complete search is the clean-up: what is gone drops out.
+            find(&d, 1, &Options::default(), &Progress::default(), &cache);
+            assert!(!paths(&cache).contains(&old));
+            assert_eq!(cache.len(), 3);
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn merging_more_often_changes_no_result() {
+        let d = big_trio("merge-often");
+        write(&d.join("s1"), b"tiny");
+        write(&d.join("s2"), b"tiny");
+        let plain = find(
+            &d,
+            1,
+            &Options::default(),
+            &Progress::default(),
+            &HashCache::new(),
+        );
+        let cache = HashCache::new();
+        let eager = find_inner(
+            &d,
+            1,
+            &Options::default(),
+            &Progress::default(),
+            &cache,
+            Duration::ZERO,
+            &|_| {},
+        );
+        assert_eq!(eager, plain);
+        assert_eq!(eager.len(), 2);
+        assert_eq!(cache.len(), 5);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn merger_hands_knowledge_over_while_work_runs() {
+        let cache = HashCache::new();
+        let seen_mid_run = with_merger(&cache, Duration::ZERO, |tx| {
+            tx.send((PathBuf::from("/m/1"), known(1, 1))).unwrap();
+            eventually(Duration::from_secs(5), || cache.len() == 1)
+        });
+        assert!(seen_mid_run, "learned entry only landed after the run");
+    }
+
+    #[test]
+    fn merger_hands_the_rest_over_at_the_end() {
+        // A long interval must neither lose the tail nor delay the return.
+        let cache = HashCache::new();
+        let start = std::time::Instant::now();
+        with_merger(&cache, Duration::from_secs(3600), |tx| {
+            for i in 0..3u8 {
+                tx.send((PathBuf::from(format!("/m/{i}")), known(1, i)))
+                    .unwrap();
+            }
+        });
+        assert_eq!(cache.len(), 3);
+        assert!(start.elapsed() < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn save_if_changed_writes_only_news() {
+        let d = tmpdir("ifchanged");
+        let file = d.join("hashes.bin");
+        let cache = HashCache::new();
+        cache.merge(vec![(PathBuf::from("/x/1"), known(1, 1))]);
+        assert!(cache.save_if_changed(&file).unwrap());
+        assert!(!cache.save_if_changed(&file).unwrap());
+        // Merging what is already known is no news either.
+        cache.merge(vec![(PathBuf::from("/x/1"), known(1, 1))]);
+        assert!(!cache.save_if_changed(&file).unwrap());
+        cache.merge(vec![(PathBuf::from("/x/2"), known(1, 2))]);
+        assert!(cache.save_if_changed(&file).unwrap());
+        assert_eq!(HashCache::load(&file).len(), 2);
+        // A loaded cache matches its file until it learns something.
+        assert!(!HashCache::load(&file).save_if_changed(&file).unwrap());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_and_merges_leave_a_valid_file() {
+        // Checkpoint timer, final save and the search's merges all meet on
+        // one cache: every save must succeed and the file must stay whole.
+        let d = tmpdir("concurrent");
+        let file = d.join("hashes.bin");
+        let cache = HashCache::new();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..25 {
+                        cache.save(&file).unwrap();
+                        assert!(HashCache::read(&file).is_ok());
+                    }
+                });
+            }
+            s.spawn(|| {
+                for i in 0..200u32 {
+                    let p = PathBuf::from(format!("/c/{i}"));
+                    cache.merge(vec![(p, known(u64::from(i) + 1, 1))]);
+                }
+            });
+        });
+        cache.save(&file).unwrap();
+        assert_eq!(HashCache::read(&file).unwrap().len(), 200);
+        let names: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("hashes.bin")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file() {
+        let d = tmpdir("savefail");
+        let taken = d.join("taken");
+        std::fs::create_dir_all(&taken).unwrap();
+        let cache = HashCache::new();
+        cache.merge(vec![(PathBuf::from("/x/1"), known(1, 1))]);
+        assert!(cache.save(&taken).is_err());
+        let names: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("taken")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn checkpoints_are_written_while_the_job_runs_and_stop_with_it() {
+        let d = tmpdir("checkpoint");
+        let file = d.join("hashes.bin");
+        let cache = HashCache::new();
+        let every = Duration::from_millis(5);
+        let answer = cache.checkpoint_while(&file, every, || {
+            cache.merge(vec![(PathBuf::from("/k/1"), known(1, 1))]);
+            let saved = eventually(Duration::from_secs(5), || HashCache::read(&file).is_ok());
+            assert!(saved, "no checkpoint was written during the job");
+            42
+        });
+        assert_eq!(answer, 42);
+        assert_eq!(HashCache::load(&file).len(), 1);
+
+        // The checkpoint thread ends with the job: nothing writes any more.
+        std::fs::remove_file(&file).unwrap();
+        cache.merge(vec![(PathBuf::from("/k/2"), known(1, 2))]);
+        std::thread::sleep(every * 10);
+        assert!(!file.exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_hang_its_checkpoints() {
+        let d = tmpdir("checkpoint-panic");
+        let cache = HashCache::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.checkpoint_while(&d.join("h.bin"), Duration::from_secs(3600), || {
+                panic!("job failed")
+            })
+        }));
+        assert!(r.is_err());
         std::fs::remove_dir_all(&d).ok();
     }
 }
