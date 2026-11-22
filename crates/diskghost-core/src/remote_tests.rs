@@ -1306,7 +1306,8 @@ struct LocalAgent {
     frames: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
-const LOCAL_AGENT: &str = "/nonexistent/.cache/diskghost/diskghost-agent-test";
+/// Where the "uploaded" agent sits (never created: `LocalAgent` serves it).
+const LOCAL_AGENT_DIR: &str = "/nonexistent/.cache/diskghost";
 
 impl LocalAgent {
     fn new() -> LocalAgent {
@@ -1324,8 +1325,8 @@ impl RemoteExec for LocalAgent {
             .unwrap()
             .push(argv.iter().map(|s| s.to_string()).collect());
         match argv {
-            ["sh", "-c", s, "sh", _] if *s == LOCATE_SCRIPT => Ok(ExecOut {
-                stdout: format!("have {LOCAL_AGENT}\n").into_bytes(),
+            ["sh", "-c", s, "sh", name] if *s == LOCATE_SCRIPT => Ok(ExecOut {
+                stdout: format!("have {LOCAL_AGENT_DIR}/{name}\n").into_bytes(),
                 ..ExecOut::default()
             }),
             _ => LocalExec.exec(argv),
@@ -1338,7 +1339,7 @@ impl RemoteExec for LocalAgent {
             .unwrap()
             .push(argv.iter().map(|s| s.to_string()).collect());
         match argv {
-            [p, "agent"] if *p == LOCAL_AGENT => {
+            [p, "agent"] if p.starts_with(&format!("{LOCAL_AGENT_DIR}/")) => {
                 for l in String::from_utf8_lossy(input).lines() {
                     self.frames
                         .lock()
@@ -1399,7 +1400,7 @@ fn the_agent_tier_resolves_the_same_location_as_the_shell_tier() {
     let shell = resolve_root(&LocalExec, &c, root.to_str().unwrap()).unwrap();
     let a = crate::remote::AgentExec {
         exec: &LocalAgent::new(),
-        agent: LOCAL_AGENT.into(),
+        agent: format!("{LOCAL_AGENT_DIR}/{}", test_bin().name()),
     };
     let fs = a.stat_fs(root.to_str().unwrap()).unwrap();
     assert_eq!(fs.root.root, shell.root);

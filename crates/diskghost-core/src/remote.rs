@@ -1,11 +1,30 @@
-//! Remote locations over SSH (`ssh://host/path`), rclone-style: nothing is
-//! installed on the remote host. Its own shell tools enumerate and hash the
-//! files *there*; only names, sizes, times, inode numbers and digests cross
-//! the network — never file content.
+//! Remote locations over SSH (`ssh://host/path`). The files are enumerated
+//! and hashed *on the host*; only names, sizes, times, inode numbers and
+//! digests cross the network — never file content. Two tiers:
+//!
+//! 1. **Agent** (mutagen / `borg serve` style): on a Linux x86_64 host this
+//!    program uploads itself once to `~/.cache/diskghost/` under a
+//!    content-addressed name ([`AgentBinary::name`]), checks its `hello`,
+//!    and speaks the JSON-lines protocol of [`crate::agent`] with it over
+//!    ssh stdio ([`AgentExec`]). BLAKE3 everywhere, like local files.
+//! 2. **Shell** (rclone style, nothing installed): the host's own `find`,
+//!    `stat` and hash tools, as described below.
+//!
+//! [`ensure_agent`] picks the tier: any failure of the agent (unsupported
+//! os/arch, upload refused, a `hello` that does not match — e.g. a
+//! dynamically linked build on a host without its libraries) falls back to
+//! the shell tier; `index add --agent never` forces it. The tier used is
+//! recorded per location (`locations.transport`). A host that answers ssh
+//! but runs no command at all (an SFTP-only account) fails with
+//! [`shell_unavailable`]: diskghost will not read every file over the
+//! network instead.
 //!
 //! # Read-only
 //!
-//! Every command this module sends is a reader: `uname`, `command -v`,
+//! The protocol has no operation that writes or removes anything. The only
+//! remote write is the agent upload itself ([`UPLOAD_SCRIPT`]), confined to
+//! `$HOME/.cache/diskghost/` and never replacing a file. Every shell-tier
+//! command is a reader: `uname`, `command -v`,
 //! `find` (`-printf` / `-print0`, never `-delete` or `-exec`), `stat`, `cd` +
 //! `pwd`, `test -d`, and a hash tool fed from `<`. No command writes,
 //! renames or removes anything on the remote host; a test records every
@@ -126,6 +145,34 @@ impl RemoteExec for SshExec {
             .args(self.args(argv))
             .stdin(Stdio::null())
             .output()?;
+        Ok(ExecOut {
+            stdout: out.stdout,
+            stderr: out.stderr,
+            code: out.status.code().unwrap_or(-1),
+        })
+    }
+
+    fn exec_stdin(&self, argv: &[&str], input: &[u8]) -> io::Result<ExecOut> {
+        use std::io::Write;
+        let mut child = Command::new(&self.ssh)
+            .args(self.args(argv))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        // Written from another thread while this one drains stdout and
+        // stderr: a big input and a big answer cannot deadlock each other.
+        let out = std::thread::scope(|s| {
+            let writer = s.spawn(move || {
+                // A remote command that stops reading early is not an
+                // error here: its exit code tells.
+                let _ = stdin.write_all(input);
+            });
+            let out = child.wait_with_output();
+            let _ = writer.join();
+            out
+        })?;
         Ok(ExecOut {
             stdout: out.stdout,
             stderr: out.stderr,
@@ -263,6 +310,7 @@ pub const PROBED_TOOLS: [&str; 5] = ["b3sum", "md5sum", "sha1sum", "find", "stat
 
 /// The probe, as one shell script (one ssh call).
 pub const PROBE_SCRIPT: &str = r#"echo "os $(uname -s 2>/dev/null)"
+echo "arch $(uname -m 2>/dev/null)"
 for t in b3sum md5sum sha1sum find stat; do
   if command -v "$t" >/dev/null 2>&1; then echo "tool $t yes"; else echo "tool $t no"; fi
 done
@@ -327,12 +375,50 @@ fn unreachable_err(x: &ExecOut) -> io::Error {
     )
 }
 
+/// What sshd says when it reached the host but will not run a command
+/// (`ForceCommand internal-sftp`, a restricted shell, `no-pty`+`command=`).
+const EXEC_REFUSED: [&str; 6] = [
+    "exec request failed",
+    "shell request failed",
+    "sftp connections only",
+    "only sftp",
+    "not allowed to execute",
+    "command not allowed",
+];
+
+/// ssh's exit 255: either the host was not reached (DNS, timeout, refused,
+/// no key — `NotConnected`), or it was and refuses to run commands
+/// (`PermissionDenied`, the message being ssh's own words; see
+/// [`shell_unavailable`]).
+fn ssh_failure(x: &ExecOut) -> io::Error {
+    let err = String::from_utf8_lossy(&x.stderr);
+    let lower = err.to_lowercase();
+    if EXEC_REFUSED.iter().any(|p| lower.contains(p)) {
+        io::Error::new(io::ErrorKind::PermissionDenied, err.trim().to_string())
+    } else {
+        unreachable_err(x)
+    }
+}
+
+/// The error for a host that answers ssh but runs no command: neither tier
+/// can work there, and the only way left — reading every file over SFTP —
+/// is what diskghost refuses to do silently.
+pub fn shell_unavailable(host: &str, detail: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "remote shell unavailable on {host} — files would have to be read over the \
+             network; upload an agent or enable shell (ssh: {detail})"
+        ),
+    )
+}
+
 /// Run `argv`; ssh's own failure (exit 255) is an error, a command's
 /// non-zero exit is not.
 pub(crate) fn run(x: &dyn RemoteExec, argv: &[&str]) -> io::Result<ExecOut> {
     let out = x.exec(argv)?;
     if out.code == 255 {
-        return Err(unreachable_err(&out));
+        return Err(ssh_failure(&out));
     }
     Ok(out)
 }
@@ -340,62 +426,7 @@ pub(crate) fn run(x: &dyn RemoteExec, argv: &[&str]) -> io::Result<ExecOut> {
 /// Probe what a host offers, in one call. `Err(NotConnected)` when it
 /// cannot be reached; `Err(Unsupported)` when it has no hash tool.
 pub fn probe(x: &dyn RemoteExec) -> io::Result<Capabilities> {
-    let out = run(x, &["sh", "-c", PROBE_SCRIPT])?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut os = String::new();
-    let mut tools = Vec::new();
-    let mut find_printf = false;
-    let mut stat = StatFlavor::None;
-    for line in text.lines() {
-        let w: Vec<&str> = line.split_whitespace().collect();
-        match w.as_slice() {
-            ["os", rest @ ..] => os = rest.join(" "),
-            ["tool", t, "yes"] if PROBED_TOOLS.contains(t) => tools.push(t.to_string()),
-            ["printf", v] => find_printf = *v == "yes",
-            ["stat", "gnu"] => stat = StatFlavor::Gnu,
-            ["stat", "bsd"] => stat = StatFlavor::Bsd,
-            _ => {}
-        }
-    }
-    let hash = HashAlgo::CHAIN
-        .into_iter()
-        .find(|a| tools.iter().any(|t| t == a.tool()));
-    let Some(hash) = hash else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "remote host unusable: none of b3sum, md5sum, sha1sum found \
-                 (probed: uname -s, command -v {}; found: [{}], os {os:?}{})",
-                PROBED_TOOLS.join(" "),
-                tools.join(", "),
-                if out.code == 0 {
-                    String::new()
-                } else {
-                    format!(
-                        "; probe exited {}: {}",
-                        out.code,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    )
-                }
-            ),
-        ));
-    };
-    if !tools.iter().any(|t| t == "find") {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "remote host unusable: no `find` (probed: {})",
-                PROBED_TOOLS.join(" ")
-            ),
-        ));
-    }
-    Ok(Capabilities {
-        os,
-        tools,
-        find_printf,
-        stat,
-        hash,
-    })
+    probe_host(x)?.1
 }
 
 /// A remote root resolved: canonical path, filesystem id and type.
@@ -747,8 +778,78 @@ pub struct HostInfo {
 /// it has no usable hash tool or `find` — the agent tier may still work).
 /// The outer `Err` is a host that cannot be reached or runs no command.
 pub fn probe_host(x: &dyn RemoteExec) -> io::Result<(HostInfo, io::Result<Capabilities>)> {
-    let _ = x;
-    unimplemented!("M5 RED")
+    let out = run(x, &["sh", "-c", PROBE_SCRIPT])?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut info = HostInfo::default();
+    let mut told_os = false;
+    let mut tools = Vec::new();
+    let mut find_printf = false;
+    let mut stat = StatFlavor::None;
+    for line in text.lines() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        match w.as_slice() {
+            ["os", rest @ ..] => {
+                told_os = true;
+                info.os = rest.join(" ");
+            }
+            ["arch", rest @ ..] => info.arch = rest.join(" "),
+            ["tool", t, "yes"] if PROBED_TOOLS.contains(t) => tools.push(t.to_string()),
+            ["printf", v] => find_printf = *v == "yes",
+            ["stat", "gnu"] => stat = StatFlavor::Gnu,
+            ["stat", "bsd"] => stat = StatFlavor::Bsd,
+            _ => {}
+        }
+    }
+    if !told_os && out.code != 0 {
+        // Connected, but the probe never ran: a host that runs no command.
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the probe did not run (exit {}): {}",
+                out.code,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    let os = info.os.clone();
+    let hash = HashAlgo::CHAIN
+        .into_iter()
+        .find(|a| tools.iter().any(|t| t == a.tool()));
+    let caps = match hash {
+        None => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "remote host unusable: none of b3sum, md5sum, sha1sum found \
+                 (probed: uname -s, command -v {}; found: [{}], os {os:?}{})",
+                PROBED_TOOLS.join(" "),
+                tools.join(", "),
+                if out.code == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; probe exited {}: {}",
+                        out.code,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )
+                }
+            ),
+        )),
+        Some(_) if !tools.iter().any(|t| t == "find") => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "remote host unusable: no `find` (probed: {})",
+                PROBED_TOOLS.join(" ")
+            ),
+        )),
+        Some(hash) => Ok(Capabilities {
+            os,
+            tools,
+            find_printf,
+            stat,
+            hash,
+        }),
+    };
+    Ok((info, caps))
 }
 
 /// Whether to try the agent tier.
@@ -795,23 +896,59 @@ pub struct AgentBinary {
 
 impl AgentBinary {
     /// This very program, when it is built for [`AGENT_TARGET`].
+    ///
+    /// Read from [`std::env::current_exe`]: the static (musl) release is
+    /// the artifact meant for this. A dynamically linked build uploads too,
+    /// but a host without its libraries fails the `hello` check, and the
+    /// shell tier is used — never a silently broken agent.
     pub fn current() -> Option<AgentBinary> {
-        None
+        if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+            return None;
+        }
+        let bytes = std::fs::read(std::env::current_exe().ok()?).ok()?;
+        Some(AgentBinary {
+            bytes,
+            ver: env!("CARGO_PKG_VERSION").to_string(),
+            os: AGENT_TARGET.0.to_string(),
+            arch: AGENT_TARGET.1.to_string(),
+        })
     }
 
     /// Content-addressed remote file name:
     /// `diskghost-agent-<ver>-<first 8 hex of BLAKE3(bytes)>`.
     pub fn name(&self) -> String {
-        String::new()
+        format!(
+            "diskghost-agent-{}-{}",
+            self.ver,
+            &blake3::hash(&self.bytes).to_hex()[..8]
+        )
     }
 }
 
 /// `$1` = agent file name: `have <abs path>` when it is already there and
 /// executable, else `need <abs path>`. Read-only.
-pub const LOCATE_SCRIPT: &str = "";
+pub const LOCATE_SCRIPT: &str = r#"[ -n "$HOME" ] || exit 5
+d="$HOME/.cache/diskghost"
+if [ -f "$d/$1" ] && [ -x "$d/$1" ]; then echo "have $d/$1"; else echo "need $d/$1"; fi
+"#;
 
 /// `$1` = agent file name, `$2` = its byte length; stdin = the binary.
-pub const UPLOAD_SCRIPT: &str = "";
+/// The only command that writes on a remote host, and only inside
+/// `$HOME/.cache/diskghost/`: a temp file, checked for its full length,
+/// made executable and moved — never over an existing file (`mv -n`) —
+/// to its content-addressed name. Prints the final path. Nothing is ever
+/// removed: an interrupted upload leaves its `.tmp` file behind.
+pub const UPLOAD_SCRIPT: &str = r#"set -e
+[ -n "$HOME" ] || exit 5
+d="$HOME/.cache/diskghost"
+mkdir -p "$d"
+t="$d/.$1.tmp.$$"
+cat > "$t"
+[ "$(wc -c < "$t" | tr -d ' ')" = "$2" ] || exit 4
+chmod 755 "$t"
+mv -n "$t" "$d/$1"
+echo "$d/$1"
+"#;
 
 /// Make sure the host has a working agent: reuse or upload it, then check
 /// its `hello`. `Ok(None)` = use the shell tier (unsupported os/arch, any
@@ -821,8 +958,42 @@ pub fn ensure_agent(
     probe: &HostInfo,
     bin: &AgentBinary,
 ) -> io::Result<Option<std::path::PathBuf>> {
-    let _ = (exec, probe, bin);
-    Ok(None)
+    let target = |os: &str, arch: &str| (os, arch) == AGENT_TARGET;
+    if !target(&probe.os, &probe.arch) || !target(&bin.os, &bin.arch) {
+        return Ok(None);
+    }
+    let name = bin.name();
+    let found = match run(exec, &["sh", "-c", LOCATE_SCRIPT, "sh", &name]) {
+        Ok(o) if o.code == 0 => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return Ok(None),
+    };
+    let (have, path) = match found.split_once(' ') {
+        Some(("have", p)) => (true, p.to_string()),
+        Some(("need", p)) => (false, p.to_string()),
+        _ => return Ok(None),
+    };
+    if !path.starts_with('/') || !path.ends_with(&format!("/.cache/diskghost/{name}")) {
+        return Ok(None);
+    }
+    if !have {
+        let len = bin.bytes.len().to_string();
+        match exec.exec_stdin(&["sh", "-c", UPLOAD_SCRIPT, "sh", &name, &len], &bin.bytes) {
+            Ok(o) if o.code == 0 && String::from_utf8_lossy(&o.stdout).trim() == path => {}
+            _ => return Ok(None),
+        }
+    }
+    let agent = AgentExec {
+        exec,
+        agent: path.clone(),
+    };
+    match agent.hello() {
+        Ok(h)
+            if h.ver == bin.ver && h.arch == probe.arch && h.os.eq_ignore_ascii_case(&probe.os) =>
+        {
+            Ok(Some(std::path::PathBuf::from(path)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The agent's answer to `stat_fs`.
@@ -848,19 +1019,188 @@ pub struct AgentExec<'a> {
 }
 
 impl AgentExec<'_> {
+    /// Send `reqs` in one session; every frame of the answer.
+    fn request(&self, reqs: &[serde_json::Value]) -> io::Result<Vec<serde_json::Value>> {
+        let mut input = Vec::new();
+        for r in reqs {
+            serde_json::to_writer(&mut input, r)?;
+            input.push(b'\n');
+        }
+        let out = self.exec.exec_stdin(&[&self.agent, "agent"], &input)?;
+        if out.code == 255 {
+            return Err(ssh_failure(&out));
+        }
+        let mut frames = Vec::new();
+        for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            frames.push(serde_json::from_slice(line).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("agent sent a line that is not JSON: {e}"),
+                )
+            })?);
+        }
+        if out.code != 0 && frames.is_empty() {
+            return Err(io::Error::other(format!(
+                "agent exited {}: {}",
+                out.code,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(frames)
+    }
+
+    /// The `hello` handshake: a diskghost agent of this protocol.
     pub fn hello(&self) -> io::Result<Hello> {
-        unimplemented!("M5 RED")
+        let f = self.request(&[serde_json::json!({"v": crate::agent::PROTOCOL, "op": "hello"})])?;
+        let h = f.first().cloned().unwrap_or_default();
+        if let Some(e) = agent_error(&h) {
+            return Err(e);
+        }
+        if h["agent"] != "diskghost" || h["v"] != crate::agent::PROTOCOL || h["blake3"] != true {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "not a diskghost agent of protocol v{}: {h}",
+                    crate::agent::PROTOCOL
+                ),
+            ));
+        }
+        let s = |k: &str| h[k].as_str().unwrap_or("").to_string();
+        Ok(Hello {
+            ver: s("ver"),
+            os: s("os"),
+            arch: s("arch"),
+        })
     }
+
+    /// `stat_fs` of `path` (relative paths: to the remote home).
     pub fn stat_fs(&self, path: &str) -> io::Result<AgentFs> {
-        let _ = path;
-        unimplemented!("M5 RED")
+        let f = self.request(&[serde_json::json!({"op": "stat_fs", "root": path})])?;
+        let fr = f.first().cloned().unwrap_or_default();
+        if let Some(e) = agent_error(&fr) {
+            return Err(if e.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("remote folder {path:?} not found: {e}"),
+                )
+            } else {
+                e
+            });
+        }
+        let fs = &fr["fs"];
+        let root = fs["root"]
+            .as_str()
+            .filter(|r| r.starts_with('/'))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad stat_fs frame: {fr}"),
+                )
+            })?
+            .to_string();
+        let fsid = fs["id"].as_str().filter(|id| {
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_hexdigit())
+                && id.bytes().any(|b| b != b'0')
+        });
+        let mount = fs["mount"].as_str().filter(|m| is_under(&root, m));
+        Ok(AgentFs {
+            root: RemoteRoot {
+                fsid: fsid.map(str::to_string),
+                fstype: None,
+                mount: mount.map(str::to_string),
+                root,
+            },
+            cow: fs["cow"] == true,
+            rotational: fs["rotational"] == true,
+        })
     }
+
+    /// Every regular file under `root` (canonical), on its filesystem.
     pub fn enumerate(&self, root: &str) -> io::Result<Listing> {
-        let _ = root;
-        unimplemented!("M5 RED")
+        let frames =
+            self.request(&[serde_json::json!({"op": "enumerate", "root": root, "xdev": true})])?;
+        let mut l = Listing::default();
+        let mut ended = false;
+        for fr in &frames {
+            if let Some(e) = agent_error(fr) {
+                return Err(e);
+            }
+            if let Some(f) = fr.get("f") {
+                let (Some(p), Some(size), Some(mtime_ns), Some(ino)) = (
+                    f["p"]
+                        .as_str()
+                        .filter(|p| !p.is_empty() && !p.starts_with('/')),
+                    f["s"].as_u64(),
+                    f["m"].as_u64(),
+                    f["i"].as_u64(),
+                ) else {
+                    l.skipped += 1;
+                    continue;
+                };
+                l.files.push(RemoteFile {
+                    path: p.to_string(),
+                    size,
+                    mtime_ns,
+                    ino,
+                });
+            } else if fr.get("skip").is_some() {
+                l.skipped += 1;
+            } else if let Some(end) = fr.get("end") {
+                ended = true;
+                l.complete = end["complete"] == true;
+            }
+        }
+        // A stream cut before its end frame lists only part of the tree.
+        l.complete &= ended;
+        Ok(l)
     }
+
+    /// BLAKE3 of each of `paths` (absolute), hashed on the host: one digest
+    /// per path, `None` when it could not be read.
     pub fn hash(&self, paths: &[String]) -> io::Result<Vec<Option<Vec<u8>>>> {
-        let _ = paths;
-        unimplemented!("M5 RED")
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reqs: Vec<serde_json::Value> = paths
+            .chunks(AGENT_HASH_BATCH)
+            .map(|c| serde_json::json!({"op": "hash", "paths": c, "sample": false}))
+            .collect();
+        let frames = self.request(&reqs)?;
+        let mut by_path: std::collections::HashMap<&str, Vec<u8>> =
+            std::collections::HashMap::new();
+        for fr in &frames {
+            if let Some(e) = agent_error(fr) {
+                return Err(e);
+            }
+            let h = &fr["h"];
+            if let (Some(p), Some(full)) = (h["p"].as_str(), h["full"].as_str()) {
+                if let Some(d) = parse_digest(full.as_bytes(), HashAlgo::Blake3) {
+                    by_path.insert(p, d);
+                }
+            }
+        }
+        Ok(paths
+            .iter()
+            .map(|p| by_path.get(p.as_str()).cloned())
+            .collect())
     }
+}
+
+/// Paths per `hash` request (all requests of a run share one session).
+pub const AGENT_HASH_BATCH: usize = 1000;
+
+/// An `{"error":{..}}` frame as an error.
+fn agent_error(frame: &serde_json::Value) -> Option<io::Error> {
+    let e = frame.get("error")?;
+    let code = e["code"].as_str().unwrap_or("error");
+    let kind = match code {
+        "not_found" => io::ErrorKind::NotFound,
+        "version" => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::Other,
+    };
+    Some(io::Error::new(
+        kind,
+        format!("agent: {code}: {}", e["msg"].as_str().unwrap_or("")),
+    ))
 }

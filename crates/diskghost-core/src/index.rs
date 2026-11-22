@@ -12,7 +12,7 @@
 //! disk fills one location, and each scan only answers for the subtree it
 //! walked.
 //!
-//! # Schema (version 4, `PRAGMA user_version`)
+//! # Schema (version 5, `PRAGMA user_version`)
 //!
 //! ```sql
 //! meta      (key TEXT PRIMARY KEY, value INTEGER NOT NULL)
@@ -24,7 +24,9 @@
 //!            role TEXT NOT NULL DEFAULT 'normal'  -- normal | master | scratch
 //!            online INTEGER NOT NULL,     -- reachable at its last scan
 //!            last_seen INTEGER NOT NULL,  -- unix seconds of that scan
-//!            cow INTEGER)                 -- v2: copy-on-write fs at that scan
+//!            cow INTEGER,                 -- v2: copy-on-write fs at that scan
+//!            transport TEXT)              -- v5: shell | agent (remote: how its
+//!                                         -- last scan listed and hashed; local: 'shell')
 //! files     (location_id → locations(id) ON DELETE CASCADE,
 //!            path TEXT,                   -- relative to locations.root
 //!            size, mtime_ns, dev, ino INTEGER,
@@ -51,9 +53,10 @@
 //! root `''`. Its files are listed and
 //! hashed by the remote host; this machine never reads them, and no local
 //! check ever looks at its `root` (that path may exist here too, holding
-//! other files). Its `full` digest is BLAKE3 when the host has `b3sum`, else
-//! MD5 / SHA-1 (`algo`) — comparable only with digests of the same
-//! algorithm. `sample` stays NULL.
+//! other files). Its `full` digest is BLAKE3 when the host has `b3sum` or
+//! runs the uploaded agent (`transport = 'agent'`), else MD5 / SHA-1
+//! (`algo`) — comparable only with digests of the same algorithm. `sample`
+//! stays NULL.
 //!
 //! A **scan root** is a folder `index add` was given. One volume may have
 //! several. `apply` quarantines a file into the longest scan root holding
@@ -85,7 +88,7 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
@@ -154,6 +157,12 @@ DROP TABLE files;
 ALTER TABLE files_v4 RENAME TO files;
 CREATE INDEX files_size ON files(size);
 CREATE INDEX files_full ON files(full) WHERE full IS NOT NULL;
+",
+    // v5: how a remote location was last listed and hashed — the uploaded
+    // agent or the host's shell tools. Local rows keep the default.
+    r"
+ALTER TABLE locations ADD COLUMN transport TEXT NOT NULL DEFAULT 'shell'
+    CHECK (transport IN ('shell', 'agent'));
 ",
 ];
 
@@ -777,14 +786,59 @@ pub(crate) fn remote_scan_with(
     bin: Option<&crate::remote::AgentBinary>,
     progress: &Progress,
 ) -> io::Result<ScanSummary> {
-    let _ = (mode, bin);
-    use crate::remote::{enum_remote, hash_remote, parse_ssh_url, probe, resolve_root};
+    use crate::remote::{
+        ensure_agent, enum_remote, hash_remote, parse_ssh_url, probe_host, resolve_root,
+        shell_unavailable, AgentExec, AgentMode, HashAlgo,
+    };
     let (host, path) =
         parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // Everything the host is asked before the index changes: an
     // unreachable or unusable host records nothing.
-    let caps = probe(x)?;
-    let rr = resolve_root(x, &caps, &path)?;
+    let (info, caps) = probe_host(x).map_err(|e| {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            shell_unavailable(&host, &e.to_string())
+        } else {
+            e
+        }
+    })?;
+    // The top tier: our own agent on the host, when it runs there.
+    let agent_path = match (mode, bin) {
+        (AgentMode::Auto, Some(b)) => ensure_agent(x, &info, b)?,
+        _ => None,
+    };
+    // Which tier lists and hashes: the agent, or the host's own tools
+    // (and without those nothing: the probe's "unusable" error).
+    enum Tier<'a> {
+        Agent(AgentExec<'a>),
+        Shell(crate::remote::Capabilities),
+    }
+    let tier = match agent_path.as_deref().and_then(Path::to_str) {
+        Some(p) => Tier::Agent(AgentExec {
+            exec: x,
+            agent: p.to_string(),
+        }),
+        None => Tier::Shell(caps?),
+    };
+    let (rr, cow) = match &tier {
+        Tier::Agent(a) => {
+            let fs = a.stat_fs(&path)?;
+            (fs.root, Some(fs.cow))
+        }
+        Tier::Shell(caps) => {
+            let rr = resolve_root(x, caps, &path)?;
+            let cow = rr.fstype.as_deref().map(|t| {
+                matches!(
+                    t,
+                    "btrfs" | "zfs" | "xfs" | "bcachefs" | "overlayfs" | "overlay"
+                )
+            });
+            (rr, cow)
+        }
+    };
+    let (algo, transport) = match &tier {
+        Tier::Agent(_) => (HashAlgo::Blake3, "agent"),
+        Tier::Shell(c) => (c.hash, "shell"),
+    };
     // A filesystem with its mountpoint, like a local volume; else the
     // folder alone. `base` is the `root` column, `prefix` the scan root.
     let (uuid, base, prefix) = match (&rr.fsid, &rr.mount) {
@@ -804,34 +858,40 @@ pub(crate) fn remote_scan_with(
             String::new(),
         ),
     };
-    let mut listing = enum_remote(x, &caps, &rr.root)?;
+    let mut listing = match &tier {
+        Tier::Agent(a) => a.enumerate(&rr.root)?,
+        Tier::Shell(c) => enum_remote(x, c, &rr.root)?,
+    };
     if !prefix.is_empty() {
         for f in &mut listing.files {
             f.path = format!("{prefix}/{}", f.path);
         }
     }
-    let cow = rr.fstype.as_deref().map(|t| {
-        matches!(
-            t,
-            "btrfs" | "zfs" | "xfs" | "bcachefs" | "overlayfs" | "overlay"
-        )
-    });
     let mut sum = ScanSummary {
         uuid: uuid.clone(),
         root: PathBuf::from(&base),
         skipped: listing.skipped,
-        algo: Some(caps.hash.as_str().to_string()),
+        algo: Some(algo.as_str().to_string()),
+        transport: Some(transport.to_string()),
         ..ScanSummary::default()
     };
 
     let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
     let loc: i64 = tx
         .query_row(
-            "INSERT INTO locations (uuid, host, root, online, last_seen, cow) \
-             VALUES (?1, ?2, ?3, 1, ?4, ?5) \
+            "INSERT INTO locations (uuid, host, root, online, last_seen, cow, transport) \
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6) \
              ON CONFLICT(uuid) DO UPDATE SET host = excluded.host, root = excluded.root, \
-             online = 1, last_seen = excluded.last_seen, cow = excluded.cow RETURNING id",
-            params![uuid, format!("ssh://{host}"), base, now_secs(), cow],
+             online = 1, last_seen = excluded.last_seen, cow = excluded.cow, \
+             transport = excluded.transport RETURNING id",
+            params![
+                uuid,
+                format!("ssh://{host}"),
+                base,
+                now_secs(),
+                cow,
+                transport
+            ],
             |r| r.get(0),
         )
         .map_err(db_err)?;
@@ -936,7 +996,10 @@ pub(crate) fn remote_scan_with(
         abs.len() as u64,
         pending.iter().map(|(_, s, ..)| *s as u64).sum(),
     );
-    let digests = hash_remote(x, &caps, &abs)?;
+    let digests = match &tier {
+        Tier::Agent(a) => a.hash(&abs)?,
+        Tier::Shell(c) => hash_remote(x, c, &abs)?,
+    };
     let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
     let mut hashed = 0;
     {
@@ -952,7 +1015,7 @@ pub(crate) fn remote_scan_with(
             progress.bytes.fetch_add(*size as u64, Ordering::Relaxed);
             if let Some(d) = d {
                 hashed += set
-                    .execute(params![loc, path, d, caps.hash.as_str(), size, mtime, ino])
+                    .execute(params![loc, path, d, algo.as_str(), size, mtime, ino])
                     .map_err(db_err)? as u64;
             }
         }
@@ -1592,6 +1655,9 @@ mod tests {
         {
             let c = Connection::open(&path).unwrap();
             c.execute_batch("DROP TABLE IF EXISTS scan_roots").unwrap();
+            // v5 added a column: take it away again, as v2 had none.
+            c.execute_batch("ALTER TABLE locations DROP COLUMN transport")
+                .unwrap();
             c.pragma_update(None, "user_version", 2).unwrap();
         }
         let idx = Index::open(&path).unwrap();

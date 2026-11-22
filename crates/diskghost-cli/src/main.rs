@@ -254,10 +254,13 @@ enum IndexAction {
     /// whose size matches another indexed file get their ends hashed.
     ///
     /// A folder may be remote: `ssh://host/path` (`ssh://host//abs/path`
-    /// for an absolute path). The host lists and hashes its own files with
-    /// its own tools (find, stat, b3sum / md5sum / sha1sum) — nothing is
-    /// installed there, and no file content crosses the network. Without
-    /// b3sum its MD5 / SHA-1 digests are only compared with each other.
+    /// for an absolute path). The host lists and hashes its own files — no
+    /// file content crosses the network. On a Linux x86_64 host this program
+    /// copies itself to ~/.cache/diskghost/ there (once per version) and runs
+    /// as a read-only agent (BLAKE3); elsewhere, or with `--agent never`, the
+    /// host's own tools are used (find, stat, b3sum / md5sum / sha1sum).
+    /// Without b3sum those MD5 / SHA-1 digests are only compared with each
+    /// other.
     Add {
         /// Folders to index (local paths or ssh://host/path).
         #[arg(required = true)]
@@ -1144,8 +1147,12 @@ fn print_index_add(path: &Path, s: &ScanSummary) {
     );
     match (s.hashed, &s.algo) {
         (Some(h), Some(algo)) => println!(
-            "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} hashed on the host ({algo})",
-            s.seen, s.new, s.changed, s.unchanged, s.vanished, h
+            "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} hashed on the host ({algo}, via {})",
+            s.seen, s.new, s.changed, s.unchanged, s.vanished, h,
+            match s.transport.as_deref() {
+                Some("agent") => "the diskghost agent",
+                _ => "its shell tools",
+            }
         ),
         _ => println!(
             "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} sampled",

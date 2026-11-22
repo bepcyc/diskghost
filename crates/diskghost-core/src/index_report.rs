@@ -829,7 +829,11 @@ fn hash_all(
 
 /// Run `f` over `items` with `n` threads that each take the next item in
 /// order — so a spinning disk sees (nearly) one front-to-back pass.
-fn in_order<T: Send>(n: usize, items: &[HashItem], f: &(dyn Fn(&HashItem) -> T + Sync)) -> Vec<T> {
+pub(crate) fn in_order<T: Send>(
+    n: usize,
+    items: &[HashItem],
+    f: &(dyn Fn(&HashItem) -> T + Sync),
+) -> Vec<T> {
     let next = AtomicUsize::new(0);
     let mut out = Vec::new();
     std::thread::scope(|s| {
