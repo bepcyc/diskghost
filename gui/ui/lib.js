@@ -68,6 +68,16 @@
   // a POSIX root "/", and a UNC share "\\server\share" stays one segment.
   function crumbs(path) {
     const p = String(path);
+    // A remote scan, `ssh://host//abs/path`: the host's own POSIX crumbs,
+    // each target again an ssh:// URL (the form the scan's root has).
+    const ssh = p.match(/^(ssh:\/\/[^/]+)\/(.*)$/);
+    if (ssh) {
+      const rest = ssh[2].startsWith("/") ? ssh[2] : `/${ssh[2]}`;
+      return crumbs(rest).map((c, i) => ({
+        label: i === 0 ? `${ssh[1].slice(6)}:/` : c.label,
+        target: `${ssh[1]}/${c.target}`,
+      }));
+    }
     const win = p.includes("\\") || /^[A-Za-z]:/.test(p);
     const sep = win ? "\\" : "/";
     let parts = p.split(/[\\/]+/).filter((s, i) => s !== "" || i === 0);
@@ -362,6 +372,8 @@
     const m = p.match(/^([A-Za-z]:)/);
     if (m) return m[1].toLowerCase();
     if (p.startsWith("\\\\")) return crumbs(p)[0].target.toLowerCase();
+    const ssh = p.match(/^ssh:\/\/[^/]+/);
+    if (ssh) return ssh[0].toLowerCase();
     return "/";
   }
 

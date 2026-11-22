@@ -297,6 +297,22 @@ async fn scan_dir(
 ) -> Result<View, String> {
     let running = Running::start(&app, job);
     blocking(move || {
+        if is_remote_url(&path) {
+            // Listed on the host itself (one filesystem, like a drive);
+            // the walk options do not apply there. The host's own error
+            // ("not found", unreachable, no shell) is shown as it is.
+            let bin = agent_binary();
+            let listing = diskghost_core::remote_listing_using(
+                &path,
+                diskghost_core::remote::AgentMode::Auto,
+                bin.as_ref(),
+                &running.progress,
+            )
+            .map_err(|e| e.to_string())?;
+            let tree = listing.tree();
+            drop(running);
+            return keep_tree(&app, job, tree, None, top, keep_snapshots);
+        }
         let requested = PathBuf::from(&path);
         if !requested.is_dir() {
             return Err(format!("not a directory: {path}"));
@@ -309,34 +325,47 @@ async fn scan_dir(
         opts.same_file_system = is_mount_point(&requested);
         let (tree, snap) = build_tree(&app, job, &requested, &opts, &running.progress);
         drop(running);
-        let view = view_of(&tree, tree.root(), top).ok_or("scan produced no tree")?;
-        let complete = tree.complete();
-        let root = tree.root().to_path_buf();
-        let shared: Shared = Arc::new(RwLock::new(Cached {
-            tree,
-            views: HashMap::new(),
-            current: Mutex::new(snap.map(Arc::new)),
-        }));
-        if let Ok(mut trees) = app.state::<AppState>().trees.lock() {
-            trees.insert(job, shared.clone());
-        }
-        // A cancelled or depth-limited walk is a partial view: browsable, but
-        // never recorded as a point in the folder's history.
-        if complete {
-            let app = app.clone();
-            std::thread::spawn(move || {
-                let Ok(snap) = current_snapshot(&shared) else {
-                    return;
-                };
-                let keep = keep_snapshots.unwrap_or(DEFAULT_SNAPSHOTS_PER_ROOT);
-                let saved =
-                    snapshot_dir(&app, &root).and_then(|dir| store_snapshot(&dir, &snap, keep));
-                let _ = app.emit("snapshot-saved", (job, saved.err()));
-            });
-        }
-        Ok(view)
+        keep_tree(&app, job, tree, snap, top, keep_snapshots)
     })
     .await
+}
+
+/// Keep `tree` as job `job`'s and return the view of its root. A complete
+/// tree is also recorded as a snapshot — in the background, so the result
+/// shows up at once.
+fn keep_tree(
+    app: &tauri::AppHandle,
+    job: u64,
+    tree: ScanTree,
+    snap: Option<Snapshot>,
+    top: usize,
+    keep_snapshots: Option<usize>,
+) -> Result<View, String> {
+    let view = view_of(&tree, tree.root(), top).ok_or("scan produced no tree")?;
+    let complete = tree.complete();
+    let root = tree.root().to_path_buf();
+    let shared: Shared = Arc::new(RwLock::new(Cached {
+        tree,
+        views: HashMap::new(),
+        current: Mutex::new(snap.map(Arc::new)),
+    }));
+    if let Ok(mut trees) = app.state::<AppState>().trees.lock() {
+        trees.insert(job, shared.clone());
+    }
+    // A cancelled, partial or depth-limited scan is a partial view:
+    // browsable, but never recorded as a point in the folder's history.
+    if complete {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let Ok(snap) = current_snapshot(&shared) else {
+                return;
+            };
+            let keep = keep_snapshots.unwrap_or(DEFAULT_SNAPSHOTS_PER_ROOT);
+            let saved = snapshot_dir(&app, &root).and_then(|dir| store_snapshot(&dir, &snap, keep));
+            let _ = app.emit("snapshot-saved", (job, saved.err()));
+        });
+    }
+    Ok(view)
 }
 
 /// Walk `path`. The MFT engine needs administrator rights, which this window
@@ -535,6 +564,12 @@ async fn find_dupes(
 ) -> Result<Vec<DupGroup>, String> {
     let running = Running::start(&app, job);
     blocking(move || {
+        if is_remote_url(&path) {
+            return Err(format!(
+                "{path}: duplicates on a remote host are found with \
+                 `diskghost index add {path}` and `diskghost dupes --index`"
+            ));
+        }
         let p = PathBuf::from(&path);
         if !p.is_dir() {
             return Err(format!("not a directory: {path}"));
@@ -629,6 +664,12 @@ async fn reclaim_dupes(
         let mut done = Vec::new();
         // One path at a time, so the outcome of each is known exactly: the
         // view drops just those copies instead of searching again.
+        for j in &jobs {
+            refuse_remote(&j.keep)?;
+            for p in &j.remove {
+                refuse_remote(p)?;
+            }
+        }
         for j in jobs {
             let keep = PathBuf::from(&j.keep);
             for p in j.remove {
@@ -683,6 +724,7 @@ async fn remove_path_cmd(
 ) -> Result<RemoveReport, String> {
     let running = Running::start(&app, job);
     blocking(move || {
+        refuse_remote(&path)?;
         let p = PathBuf::from(&path);
         if !p.exists() {
             return Err(format!("no such path: {path}"));
@@ -846,6 +888,47 @@ fn drives() -> Vec<Drive> {
 
 #[cfg(not(windows))]
 fn drives() -> Vec<Drive> {
+    // Every real local filesystem, wherever it is mounted (`/d/models2`,
+    // `/home`, …). Where the mount table cannot be read (macOS), the
+    // folders volumes are usually mounted in.
+    let mounts = diskghost_core::local_mounts();
+    let list = if mounts.is_empty() {
+        mount_folder_drives()
+            .into_iter()
+            .map(|p| {
+                let kind = if p == Path::new("/") {
+                    "fixed"
+                } else {
+                    "other"
+                };
+                (p, String::new(), kind)
+            })
+            .collect()
+    } else {
+        drive_list(&mounts)
+    };
+    list.into_iter()
+        .map(|(p, fs, kind)| {
+            let (total, free) = disk_space(&p);
+            Drive {
+                label: p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                fs,
+                kind: kind.into(),
+                path: p.to_string_lossy().into_owned(),
+                total,
+                free,
+            }
+        })
+        .collect()
+}
+
+/// `/` plus the mount points directly in the folders volumes are usually
+/// mounted in — for systems without `/proc/self/mountinfo`.
+#[cfg(not(windows))]
+fn mount_folder_drives() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/")];
     let user = std::env::var("USER").unwrap_or_default();
     for parent in [
@@ -870,34 +953,42 @@ fn drives() -> Vec<Drive> {
         }
     }
     roots
-        .into_iter()
-        .map(|p| {
-            let (total, free) = disk_space(&p);
-            Drive {
-                label: p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                fs: String::new(),
-                kind: if p == Path::new("/") {
-                    "fixed"
-                } else {
-                    "other"
-                }
-                .into(),
-                path: p.to_string_lossy().into_owned(),
-                total,
-                free,
-            }
-        })
-        .collect()
 }
 
 /// A remote folder (`ssh://host/path`): scanned over ssh, never touched
 /// as a local path.
 fn is_remote_url(path: &str) -> bool {
-    let _ = path;
-    false
+    path.starts_with("ssh://")
+}
+
+/// Refuse to delete, trash or link anything of a remote scan: its paths
+/// name files on another machine, never local ones.
+fn refuse_remote(path: &str) -> Result<(), String> {
+    if is_remote_url(path) {
+        Err(format!(
+            "{path} is on a remote host: Diskghost never changes remote files"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The agent to run on a remote host: the command-line `diskghost` shipped
+/// next to this app, else the one on the `PATH`. `None`: the host's own
+/// shell tools list the folder.
+fn agent_binary() -> Option<diskghost_core::remote::AgentBinary> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("diskghost")));
+    let on_path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join("diskghost"));
+    beside
+        .into_iter()
+        .chain(on_path)
+        .find(|p| p.is_file())
+        .and_then(|p| diskghost_core::remote::AgentBinary::from_file(&p))
 }
 
 /// The drives to offer for the real local filesystems `mounts`: `/` first
@@ -905,8 +996,26 @@ fn is_remote_url(path: &str) -> bool {
 /// mount point. (path, filesystem type, kind).
 #[cfg(unix)]
 fn drive_list(mounts: &[diskghost_core::LocalMount]) -> Vec<(PathBuf, String, &'static str)> {
-    let _ = mounts;
-    Vec::new()
+    let root = Path::new("/");
+    let root_fs = mounts
+        .iter()
+        .find(|m| m.mount_point == root)
+        .map(|m| m.fstype.clone())
+        .unwrap_or_default();
+    let mut rest: Vec<&diskghost_core::LocalMount> =
+        mounts.iter().filter(|m| m.mount_point != root).collect();
+    rest.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    std::iter::once((root.to_path_buf(), root_fs, "fixed"))
+        .chain(rest.into_iter().map(|m| {
+            let p = &m.mount_point;
+            let kind = if p.starts_with("/media") || p.starts_with("/run/media") {
+                "removable"
+            } else {
+                "other"
+            };
+            (p.clone(), m.fstype.clone(), kind)
+        }))
+        .collect()
 }
 
 /// Where the UI's settings are kept.

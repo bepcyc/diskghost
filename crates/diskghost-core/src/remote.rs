@@ -914,6 +914,22 @@ impl AgentBinary {
         })
     }
 
+    /// The `diskghost` program at `path` as the agent (a GUI is no agent
+    /// itself: it ships the command-line program next to it). Assumed to be
+    /// this version; a different one fails the `hello` check and the shell
+    /// tier is used.
+    pub fn from_file(path: &std::path::Path) -> Option<AgentBinary> {
+        if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+            return None;
+        }
+        Some(AgentBinary {
+            bytes: std::fs::read(path).ok()?,
+            ver: env!("CARGO_PKG_VERSION").to_string(),
+            os: AGENT_TARGET.0.to_string(),
+            arch: AGENT_TARGET.1.to_string(),
+        })
+    }
+
     /// Content-addressed remote file name:
     /// `diskghost-agent-<ver>-<first 8 hex of BLAKE3(bytes)>`.
     pub fn name(&self) -> String {
@@ -1280,7 +1296,17 @@ impl RemoteListing {
 
     /// The listing as a browsable tree rooted at [`RemoteListing::url`].
     pub fn tree(&self) -> crate::ScanTree {
-        crate::ScanTree::from_entries(std::path::Path::new(&self.url()), Vec::new())
+        let mut t = crate::ScanTree::from_remote(
+            std::path::Path::new(&self.url()),
+            &self.listing.files,
+            self.listing.skipped,
+            self.listing.complete,
+            self.disk,
+        );
+        if self.cancelled {
+            t.mark_cancelled();
+        }
+        t
     }
 }
 
@@ -1292,13 +1318,24 @@ pub fn remote_listing(
     mode: AgentMode,
     progress: &crate::Progress,
 ) -> io::Result<RemoteListing> {
-    let (host, _) =
-        parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let bin = match mode {
         AgentMode::Auto => AgentBinary::current(),
         AgentMode::Never => None,
     };
-    remote_listing_with(url, &SshExec::new(&host), mode, bin.as_ref(), progress)
+    remote_listing_using(url, mode, bin.as_ref(), progress)
+}
+
+/// [`remote_listing`] offering `bin` as the agent (`None`: the shell tier,
+/// with a note saying why).
+pub fn remote_listing_using(
+    url: &str,
+    mode: AgentMode,
+    bin: Option<&AgentBinary>,
+    progress: &crate::Progress,
+) -> io::Result<RemoteListing> {
+    let (host, _) =
+        parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    remote_listing_with(url, &SshExec::new(&host), mode, bin, progress)
 }
 
 /// [`remote_listing`] running its commands through `x`.
@@ -1309,8 +1346,152 @@ pub(crate) fn remote_listing_with(
     bin: Option<&AgentBinary>,
     progress: &crate::Progress,
 ) -> io::Result<RemoteListing> {
-    let _ = (url, x, mode, bin, progress);
-    Err(io::Error::other("remote_listing: not implemented"))
+    use std::sync::atomic::Ordering;
+    let opened = open_remote(url, x, mode, bin)?;
+    // One `find` (or one agent stream) lists everything: cancelling can
+    // only stop the scan before it starts.
+    let cancelled = progress.cancelled();
+    let listing = if cancelled {
+        Listing::default()
+    } else {
+        opened.enumerate()?
+    };
+    progress
+        .files
+        .store(listing.files.len() as u64, Ordering::Relaxed);
+    progress.bytes.store(
+        listing.files.iter().map(|f| f.size).sum(),
+        Ordering::Relaxed,
+    );
+    Ok(RemoteListing {
+        host: opened.host.clone(),
+        root: opened.rr.root.clone(),
+        listing,
+        transport: opened.transport(),
+        agent_note: opened.agent_note.clone(),
+        // Neither `resolve_root` nor the agent's `stat_fs` reports space.
+        disk: None,
+        cancelled,
+    })
+}
+
+/// Which tier lists and hashes a remote folder.
+pub(crate) enum Tier<'a> {
+    /// Our own agent on the host.
+    Agent(AgentExec<'a>),
+    /// The host's own `find` / `stat` / hash tools.
+    Shell(Capabilities),
+}
+
+/// A remote folder ready to list: host probed, tier chosen, root resolved.
+pub(crate) struct Opened<'a> {
+    pub(crate) host: String,
+    x: &'a dyn RemoteExec,
+    tier: Tier<'a>,
+    pub(crate) rr: RemoteRoot,
+    /// Whether the filesystem is copy-on-write, when known.
+    pub(crate) cow: Option<bool>,
+    /// Why the agent tier was not used, when it was wanted.
+    pub(crate) agent_note: Option<String>,
+}
+
+impl Opened<'_> {
+    /// `agent` or `shell`.
+    pub(crate) fn transport(&self) -> &'static str {
+        match self.tier {
+            Tier::Agent(_) => "agent",
+            Tier::Shell(_) => "shell",
+        }
+    }
+
+    /// The digest [`Opened::hash`] makes.
+    pub(crate) fn algo(&self) -> HashAlgo {
+        match &self.tier {
+            Tier::Agent(_) => HashAlgo::Blake3,
+            Tier::Shell(c) => c.hash,
+        }
+    }
+
+    /// Every regular file under the root, on its filesystem.
+    pub(crate) fn enumerate(&self) -> io::Result<Listing> {
+        match &self.tier {
+            Tier::Agent(a) => a.enumerate(&self.rr.root),
+            Tier::Shell(c) => enum_remote(self.x, c, &self.rr.root),
+        }
+    }
+
+    /// Digest of each of `abs` (absolute paths), made on the host.
+    pub(crate) fn hash(&self, abs: &[String]) -> io::Result<Vec<Option<Vec<u8>>>> {
+        match &self.tier {
+            Tier::Agent(a) => a.hash(abs),
+            Tier::Shell(c) => hash_remote(self.x, c, abs),
+        }
+    }
+}
+
+/// Probe the host of `url`, pick the tier (the agent when `mode` allows and
+/// it runs there, else the shell tools) and resolve the folder. Read-only
+/// apart from the agent upload into `~/.cache/diskghost/`.
+pub(crate) fn open_remote<'a>(
+    url: &str,
+    x: &'a dyn RemoteExec,
+    mode: AgentMode,
+    bin: Option<&AgentBinary>,
+) -> io::Result<Opened<'a>> {
+    let (host, path) =
+        parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let (info, caps) = probe_host(x).map_err(|e| {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            shell_unavailable(&host, &e.to_string())
+        } else {
+            e
+        }
+    })?;
+    // The top tier: our own agent on the host, when it runs there.
+    let (agent_path, agent_note) = match (mode, bin) {
+        (AgentMode::Never, _) => (None, None),
+        (AgentMode::Auto, None) => (
+            None,
+            Some("this build cannot serve as an agent (only a Linux x86_64 build can)".into()),
+        ),
+        (AgentMode::Auto, Some(b)) => match ensure_agent_why(x, &info, b) {
+            Ok(p) => (Some(p), None),
+            Err(why) => (None, Some(why)),
+        },
+    };
+    // Without the agent, the host's own tools (and without those nothing:
+    // the probe's "unusable" error).
+    let tier = match agent_path.as_deref().and_then(std::path::Path::to_str) {
+        Some(p) => Tier::Agent(AgentExec {
+            exec: x,
+            agent: p.to_string(),
+        }),
+        None => Tier::Shell(caps?),
+    };
+    let (rr, cow) = match &tier {
+        Tier::Agent(a) => {
+            let fs = a.stat_fs(&path)?;
+            (fs.root, Some(fs.cow))
+        }
+        Tier::Shell(caps) => {
+            let rr = resolve_root(x, caps, &path)?;
+            let cow = rr.fstype.as_deref().map(|t| {
+                matches!(
+                    t,
+                    "btrfs" | "zfs" | "xfs" | "bcachefs" | "overlayfs" | "overlay"
+                )
+            });
+            (rr, cow)
+        }
+    };
+    Ok(Opened {
+        host,
+        x,
+        tier,
+        rr,
+        cow,
+        agent_note,
+    })
 }
 
 /// The folder `url` (`ssh://host/path`) as a browsable tree, listed on the

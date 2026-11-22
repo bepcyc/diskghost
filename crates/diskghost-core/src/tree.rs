@@ -475,8 +475,42 @@ impl ScanTree {
         complete: bool,
         disk: Option<(u64, u64)>,
     ) -> ScanTree {
-        let _ = (files, skipped, complete, disk);
-        ScanTree::from_entries(root, Vec::new())
+        let mut sorted: Vec<&crate::remote::RemoteFile> = files.iter().collect();
+        // Byte order keeps everything under `a/` together, right after `a`'s
+        // first file: each folder is emitted once, before its contents.
+        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut inodes = std::collections::HashSet::new();
+        let mut entries = Vec::with_capacity(sorted.len());
+        // Folders (as path components) of the previous entry.
+        let mut open: Vec<&str> = Vec::new();
+        for f in sorted {
+            // One remote filesystem: the inode alone names a file (0: the
+            // host did not tell it).
+            if f.ino != 0 && !inodes.insert(f.ino) {
+                continue;
+            }
+            let mut dirs: Vec<&str> = f.path.split('/').collect();
+            dirs.pop();
+            let common = open.iter().zip(&dirs).take_while(|(a, b)| a == b).count();
+            for depth in common..dirs.len() {
+                entries.push((dirs[..=depth].join("/").into_bytes(), ENTRY_DIR, 0));
+            }
+            entries.push((f.path.clone().into_bytes(), ENTRY_FILE, f.size));
+            open = dirs;
+        }
+        let mut tree = ScanTree::from_entries(root, entries);
+        tree.skipped = skipped;
+        if !complete {
+            // Rows the host could not list are missing: the totals are a
+            // lower bound, and the tree is never worth a snapshot.
+            for node in &mut tree.nodes {
+                node.complete = false;
+            }
+        }
+        let (total, free) = disk.unwrap_or((0, 0));
+        tree.disk_total = total;
+        tree.disk_free = free;
+        tree
     }
 
     /// The directory this tree was built from.

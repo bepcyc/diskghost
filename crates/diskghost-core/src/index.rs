@@ -794,66 +794,12 @@ pub(crate) fn remote_scan_with(
     bin: Option<&crate::remote::AgentBinary>,
     progress: &Progress,
 ) -> io::Result<ScanSummary> {
-    use crate::remote::{
-        ensure_agent_why, enum_remote, hash_remote, parse_ssh_url, probe_host, resolve_root,
-        shell_unavailable, AgentExec, AgentMode, HashAlgo,
-    };
-    let (host, path) =
-        parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // Everything the host is asked before the index changes: an
     // unreachable or unusable host records nothing.
-    let (info, caps) = probe_host(x).map_err(|e| {
-        if e.kind() == io::ErrorKind::PermissionDenied {
-            shell_unavailable(&host, &e.to_string())
-        } else {
-            e
-        }
-    })?;
-    // The top tier: our own agent on the host, when it runs there.
-    let (agent_path, agent_note) = match (mode, bin) {
-        (AgentMode::Never, _) => (None, None),
-        (AgentMode::Auto, None) => (
-            None,
-            Some("this build cannot serve as an agent (only a Linux x86_64 build can)".into()),
-        ),
-        (AgentMode::Auto, Some(b)) => match ensure_agent_why(x, &info, b) {
-            Ok(p) => (Some(p), None),
-            Err(why) => (None, Some(why)),
-        },
-    };
-    // Which tier lists and hashes: the agent, or the host's own tools
-    // (and without those nothing: the probe's "unusable" error).
-    enum Tier<'a> {
-        Agent(AgentExec<'a>),
-        Shell(crate::remote::Capabilities),
-    }
-    let tier = match agent_path.as_deref().and_then(Path::to_str) {
-        Some(p) => Tier::Agent(AgentExec {
-            exec: x,
-            agent: p.to_string(),
-        }),
-        None => Tier::Shell(caps?),
-    };
-    let (rr, cow) = match &tier {
-        Tier::Agent(a) => {
-            let fs = a.stat_fs(&path)?;
-            (fs.root, Some(fs.cow))
-        }
-        Tier::Shell(caps) => {
-            let rr = resolve_root(x, caps, &path)?;
-            let cow = rr.fstype.as_deref().map(|t| {
-                matches!(
-                    t,
-                    "btrfs" | "zfs" | "xfs" | "bcachefs" | "overlayfs" | "overlay"
-                )
-            });
-            (rr, cow)
-        }
-    };
-    let (algo, transport) = match &tier {
-        Tier::Agent(_) => (HashAlgo::Blake3, "agent"),
-        Tier::Shell(c) => (c.hash, "shell"),
-    };
+    let opened = crate::remote::open_remote(url, x, mode, bin)?;
+    let (host, rr, cow) = (opened.host.clone(), opened.rr.clone(), opened.cow);
+    let (algo, transport) = (opened.algo(), opened.transport());
+    let agent_note = opened.agent_note.clone();
     // A filesystem with its mountpoint, like a local volume; else the
     // folder alone. `base` is the `root` column, `prefix` the scan root.
     let (uuid, base, prefix) = match (&rr.fsid, &rr.mount) {
@@ -873,10 +819,7 @@ pub(crate) fn remote_scan_with(
             String::new(),
         ),
     };
-    let mut listing = match &tier {
-        Tier::Agent(a) => a.enumerate(&rr.root)?,
-        Tier::Shell(c) => enum_remote(x, c, &rr.root)?,
-    };
+    let mut listing = opened.enumerate()?;
     if !prefix.is_empty() {
         for f in &mut listing.files {
             f.path = format!("{prefix}/{}", f.path);
@@ -1012,10 +955,7 @@ pub(crate) fn remote_scan_with(
         abs.len() as u64,
         pending.iter().map(|(_, s, ..)| *s as u64).sum(),
     );
-    let digests = match &tier {
-        Tier::Agent(a) => a.hash(&abs)?,
-        Tier::Shell(c) => hash_remote(x, c, &abs)?,
-    };
+    let digests = opened.hash(&abs)?;
     let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
     let mut hashed = 0;
     {

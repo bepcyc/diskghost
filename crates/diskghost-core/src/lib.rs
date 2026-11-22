@@ -56,7 +56,7 @@ pub use plan::{make_plan, Plan, PLAN_VERSION};
 pub use policy::{Distinct, Policy};
 pub use rotational::is_rotational;
 
-pub use remote::{remote_listing, remote_tree, RemoteListing};
+pub use remote::{remote_listing, remote_listing_using, remote_tree, RemoteListing};
 pub use snapshot::{
     diff, format_timestamp, DiffReport, DirDelta, FileDelta, Snapshot, SnapshotError,
     DIFF_FILE_LIMIT, SNAPSHOT_FORMAT,

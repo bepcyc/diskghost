@@ -318,8 +318,31 @@ const REAL_FS: &[&str] = &[
 /// The real local filesystems of a `/proc/self/mountinfo` text, each once
 /// (first mountpoint of a device wins), in mount-table order.
 pub(crate) fn local_mounts_from(info: &str) -> Vec<LocalMount> {
-    let _ = (info, REAL_FS);
-    Vec::new()
+    let mut seen = HashSet::new();
+    info.lines()
+        .filter_map(parse_mountinfo_entry)
+        // A bind mount or a btrfs subvolume shows part of a filesystem
+        // that is (or could be) listed whole: counting it would count the
+        // same data twice.
+        .filter(|m| m.root == "/")
+        .filter(|m| !is_remote_fs(&m.fstype) && is_storage_fs(&m.fstype))
+        .filter(|m| seen.insert(m.dev))
+        .map(|m| LocalMount {
+            dev: m.dev,
+            mount_point: m.mount_point,
+            fstype: m.fstype,
+            source: m.source,
+        })
+        .collect()
+}
+
+/// Whether `fstype` holds data on local storage: [`REAL_FS`], or a FUSE
+/// filesystem that only re-presents local storage ([`LOCAL_FUSE`]).
+fn is_storage_fs(fstype: &str) -> bool {
+    REAL_FS.contains(&fstype)
+        || fstype
+            .strip_prefix("fuse.")
+            .is_some_and(|sub| LOCAL_FUSE.contains(&sub))
 }
 
 /// Every real local filesystem mounted on this machine (Linux: from
@@ -978,7 +1001,7 @@ mod tests {
 109 29 0:80 / /net/nas rw shared:62 - nfs4 nas:/export rw,vers=4.2
 110 29 8:1 / /media/u/win rw shared:63 - fuseblk /dev/sda1 rw,user_id=0
 111 29 0:81 / /srv/pool rw shared:64 - fuse.mergerfs pool rw
-112 29 8:2 / /media/u/X9\040Pro rw shared:65 - exfat /dev/sda2 rw
+112 29 8:2 / /media/u/X9\\040Pro rw shared:65 - exfat /dev/sda2 rw
 113 29 259:6 / /boot/efi rw shared:66 - vfat /dev/nvme1n1p6 rw
 114 29 0:82 / /home/u/remote rw shared:67 - fuse.sshfs u@host:/ rw
 115 29 0:83 / /mnt/share rw shared:68 - cifs //nas/share rw

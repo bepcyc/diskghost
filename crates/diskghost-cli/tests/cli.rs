@@ -1339,7 +1339,9 @@ fn scan_of_an_ssh_url_lists_the_remote_folder_over_a_stand_in_ssh() {
     assert_eq!(v["total_files"], 2);
     assert_eq!(v["root"], format!("ssh://fakehost/{}", remote.display()));
     assert_eq!(v["transport"], "shell");
-    assert_eq!(v["complete"], true);
+    // `complete` is written only when false.
+    assert!(v.get("complete").is_none(), "{v:#}");
+    assert_eq!(v["cancelled"], false);
 
     // Human output names the remote root.
     let out = remote_cmd(&d, &["scan", "--agent", "never", &url]);

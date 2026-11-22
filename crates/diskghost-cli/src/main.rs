@@ -17,10 +17,10 @@ use diskghost_core::{
 };
 use diskghost_core::{
     diff, find_duplicates_cached, format_timestamp, human_delta, human_size, index_dupes,
-    index_remote, index_scan, phase, reclaim, remove_path, validate_globs, validate_host,
-    DiffReport, DupGroup, HashCache, Index, IndexDupesReport, IndexReportOptions, LocationStatus,
-    Options, Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, Role, ScanReport,
-    ScanSummary, ScanTree, Snapshot, Suggest, CHECKPOINT_INTERVAL,
+    index_remote, index_scan, phase, reclaim, remote_listing, remove_path, validate_globs,
+    validate_host, DiffReport, DupGroup, HashCache, Index, IndexDupesReport, IndexReportOptions,
+    LocationStatus, Options, Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport,
+    Role, ScanReport, ScanSummary, ScanTree, Snapshot, Suggest, CHECKPOINT_INTERVAL,
 };
 use serde::Serialize;
 
@@ -416,9 +416,10 @@ fn main() -> ExitCode {
             walk,
             save,
             since,
-            agent: _,
+            agent,
         } => {
-            if !path.is_dir() {
+            let remote_url = ssh_url(&path).map(str::to_string);
+            if remote_url.is_none() && !path.is_dir() {
                 eprintln!("error: not a directory: {}", path.display());
                 return ExitCode::FAILURE;
             }
@@ -436,7 +437,18 @@ fn main() -> ExitCode {
                 None => None,
             };
             let started = std::time::Instant::now();
-            let tree = with_progress(|p| ScanTree::build(&path, &opts, p));
+            // A remote folder is listed on its host (one filesystem; the
+            // walk options do not apply there).
+            let (tree, remote) = match &remote_url {
+                Some(url) => match with_progress(|p| remote_listing(url, agent.into(), p)) {
+                    Ok(l) => (l.tree(), Some((l.transport, l.agent_note.clone()))),
+                    Err(e) => {
+                        eprintln!("error: scanning {url}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => (with_progress(|p| ScanTree::build(&path, &opts, p)), None),
+            };
             let elapsed = started.elapsed();
             let report = tree.root_report(top);
             let snapshot = (old.is_some() || save.is_some()).then(|| Snapshot::capture(&tree));
@@ -471,6 +483,8 @@ fn main() -> ExitCode {
                     engine: tree.engine(),
                     mft_fallback: tree.mft_fallback(),
                     snapshot_saved: saved,
+                    transport: remote.as_ref().map(|r| r.0),
+                    agent_note: remote.as_ref().and_then(|r| r.1.as_deref()),
                 };
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
@@ -487,6 +501,9 @@ fn main() -> ExitCode {
                 println!("\nScanned in {}{engine}", fmt_duration(elapsed));
                 if let Some(why) = tree.mft_fallback() {
                     eprintln!("note: --mft not used: {why}");
+                }
+                if let Some((_, Some(n))) = &remote {
+                    eprintln!("note: agent not used — {n}; the host's shell tools were used");
                 }
                 if let Some(file) = saved {
                     eprintln!("snapshot saved to {}", file.display());
@@ -1240,6 +1257,12 @@ struct ScanOutput<'a> {
     /// Where `--save` wrote the snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot_saved: Option<&'a Path>,
+    /// A remote scan: `agent` or `shell`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<&'a str>,
+    /// A remote scan: why the agent was not used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_note: Option<&'a str>,
 }
 
 /// `dupes --json` output: the groups, plus `reclaim` when `--reclaim` was
