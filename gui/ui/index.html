@@ -13,15 +13,15 @@
         <form id="pathform" class="pathbox" autocomplete="off" role="search">
           <label class="sr-only" for="path" data-i18n="pathLabel">Folder path</label>
           <input id="path" type="text" spellcheck="false" data-i18n-ph="placeholder" data-i18n-title="pathKeys" />
-          <button id="btn-browse" type="button" data-i18n="browse">Browse…</button>
-          <button id="btn-scan" class="primary" type="submit" data-icon="scan" data-i18n="scan">Scan</button>
-          <button id="btn-dupes" type="button" data-icon="copies" data-i18n="dupes">Find duplicates</button>
+          <button id="btn-browse" type="button" class="quiet" data-i18n="browse" data-i18n-title="keyBrowse">Browse…</button>
+          <button id="btn-scan" class="primary" type="submit" data-icon="scan" data-i18n="scan" data-i18n-label="scan" data-i18n-title="scan">Scan</button>
+          <button id="btn-dupes" type="button" class="quiet" data-icon="copies" data-i18n="dupes" data-i18n-label="dupes" data-i18n-title="dupes">Find duplicates</button>
         </form>
         <button id="btn-excludes" class="chip-btn" type="button"></button>
-        <button id="btn-settings" class="icon-btn" type="button" data-icon="gear" data-i18n-title="settings" aria-label="Settings"></button>
+        <button id="btn-settings" class="icon-btn quiet" type="button" data-icon="gear" data-i18n-title="settings" data-i18n-label="settings" aria-label="Settings"></button>
       </header>
 
-      <nav class="sidebar" aria-label="Drives and jobs">
+      <nav class="sidebar" aria-label="Drives and jobs" data-i18n-label="sideLabel">
         <section class="side-sec" aria-labelledby="h-drives">
           <div class="side-head">
             <h2 id="h-drives" class="side-title" data-i18n="drives">Drives</h2>
@@ -30,14 +30,20 @@
           <div id="drives" class="drives"></div>
           <button id="btn-scan-all" type="button" class="wide quiet" data-i18n="scanAll">Scan all drives</button>
         </section>
-        <section class="side-sec grow" aria-labelledby="h-jobs">
+        <section class="side-sec" aria-labelledby="h-jobs">
           <div class="side-head">
             <h2 id="h-jobs" class="side-title" data-i18n="scans">Scans</h2>
             <button id="btn-clear-done" class="link-btn" type="button" data-i18n="clearDone">Clear finished</button>
           </div>
-          <div id="jobs" class="jobs"></div>
-          <p class="hint" data-i18n="dropHint">Drop folders anywhere — each one is queued as its own scan.</p>
+          <div id="jobs-scan" class="jobs"></div>
         </section>
+        <section class="side-sec" aria-labelledby="h-dupes">
+          <div class="side-head">
+            <h2 id="h-dupes" class="side-title" data-i18n="navDupes">Duplicate searches</h2>
+          </div>
+          <div id="jobs-dupes" class="jobs"></div>
+        </section>
+        <p id="drop-hint" class="hint" data-i18n="dropHint">Drop folders anywhere — each one is queued as its own scan.</p>
       </nav>
 
       <main id="main" tabindex="-1"></main>

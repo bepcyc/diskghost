@@ -26,6 +26,7 @@
     queue: "M2.25 4h11.5M2.25 8h11.5M2.25 12h7",
     scan: "M7 2.25a4.75 4.75 0 1 0 0 9.5 4.75 4.75 0 1 0 0-9.5zM10.5 10.5l3.25 3.25",
     plus: "M8 2.75v10.5M2.75 8h10.5",
+    filter: "M1.75 2.75h12.5l-4.75 5.5v5l-3-1.5v-3.5z",
   };
   const NS = "http://www.w3.org/2000/svg";
   function icon(name, label) {

@@ -389,3 +389,36 @@ test("theme setting survives a round trip and rejects junk", () => {
   assert.equal(lib.mergeSettings({ theme: "light" }).theme, "light");
   assert.equal(lib.mergeSettings({ theme: "neon" }).theme, "auto");
 });
+
+test("English and German carry the same UI strings", () => {
+  const I18N = require("./i18n.js");
+  const en = Object.keys(I18N.en).sort();
+  const de = Object.keys(I18N.de).sort();
+  assert.deepEqual(de.filter((k) => !en.includes(k)), [], "keys only in de");
+  assert.deepEqual(en.filter((k) => !de.includes(k)), [], "keys only in en");
+});
+
+test("every string key app.js asks for exists", () => {
+  const I18N = require("./i18n.js");
+  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "app.js"), "utf8");
+  // t("key") / tf("key", …) and string keys picked by a ternary inside t(…)
+  const keys = new Set([
+    ...[...src.matchAll(/\btf?\(\s*"([A-Za-z_]+)"/g)].map((m) => m[1]),
+    ...[...src.matchAll(/\bt\([^()]*\?\s*"([A-Za-z_]+)"\s*:\s*"([A-Za-z_]+)"\)/g)].flatMap((m) => [m[1], m[2]]),
+  ]);
+  const missing = [...keys].filter((k) => !(k in I18N.en));
+  assert.deepEqual(missing, []);
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "index.html"), "utf8");
+  const htmlKeys = [...html.matchAll(/data-i18n(?:-ph|-title|-label)?="([A-Za-z_]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(htmlKeys.filter((k) => !(k in I18N.en)), []);
+});
+
+test("no emoji left in UI strings (icons come from icons.js)", () => {
+  const I18N = require("./i18n.js");
+  const emoji = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+  for (const lang of ["en", "de"]) {
+    for (const [k, v] of Object.entries(I18N[lang])) {
+      if (typeof v === "string") assert.ok(!emoji.test(v), `${lang}.${k} has an emoji: ${v}`);
+    }
+  }
+});
