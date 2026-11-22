@@ -17,16 +17,36 @@ const triple =
 const debug = process.env.TAURI_ENV_DEBUG === "true";
 const profile = debug ? "debug" : "release";
 
-const args = ["build", "-p", "diskghost-cli", "--target", triple];
-if (!debug) args.push("--release");
-execFileSync("cargo", args, { cwd: root, stdio: "inherit" });
+const build = (t) => {
+  const args = ["build", "-p", "diskghost-cli", "--target", t];
+  if (!debug) args.push("--release");
+  execFileSync("cargo", args, { cwd: root, stdio: "inherit" });
+};
+
+// On Linux x86_64 the sidecar doubles as the agent uploaded to remote
+// hosts, where the local glibc may not match — a static musl build runs
+// everywhere. Build for musl when the toolchain offers it, else the host
+// target (the agent handshake then fails honestly and the shell tier is
+// used, never a silently broken agent).
+const musl = "x86_64-unknown-linux-musl";
+let buildTarget = triple;
+if (triple === "x86_64-unknown-linux-gnu") {
+  try {
+    build(musl);
+    buildTarget = musl;
+  } catch {
+    build(triple);
+  }
+} else {
+  build(triple);
+}
 
 const ext = triple.includes("windows") ? ".exe" : "";
 const targetDir = process.env.CARGO_TARGET_DIR || join(root, "target");
 const outDir = join(tauriDir, "binaries");
 mkdirSync(outDir, { recursive: true });
 copyFileSync(
-  join(targetDir, triple, profile, `diskghost${ext}`),
+  join(targetDir, buildTarget, profile, `diskghost${ext}`),
   join(outDir, `diskghost-${triple}${ext}`),
 );
-console.log(`CLI sidecar: binaries/diskghost-${triple}${ext} (${profile})`);
+console.log(`CLI sidecar: binaries/diskghost-${triple}${ext} (${profile}, built for ${buildTarget})`);
