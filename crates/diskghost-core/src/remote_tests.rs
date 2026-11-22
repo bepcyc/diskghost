@@ -1154,6 +1154,8 @@ fn a_hello_mismatch_falls_back_to_the_shell_and_records_it() {
         .add_remote_via(URL, &h, AgentMode::Auto, Some(&b))
         .unwrap();
     assert_eq!(s.transport.as_deref(), Some("shell"));
+    let note = s.agent_note.clone().expect("the fallback is explained");
+    assert!(note.contains("0.0.1") && note.contains("hello"), "{note}");
     assert_eq!((s.seen, s.hashed), (2, Some(2)));
     assert_eq!(transport_of(&e, UUID), "shell");
     // The broken agent is not uploaded again on the next run.
@@ -1174,6 +1176,11 @@ fn a_failed_upload_falls_back_to_the_shell() {
         .add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()))
         .unwrap();
     assert_eq!(s.transport.as_deref(), Some("shell"));
+    let note = s.agent_note.clone().expect("the fallback is explained");
+    assert!(
+        note.contains("upload") && note.contains("No space left"),
+        "{note}"
+    );
     assert!(
         !kinds(&h).contains(&"agent".to_string()),
         "no hello of a failed upload"
@@ -1189,6 +1196,7 @@ fn agent_never_forces_the_shell_tier_without_a_single_agent_call() {
         .add_remote_via(URL, &h, AgentMode::Never, Some(&test_bin()))
         .unwrap();
     assert_eq!(s.transport.as_deref(), Some("shell"));
+    assert_eq!(s.agent_note, None, "never asked for: nothing to explain");
     for k in kinds(&h) {
         assert!(!["locate", "upload", "agent"].contains(&k.as_str()), "{k}");
     }
@@ -1304,6 +1312,9 @@ fn a_v4_index_migrates_to_v5_keeping_its_rows_as_shell_locations() {
 struct LocalAgent {
     calls: std::sync::Mutex<Vec<Vec<String>>>,
     frames: std::sync::Mutex<Vec<serde_json::Value>>,
+    /// Cut an `enumerate` answer after its first file frame (a dropped
+    /// connection, a killed agent).
+    cut: std::sync::atomic::AtomicBool,
 }
 
 /// Where the "uploaded" agent sits (never created: `LocalAgent` serves it).
@@ -1314,6 +1325,7 @@ impl LocalAgent {
         LocalAgent {
             calls: std::sync::Mutex::new(Vec::new()),
             frames: std::sync::Mutex::new(Vec::new()),
+            cut: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -1348,6 +1360,16 @@ impl RemoteExec for LocalAgent {
                 }
                 let mut out = Vec::new();
                 crate::agent::serve(input, &mut out)?;
+                let enumerate = String::from_utf8_lossy(input).contains(r#""op":"enumerate""#);
+                if enumerate && self.cut.load(AtomicOrdering::SeqCst) {
+                    let first = out.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+                    out.truncate(first);
+                    return Ok(ExecOut {
+                        stdout: out,
+                        stderr: b"Connection reset".to_vec(),
+                        code: 1,
+                    });
+                }
                 Ok(ExecOut {
                     stdout: out,
                     ..ExecOut::default()
@@ -1561,4 +1583,218 @@ fn the_upload_is_the_only_writing_command_and_stays_in_the_cache_dir() {
     for p in cached {
         assert!(p.starts_with(&h.agent_dir()), "{p}");
     }
+}
+
+#[test]
+fn an_unsupported_host_says_why_the_agent_was_not_used() {
+    let e = Estate::new("agent-note-arch");
+    let h = FakeHost::linux().with_arch("aarch64");
+    h.put("/storage/a.bin", &content(1), T0);
+    let s = e
+        .add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()))
+        .unwrap();
+    assert_eq!(s.transport.as_deref(), Some("shell"));
+    let note = s.agent_note.expect("explained");
+    assert!(
+        note.contains("aarch64") && note.contains("x86_64"),
+        "{note}"
+    );
+    // No agent binary for this build at all: said too.
+    let s = e
+        .add_remote_via(URL, &x86(), AgentMode::Auto, None)
+        .unwrap();
+    assert!(s.agent_note.is_some_and(|n| n.contains("this build")));
+    // The agent ran: nothing to explain.
+    let e2 = Estate::new("agent-note-none");
+    let h = x86();
+    let s = e2.add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()));
+    // (the fake agent answers hello only, so the scan fails after it)
+    assert!(s.is_err());
+}
+
+// ---- AgentExec frame parsing and batching (characterization) ---------
+
+/// Answers every `exec_stdin` with `answer(stdin)`; records each stdin.
+struct Canned<F: Fn(&[u8]) -> ExecOut + Sync> {
+    answer: F,
+    inputs: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl<F: Fn(&[u8]) -> ExecOut + Sync> RemoteExec for Canned<F> {
+    fn exec(&self, _argv: &[&str]) -> io::Result<ExecOut> {
+        Err(io::Error::other("Canned: exec_stdin only"))
+    }
+    fn exec_stdin(&self, _argv: &[&str], input: &[u8]) -> io::Result<ExecOut> {
+        self.inputs.lock().unwrap().push(input.to_vec());
+        Ok((self.answer)(input))
+    }
+}
+
+fn canned<F: Fn(&[u8]) -> ExecOut + Sync>(answer: F) -> Canned<F> {
+    Canned {
+        answer,
+        inputs: std::sync::Mutex::new(Vec::new()),
+    }
+}
+
+fn answer(stdout: &str, code: i32) -> ExecOut {
+    ExecOut {
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: b"agent: killed".to_vec(),
+        code,
+    }
+}
+
+#[test]
+fn an_enumerate_stream_without_its_end_frame_is_incomplete() {
+    let f = r#"{"f":{"p":"a.bin","s":5,"m":7,"d":1,"i":9}}"#;
+    for (out, code) in [
+        (format!("{f}\n"), 0),
+        (format!("{f}\n"), 1),
+        (
+            format!("{f}\n{{\"end\":{{\"n\":1,\"complete\":true}}}}\n"),
+            0,
+        ),
+    ] {
+        let c = canned(|_| answer(&out, code));
+        let a = crate::remote::AgentExec {
+            exec: &c,
+            agent: "/a".into(),
+        };
+        let l = a.enumerate("/r").unwrap();
+        assert_eq!(l.files.len(), 1);
+        assert_eq!(
+            (
+                l.files[0].path.as_str(),
+                l.files[0].size,
+                l.files[0].mtime_ns,
+                l.files[0].ino
+            ),
+            ("a.bin", 5, 7, 9)
+        );
+        assert_eq!(l.complete, out.contains("end") && code == 0, "{out} {code}");
+    }
+    // Bad frames: an absolute or empty path is skipped, never stored.
+    let c = canned(|_| {
+        answer(
+            "{\"f\":{\"p\":\"/etc/x\",\"s\":1,\"m\":1,\"i\":1}}\n\
+             {\"f\":{\"p\":\"\",\"s\":1,\"m\":1,\"i\":1}}\n\
+             {\"skip\":{\"p\":\"x\",\"why\":\"y\"}}\n\
+             {\"end\":{\"n\":0,\"complete\":true}}\n",
+            0,
+        )
+    });
+    let a = crate::remote::AgentExec {
+        exec: &c,
+        agent: "/a".into(),
+    };
+    let l = a.enumerate("/r").unwrap();
+    assert!(l.files.is_empty());
+    assert_eq!((l.skipped, l.complete), (3, true));
+}
+
+#[test]
+fn a_line_that_is_not_json_is_an_error_not_a_guess() {
+    let c = canned(|_| answer("{\"f\":{}}\nSegmentation fault\n", 0));
+    let a = crate::remote::AgentExec {
+        exec: &c,
+        agent: "/a".into(),
+    };
+    assert_eq!(
+        a.enumerate("/r").unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    // An error frame is an error too.
+    let c = canned(|_| answer(r#"{"error":{"code":"not_found","msg":"gone"}}"#, 0));
+    let a = crate::remote::AgentExec {
+        exec: &c,
+        agent: "/a".into(),
+    };
+    assert_eq!(a.stat_fs("x").unwrap_err().kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn hash_requests_are_batched_in_one_session_and_aligned_by_path() {
+    let n = crate::remote::AGENT_HASH_BATCH * 2 + 5;
+    let paths: Vec<String> = (0..n).map(|i| format!("/r/f{i}")).collect();
+    // The agent answers every path but the 7th, in reverse order.
+    let c = canned(|input| {
+        let mut out = String::new();
+        for line in String::from_utf8_lossy(input).lines() {
+            let req: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(req["op"], "hash");
+            let ps: Vec<&str> = req["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            for p in ps.iter().rev().filter(|p| **p != "/r/f7") {
+                let full = blake3::hash(p.as_bytes()).to_hex();
+                out += &format!(
+                    "{}\n",
+                    serde_json::json!({"h": {"p": p, "full": full.as_str(), "sample": null, "err": null}})
+                );
+            }
+            out += &format!("{}\n", serde_json::json!({"end": {"n": ps.len()}}));
+        }
+        answer(&out, 0)
+    });
+    let a = crate::remote::AgentExec {
+        exec: &c,
+        agent: "/a".into(),
+    };
+    let d = a.hash(&paths).unwrap();
+    let inputs = c.inputs.lock().unwrap().clone();
+    assert_eq!(inputs.len(), 1, "one ssh session");
+    let lines = String::from_utf8(inputs[0].clone()).unwrap();
+    assert_eq!(
+        lines.lines().count(),
+        3,
+        "batches of {}",
+        crate::remote::AGENT_HASH_BATCH
+    );
+    assert_eq!(d.len(), n);
+    for (i, (p, got)) in paths.iter().zip(&d).enumerate() {
+        if i == 7 {
+            assert_eq!(*got, None, "no h frame: unknown, not a guess");
+        } else {
+            assert_eq!(
+                got.as_deref(),
+                Some(&blake3::hash(p.as_bytes()).as_bytes()[..])
+            );
+        }
+    }
+    assert!(a.hash(&[]).unwrap().is_empty());
+    assert_eq!(
+        c.inputs.lock().unwrap().len(),
+        1,
+        "nothing sent for nothing"
+    );
+}
+
+#[test]
+fn an_agent_scan_cut_short_drops_no_rows() {
+    if !local_target_ok() {
+        return;
+    }
+    let e = Estate::new("agent-cut");
+    let root = e.loc("r");
+    for n in ["a", "b", "c"] {
+        write(&root.join(format!("{n}.bin")), &content(1));
+    }
+    let url = format!("ssh://local/{}", root.display());
+    let la = LocalAgent::new();
+    let s = e
+        .add_remote_via(&url, &la, AgentMode::Auto, Some(&test_bin()))
+        .unwrap();
+    assert_eq!((s.new, s.transport.as_deref()), (3, Some("agent")));
+    // Now the agent's stream dies after its first file frame.
+    la.cut.store(true, AtomicOrdering::SeqCst);
+    let s = e
+        .add_remote_via(&url, &la, AgentMode::Auto, Some(&test_bin()))
+        .unwrap();
+    assert!(!s.complete);
+    assert_eq!((s.seen, s.vanished), (1, 0));
+    assert_eq!(all_rows(&e.idx, &s.uuid).len(), 3, "nothing dropped");
 }

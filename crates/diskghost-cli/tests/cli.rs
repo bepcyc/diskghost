@@ -1076,13 +1076,20 @@ fn index_add_ssh_status_and_dupes_over_a_stand_in_ssh() {
     let db_s = db.to_str().unwrap();
     let url = format!("ssh://fakehost/{}", remote.display());
 
-    let out = remote_cmd(&d, &["index", "--db", db_s, "--json", "add", &url]);
+    // The shell tier end to end (the agent tier: the test below).
+    let out = remote_cmd(
+        &d,
+        &[
+            "index", "--db", db_s, "--json", "add", "--agent", "never", &url,
+        ],
+    );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let added: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(added[0]["transport"], "shell");
     let s = &added[0];
     let uuid = s["uuid"].as_str().unwrap().to_string();
     // One location per remote filesystem: `ssh://host/<fs id>`, no folder.

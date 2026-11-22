@@ -233,6 +233,10 @@ pub struct ScanSummary {
     /// Remote locations: `agent` or `shell` (see [`crate::remote::Transport`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
+    /// Remote locations: why the agent was asked for (`--agent auto`) but
+    /// not used — the shell tier ran instead. Never silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_note: Option<String>,
 }
 
 /// One location as `diskghost index status` reports it.
