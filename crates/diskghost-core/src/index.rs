@@ -727,6 +727,19 @@ fn scan_observed(
     Ok(sum)
 }
 
+/// Drop rows of location `loc` under `prefix` that scan generation `gen`
+/// did not see, except under `bound` (relative paths the walk listed but did
+/// not enter). Index rows only.
+fn drop_vanished(
+    _conn: &Connection,
+    _loc: i64,
+    _gen: i64,
+    _prefix: &str,
+    _bound: &[String],
+) -> rusqlite::Result<usize> {
+    unimplemented!("M1 bound fix")
+}
+
 /// A row whose content has to be sampled.
 struct Pending {
     location_id: i64,
@@ -1259,6 +1272,57 @@ mod tests {
         assert!(!s.complete);
         assert_eq!(s.vanished, 0);
         assert_eq!(row_count(&idx), 2);
+    }
+
+    #[test]
+    fn rows_under_unentered_mounts_are_not_vanished() {
+        // A nested btrfs subvolume (or any mount the walk lists but does not
+        // enter) shares the location of its parent on this design: its rows
+        // were not seen because they were not walked, not because they are
+        // gone. Also: `a/mm` is no child of `a/m`.
+        let d = tmpdir("bound");
+        let idx = open_db(&d);
+        insert_location(&idx, "vol", "/nowhere");
+        let loc: i64 = idx
+            .conn
+            .query_row("SELECT id FROM locations WHERE uuid = 'vol'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        idx.conn.execute("DELETE FROM files", []).unwrap();
+        for (i, p) in [
+            "a/x",
+            "a/m",
+            "a/m/y",
+            "a/m/deep/z",
+            "a/mm/z",
+            "b/q",
+            "a/seen",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let seen = if *p == "a/seen" { 2 } else { 1 };
+            idx.conn
+                .execute(
+                    "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, seen) \
+                     VALUES (?1, ?2, 1, 0, 0, ?3, ?4)",
+                    rusqlite::params![loc, p, i as i64, seen],
+                )
+                .unwrap();
+        }
+        let n = drop_vanished(&idx.conn, loc, 2, "a", &["a/m".to_string()]).unwrap();
+        let mut left: Vec<String> = idx
+            .conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["a/m", "a/m/deep/z", "a/m/y", "a/seen", "b/q"]);
+        assert_eq!(n, 2, "a/x and a/mm/z are gone");
     }
 
     // ---- locations ------------------------------------------------------
