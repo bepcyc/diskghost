@@ -700,7 +700,10 @@ function jobName(j) {
 }
 
 function jobSub(j) {
-  if (j.state === "queued") return j.root;
+  if (j.state === "queued") {
+    const q = jobs.filter((x) => x.state === "queued");
+    return `${t("stQueued")} ${q.indexOf(j) + 1}/${q.length} · ${j.root}`;
+  }
   if (j.state === "running") {
     if (j.kind === "dupes") return `${j.phase + 1}/3 · ${num(j.files)} ${t("files")}`;
     return `${num(j.files)} ${t("files")} · ${human(j.bytes)}`;
@@ -719,12 +722,12 @@ function jobSub(j) {
   return "";
 }
 
-// Estimated progress of a drive-root scan: bytes found vs the drive's used space.
+// Estimated progress of a drive-root scan: bytes found vs the drive's used
+// space — null where the comparison would lie (compressing filesystems).
 function estimate(j) {
+  if (j.kind !== "scan") return null;
   const d = drives.find((x) => x.path.toLowerCase() === j.root.toLowerCase() || x.path === `${j.root}\\`);
-  if (!d || j.kind !== "scan") return null;
-  const used = d.total - d.free;
-  return used > 0 ? Math.min(0.99, j.bytes / used) : null;
+  return estimateScan(j.bytes, d);
 }
 
 // Sidebar rows are created once per job and then only updated in place:
@@ -1034,7 +1037,7 @@ function statsRow(j, v) {
   const nExcl = j.opts?.exclude?.length || 0;
   const row = el("dl", { class: "stats" },
     stat(t("kSize"), atLeast + human(v.total_size),
-      used > 0 ? `${pct(v.total_size, used)} ${t("kSizeOfUsed")} ${d ? d.path : t("kSizeOfDisk")}` : null),
+      used > 0 ? `${pct(v.total_size, used)} ${t("kSizeOfUsed")} ${d ? d.path : t("kSizeOfDisk")}${exceedsUsed(v.total_size, used) ? ` — ${t("usedExplained")}` : ""}` : null),
     stat(t("kFiles"), atLeast + num(v.total_files),
       v.total_files ? `${t("kAvg")} ${human(Math.round(v.total_size / v.total_files))} ${t("kPerFile")}` : null),
     stat(t("kFolders"), atLeast + num(v.total_dirs), `${num(v.root_files_count)} ${t("kDirect")}`),
@@ -1917,13 +1920,22 @@ try {
     paintQueued = true;
     requestAnimationFrame(() => {
       paintQueued = false;
-      renderJobs();
-      if (op) renderOp();
-      const a = active();
-      if (a && a.state === "running") updateProgressView(a);
+      repaintLive();
     });
   });
 } catch (_) { /* events unavailable */ }
+
+// A repaint that rAF starvation cannot stall (an occluded webview stops
+// animation frames): live counters never look frozen while jobs run.
+function repaintLive() {
+  renderJobs();
+  if (op) renderOp();
+  const a = active();
+  if (a && a.state === "running") updateProgressView(a);
+}
+setInterval(() => {
+  if (jobs.some((j) => j.state === "running") || op) repaintLive();
+}, 500);
 
 // Drag & drop: every dropped folder becomes its own queued scan.
 try {

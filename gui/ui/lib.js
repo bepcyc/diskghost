@@ -410,6 +410,26 @@
     };
   }
 
+  // Filesystems where stored (logical) size can exceed physically used
+  // space — transparent compression and reflinks make a "% of the used
+  // space" estimate saturate early and look frozen.
+  const COMPRESS_FS = new Set(["btrfs", "zfs", "bcachefs"]);
+
+  // Estimated fraction (0..0.99) of a drive-root scan: bytes found vs the
+  // drive's used space — null where the estimate would lie.
+  function estimateScan(bytes, drive) {
+    if (!drive) return null;
+    if (COMPRESS_FS.has(String(drive.fs || "").toLowerCase())) return null;
+    const used = drive.total - drive.free;
+    return used > 0 ? Math.min(0.99, bytes / used) : null;
+  }
+
+  // A scanned logical size larger than the drive's physical used space —
+  // compression, reflinks or sparse files, not an error.
+  function exceedsUsed(scanned, used) {
+    return used > 0 && scanned > used;
+  }
+
   // The drive a path lives on ("c:", "\\server\share", "/"), for scheduling.
   function driveKey(path) {
     const p = String(path);
@@ -548,6 +568,7 @@
     human, humanDelta, unmeasured, sizeText, countText, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, driveMedia, groupDrives, remoteDrive, mapItems, parentPath, isUnder, SETTINGS_VERSION,
+    estimateScan, exceedsUsed, COMPRESS_FS,
     isProtectedPath, folderSets, protectedExcludes, dropReclaimed,
   };
 });

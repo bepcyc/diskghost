@@ -104,6 +104,24 @@ pub trait RemoteExec: Sync {
             "this transport cannot send input to a remote command",
         ))
     }
+
+    /// [`RemoteExec::exec`]/[`RemoteExec::exec_stdin`] reporting `on_chunk`
+    /// with stdout pieces as they arrive — live progress for a listing
+    /// that can run for hours. The default reports one chunk once the
+    /// command ends (a transport that cannot stream).
+    fn exec_live(
+        &self,
+        argv: &[&str],
+        stdin: Option<&[u8]>,
+        on_chunk: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<ExecOut> {
+        let out = match stdin {
+            Some(input) => self.exec_stdin(argv, input)?,
+            None => self.exec(argv)?,
+        };
+        on_chunk(&out.stdout);
+        Ok(out)
+    }
 }
 
 /// The real thing: `ssh <extra> -- <host> <argv, shell-quoted>`.
@@ -177,6 +195,71 @@ impl RemoteExec for SshExec {
             stdout: out.stdout,
             stderr: out.stderr,
             code: out.status.code().unwrap_or(-1),
+        })
+    }
+
+    fn exec_live(
+        &self,
+        argv: &[&str],
+        input: Option<&[u8]>,
+        on_chunk: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<ExecOut> {
+        use std::io::{Read, Write};
+        let mut child = Command::new(&self.ssh)
+            .args(self.args(argv))
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take();
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let (res, stdout_bytes, stderr_bytes) = std::thread::scope(|s| {
+            let err = s.spawn(move || {
+                let mut v = Vec::new();
+                let _ = stderr.read_to_end(&mut v);
+                v
+            });
+            let wr = stdin.take().map(|mut w| {
+                let input = input.unwrap_or_default();
+                s.spawn(move || {
+                    // A remote command that stops reading early is not
+                    // an error here: its exit code tells.
+                    let _ = w.write_all(input);
+                })
+            });
+            let mut out = Vec::new();
+            let mut buf = [0u8; 64 * 1024];
+            let res = loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => {
+                        out.extend_from_slice(&buf[..n]);
+                        on_chunk(&buf[..n]);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => break Err(e),
+                }
+            };
+            if res.is_err() {
+                let _ = child.kill();
+            }
+            if let Some(h) = wr {
+                let _ = h.join();
+            }
+            let err = err.join().unwrap_or_default();
+            (res, out, err)
+        });
+        res?;
+        let status = child.wait()?;
+        Ok(ExecOut {
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+            code: status.code().unwrap_or(-1),
         })
     }
 }
@@ -423,6 +506,19 @@ pub(crate) fn run(x: &dyn RemoteExec, argv: &[&str]) -> io::Result<ExecOut> {
     Ok(out)
 }
 
+/// [`run`] reporting stdout pieces to `on_chunk` as they arrive.
+fn run_live(
+    x: &dyn RemoteExec,
+    argv: &[&str],
+    on_chunk: &mut dyn FnMut(&[u8]),
+) -> io::Result<ExecOut> {
+    let out = x.exec_live(argv, None, on_chunk)?;
+    if out.code == 255 {
+        return Err(ssh_failure(&out));
+    }
+    Ok(out)
+}
+
 /// Probe what a host offers, in one call. `Err(NotConnected)` when it
 /// cannot be reached; `Err(Unsupported)` when it has no hash tool.
 pub fn probe(x: &dyn RemoteExec) -> io::Result<Capabilities> {
@@ -594,11 +690,60 @@ pub fn parse_mtime(s: &str) -> Option<u64> {
         .checked_add(ns.parse::<u64>().ok()?)
 }
 
+/// Counts `find -printf` records as they stream in: files and their bytes
+/// so far, for live progress. A record split across chunks is counted
+/// when its `\0` terminator arrives.
+#[derive(Default)]
+struct PrintfProgress {
+    pending: Vec<u8>,
+    files: u64,
+    bytes: u64,
+}
+
+impl PrintfProgress {
+    fn feed(&mut self, chunk: &[u8], progress: &crate::Progress) {
+        self.pending.extend_from_slice(chunk);
+        let mut done = 0;
+        for (i, &b) in self.pending.iter().enumerate() {
+            if b == 0 {
+                done = i + 1;
+            }
+        }
+        for rec in self.pending[..done]
+            .split(|&b| b == 0)
+            .filter(|r| !r.is_empty())
+        {
+            // `%s\t…`: the size is the first field of a well-formed record.
+            let size = rec
+                .split(|&b| b == b'\t')
+                .next()
+                .and_then(|w| std::str::from_utf8(w).ok())
+                .and_then(|w| w.parse::<u64>().ok());
+            self.files += 1;
+            self.bytes += size.unwrap_or(0);
+        }
+        self.pending.drain(..done);
+        progress.set_counts(self.files, self.bytes);
+    }
+}
+
 /// List every regular file under `root` (canonical), staying on its
 /// filesystem.
 pub fn enum_remote(x: &dyn RemoteExec, caps: &Capabilities, root: &str) -> io::Result<Listing> {
+    enum_remote_live(x, caps, root, &crate::Progress::default())
+}
+
+/// [`enum_remote`] reporting `progress` as the listing arrives — record
+/// by record — instead of storing the totals once at the end.
+pub fn enum_remote_live(
+    x: &dyn RemoteExec,
+    caps: &Capabilities,
+    root: &str,
+    progress: &crate::Progress,
+) -> io::Result<Listing> {
     if caps.find_printf {
-        let out = run(
+        let mut seen = PrintfProgress::default();
+        let out = run_live(
             x,
             &[
                 "find",
@@ -609,8 +754,10 @@ pub fn enum_remote(x: &dyn RemoteExec, caps: &Capabilities, root: &str) -> io::R
                 "-printf",
                 PRINTF_FORMAT,
             ],
+            &mut |chunk| seen.feed(chunk, progress),
         )?;
         let (files, skipped) = parse_printf(&out.stdout, root);
+        progress.set_counts(files.len() as u64, files.iter().map(|f| f.size).sum());
         return Ok(Listing {
             files,
             skipped,
@@ -618,7 +765,16 @@ pub fn enum_remote(x: &dyn RemoteExec, caps: &Capabilities, root: &str) -> io::R
         });
     }
     // No -printf: names first, then sizes, times and inodes in batches.
-    let out = run(x, &["find", root, "-xdev", "-type", "f", "-print0"])?;
+    // Every `\0` ending a name counts one more file found.
+    let mut names_seen = 0u64;
+    let out = run_live(
+        x,
+        &["find", root, "-xdev", "-type", "f", "-print0"],
+        &mut |chunk| {
+            names_seen += chunk.iter().filter(|&&b| b == 0).count() as u64;
+            progress.set_counts(names_seen, 0);
+        },
+    )?;
     let mut complete = out.code == 0;
     let mut skipped = 0;
     let mut names = Vec::new();
@@ -674,7 +830,9 @@ pub fn enum_remote(x: &dyn RemoteExec, caps: &Capabilities, root: &str) -> io::R
                 }
             }
         }
+        progress.set_counts(names.len() as u64, files.iter().map(|f| f.size).sum());
     }
+    progress.set_counts(files.len() as u64, files.iter().map(|f| f.size).sum());
     Ok(Listing {
         files,
         skipped,
@@ -1084,23 +1242,66 @@ pub struct AgentExec<'a> {
 impl AgentExec<'_> {
     /// Send `reqs` in one session; every frame of the answer.
     fn request(&self, reqs: &[serde_json::Value]) -> io::Result<Vec<serde_json::Value>> {
+        self.request_live(reqs, &mut |_| {})
+    }
+
+    /// `request` invoking `on_frame` with each frame as it arrives — a
+    /// long `enumerate` stream reports progress this way.
+    fn request_live(
+        &self,
+        reqs: &[serde_json::Value],
+        on_frame: &mut dyn FnMut(&serde_json::Value),
+    ) -> io::Result<Vec<serde_json::Value>> {
         let mut input = Vec::new();
         for r in reqs {
             serde_json::to_writer(&mut input, r)?;
             input.push(b'\n');
         }
-        let out = self.exec.exec_stdin(&[&self.agent, "agent"], &input)?;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut frames = Vec::new();
+        let mut parse_err = None;
+        let mut take_lines = |pending: &mut Vec<u8>, all: bool| {
+            let upto = if all {
+                pending.len()
+            } else {
+                pending
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            };
+            for line in pending[..upto]
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+            {
+                match serde_json::from_slice::<serde_json::Value>(line) {
+                    Ok(v) => {
+                        on_frame(&v);
+                        frames.push(v);
+                    }
+                    Err(e) => {
+                        parse_err = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("agent sent a line that is not JSON: {e}"),
+                        ))
+                    }
+                }
+            }
+            pending.drain(..upto);
+        };
+        let out = self
+            .exec
+            .exec_live(&[&self.agent, "agent"], Some(&input), &mut |chunk| {
+                pending.extend_from_slice(chunk);
+                take_lines(&mut pending, false);
+            })?;
+        // A last line without its terminator, when one ever arrives.
+        take_lines(&mut pending, true);
         if out.code == 255 {
             return Err(ssh_failure(&out));
         }
-        let mut frames = Vec::new();
-        for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-            frames.push(serde_json::from_slice(line).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("agent sent a line that is not JSON: {e}"),
-                )
-            })?);
+        if let Some(e) = parse_err {
+            return Err(e);
         }
         if out.code != 0 && frames.is_empty() {
             return Err(io::Error::other(format!(
@@ -1181,8 +1382,30 @@ impl AgentExec<'_> {
 
     /// Every regular file under `root` (canonical), on its filesystem.
     pub fn enumerate(&self, root: &str) -> io::Result<Listing> {
-        let frames =
-            self.request(&[serde_json::json!({"op": "enumerate", "root": root, "xdev": true})])?;
+        self.enumerate_live(root, &crate::Progress::default())
+    }
+
+    /// `enumerate` reporting `progress` per file frame as it arrives.
+    pub fn enumerate_live(&self, root: &str, progress: &crate::Progress) -> io::Result<Listing> {
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        let frames = self.request_live(
+            &[serde_json::json!({"op": "enumerate", "root": root, "xdev": true})],
+            &mut |fr| {
+                if let Some(f) = fr.get("f") {
+                    let valid = f["p"]
+                        .as_str()
+                        .is_some_and(|p| !p.is_empty() && !p.starts_with('/'));
+                    if valid && f["m"].as_u64().is_some() && f["i"].as_u64().is_some() {
+                        if let Some(size) = f["s"].as_u64() {
+                            files += 1;
+                            bytes += size;
+                            progress.set_counts(files, bytes);
+                        }
+                    }
+                }
+            },
+        )?;
         let mut l = Listing::default();
         let mut ended = false;
         for fr in &frames {
@@ -1354,7 +1577,7 @@ pub(crate) fn remote_listing_with(
     let listing = if cancelled {
         Listing::default()
     } else {
-        opened.enumerate()?
+        opened.enumerate(progress)?
     };
     progress
         .files
@@ -1412,11 +1635,12 @@ impl Opened<'_> {
         }
     }
 
-    /// Every regular file under the root, on its filesystem.
-    pub(crate) fn enumerate(&self) -> io::Result<Listing> {
+    /// Every regular file under the root, on its filesystem, reporting
+    /// `progress` as the listing arrives.
+    pub(crate) fn enumerate(&self, progress: &crate::Progress) -> io::Result<Listing> {
         match &self.tier {
-            Tier::Agent(a) => a.enumerate(&self.rr.root),
-            Tier::Shell(c) => enum_remote(self.x, c, &self.rr.root),
+            Tier::Agent(a) => a.enumerate_live(&self.rr.root, progress),
+            Tier::Shell(c) => enum_remote_live(self.x, c, &self.rr.root, progress),
         }
     }
 

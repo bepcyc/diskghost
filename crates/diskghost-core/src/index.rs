@@ -819,7 +819,7 @@ pub(crate) fn remote_scan_with(
             String::new(),
         ),
     };
-    let mut listing = opened.enumerate()?;
+    let mut listing = opened.enumerate(progress)?;
     if !prefix.is_empty() {
         for f in &mut listing.files {
             f.path = format!("{prefix}/{}", f.path);
