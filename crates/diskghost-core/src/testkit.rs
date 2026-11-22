@@ -250,6 +250,9 @@ pub(crate) struct FakeHost {
     pub(crate) home: String,
     pub(crate) fsid: Option<String>,
     pub(crate) fstype: Option<String>,
+    /// Mountpoint of the filesystem holding every folder; `None`: neither
+    /// `stat -c %m` nor `df -P` tells it.
+    pub(crate) mount: Option<String>,
     pub(crate) files: Mutex<BTreeMap<String, FakeFile>>,
     pub(crate) dirs: Mutex<BTreeSet<String>>,
     pub(crate) down: AtomicBool,
@@ -270,6 +273,7 @@ impl FakeHost {
             home: "/home/u".into(),
             fsid: Some("a1b2c3d4".into()),
             fstype: Some("ext2/ext3".into()),
+            mount: Some("/".into()),
             files: Mutex::new(BTreeMap::new()),
             dirs: Mutex::new(["/".to_string(), "/home".into(), "/home/u".into()].into()),
             down: AtomicBool::new(false),
@@ -290,6 +294,18 @@ impl FakeHost {
             fstype: None,
             ..FakeHost::linux()
         }
+    }
+
+    /// The mountpoint the host reports (`None`: it tells none).
+    pub(crate) fn with_mount(mut self, mount: Option<&str>) -> FakeHost {
+        self.mount = mount.map(str::to_string);
+        self
+    }
+
+    /// The `stat` dialect: `gnu`, `bsd` or `none`.
+    pub(crate) fn with_stat(mut self, stat: &'static str) -> FakeHost {
+        self.stat = stat;
+        self
     }
 
     pub(crate) fn with_tools(mut self, tools: &[&'static str]) -> FakeHost {
@@ -441,7 +457,13 @@ impl RemoteExec for FakeHost {
                     ("bsd", _) => "66".to_string(),
                     _ => String::new(),
                 };
-                ok(format!("{root}\n{fs}\n").into_bytes())
+                // GNU `stat -c %m`; otherwise the last line of `df -P`.
+                let mount = match (*flavor, &self.mount) {
+                    ("gnu", Some(m)) => format!("mount {m}"),
+                    (_, Some(m)) => format!("df /dev/fake0 1000 500 500 50% {m}"),
+                    (_, None) => "df ".to_string(),
+                };
+                ok(format!("{root}\n{fs}\n{mount}\n").into_bytes())
             }
             ["find", root, "-xdev", "-type", "f", "-printf", fmt] => {
                 if !self.printf {

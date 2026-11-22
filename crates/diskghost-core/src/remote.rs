@@ -377,6 +377,8 @@ pub struct RemoteRoot {
     pub fsid: Option<String>,
     /// GNU `stat -f %T` (`ext2/ext3`, `btrfs`, …).
     pub fstype: Option<String>,
+    /// The mountpoint of the root's filesystem.
+    pub mount: Option<String>,
 }
 
 pub fn resolve_root(x: &dyn RemoteExec, caps: &Capabilities, path: &str) -> io::Result<RemoteRoot> {
@@ -413,7 +415,12 @@ pub fn resolve_root(x: &dyn RemoteExec, caps: &Capabilities, path: &str) -> io::
         StatFlavor::Bsd => (id.map(|d| format!("dev{d}")), None),
         StatFlavor::None => (None, None),
     };
-    Ok(RemoteRoot { root, fsid, fstype })
+    Ok(RemoteRoot {
+        root,
+        fsid,
+        fstype,
+        mount: None,
+    })
 }
 
 /// One remote file, path relative to the root.

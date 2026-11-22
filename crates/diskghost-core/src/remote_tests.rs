@@ -266,6 +266,27 @@ fn the_root_is_resolved_with_its_filesystem_id() {
     assert_eq!(r.fstype, None);
 }
 
+#[test]
+fn the_root_is_resolved_with_its_mountpoint_in_the_same_call() {
+    let h = FakeHost::linux().with_mount(Some("/storage"));
+    h.put("/storage/a/x", b"x", T0);
+    let c = caps(&h);
+    let r = resolve_root(&h, &c, "/storage/a").unwrap();
+    assert_eq!(r.mount.as_deref(), Some("/storage"), "GNU stat -c %m");
+    assert_eq!(h.calls().len(), 2, "probe + one resolve call");
+    let b = FakeHost::bsd().with_mount(Some("/storage"));
+    b.put("/storage/a/x", b"x", T0);
+    let r = resolve_root(&b, &caps(&b), "/storage/a").unwrap();
+    assert_eq!(r.mount.as_deref(), Some("/storage"), "last field of df -P");
+    // Not obtainable, or not a path prefix of the root: unknown.
+    let n = FakeHost::linux().with_mount(None);
+    n.put("/storage/a/x", b"x", T0);
+    assert_eq!(resolve_root(&n, &caps(&n), "/storage").unwrap().mount, None);
+    let o = FakeHost::linux().with_mount(Some("/stor"));
+    o.put("/storage/a/x", b"x", T0);
+    assert_eq!(resolve_root(&o, &caps(&o), "/storage").unwrap().mount, None);
+}
+
 // ---- hashing ---------------------------------------------------------
 
 #[test]
@@ -371,6 +392,15 @@ fn the_real_commands_list_and_hash_a_local_folder_identically() {
     let c = probe(&LocalExec).unwrap();
     let r = resolve_root(&LocalExec, &c, root.to_str().unwrap()).unwrap();
     assert_eq!(PathBuf::from(&r.root), root);
+    if c.stat != StatFlavor::None {
+        // The real `stat -c %m` / `df -P` names the mountpoint above it.
+        let m = r.mount.clone().expect("mountpoint of the temp dir");
+        assert!(
+            m == "/" || r.root == m || r.root.starts_with(&format!("{m}/")),
+            "{m} is not a prefix of {}",
+            r.root
+        );
+    }
     let mut l = enum_remote(&LocalExec, &c, &r.root).unwrap();
     assert!(l.complete);
     l.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -710,6 +740,99 @@ fn a_remote_location_is_its_own_device_per_filesystem() {
         crate::index_report::filesystem_of("ssh://a/1:/x"),
         crate::index_report::filesystem_of("ssh://b/1:/x")
     );
+}
+
+fn scan_roots_of(e: &Estate, uuid: &str) -> Vec<String> {
+    let mut st = e
+        .idx
+        .conn
+        .prepare(
+            "SELECT s.path FROM scan_roots s JOIN locations l ON l.id = s.location_id \
+             WHERE l.uuid = ?1 ORDER BY s.path",
+        )
+        .unwrap();
+    st.query_map([uuid], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn location_count(e: &Estate) -> i64 {
+    e.idx
+        .conn
+        .query_row("SELECT COUNT(*) FROM locations", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn two_folders_of_one_remote_filesystem_share_one_location_like_a_volume() {
+    let e = Estate::new("remote-two-folders");
+    let h = FakeHost::linux().with_mount(Some("/storage"));
+    h.put("/storage/a/x", &content(1), T0);
+    h.put("/storage/b/y", &content(1), T0);
+    let sa = e.add_remote("ssh://adroid//storage/a", &h).unwrap();
+    let sb = e.add_remote("ssh://adroid//storage/b", &h).unwrap();
+    let uuid = "ssh://adroid/a1b2c3d4";
+    assert_eq!((sa.uuid.as_str(), sb.uuid.as_str()), (uuid, uuid));
+    assert_eq!(sb.root, PathBuf::from("/storage"));
+    assert_eq!(location_count(&e), 1);
+    let (host, root, _) = loc_row(&e, uuid);
+    assert_eq!((host.as_str(), root.as_str()), ("ssh://adroid", "/storage"));
+    assert_eq!(scan_roots_of(&e, uuid), ["a", "b"]);
+    let rows = remote_rows(&e, uuid);
+    let paths: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(paths, ["a/x", "b/y"]);
+    // Hashed on the host at mount + '/' + path.
+    let hashed: Vec<String> = h
+        .calls()
+        .into_iter()
+        .filter(|c| c.get(2).map(String::as_str) == Some(HASH_SCRIPT))
+        .flat_map(|c| c[5..].to_vec())
+        .collect();
+    assert_eq!(hashed, ["/storage/a/x", "/storage/b/y"]);
+    assert!(rows.iter().all(|r| r.2.is_some()));
+    // A rescan of folder a after its file was removed drops only that row.
+    h.remove("/storage/a/x");
+    let s = e.add_remote("ssh://adroid//storage/a", &h).unwrap();
+    assert!(s.complete);
+    assert_eq!((s.seen, s.vanished), (0, 1));
+    let rows = remote_rows(&e, uuid);
+    let paths: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(paths, ["b/y"], "b's rows stay");
+    assert_eq!(scan_roots_of(&e, uuid), ["a", "b"]);
+}
+
+#[test]
+fn a_gnu_host_uuid_is_exactly_host_and_filesystem_id() {
+    let e = Estate::new("remote-uuid-gnu");
+    let h = FakeHost::linux().with_mount(Some("/storage"));
+    h.put("/storage/f.bin", b"f", T0);
+    let s = e.add_remote(URL, &h).unwrap();
+    assert_eq!(s.uuid, "ssh://adroid/a1b2c3d4");
+    assert_eq!(scan_roots_of(&e, "ssh://adroid/a1b2c3d4"), [""]);
+    assert_eq!(remote_rows(&e, "ssh://adroid/a1b2c3d4")[0].0, "f.bin");
+}
+
+#[test]
+fn without_a_usable_filesystem_id_the_uuid_is_host_and_folder() {
+    let hosts = [
+        // stat answers no dialect: no fs id at all.
+        FakeHost::linux().with_stat("none"),
+        // fs id known, mountpoint not obtainable.
+        FakeHost::linux().with_mount(None),
+        // fs id known, "mountpoint" not a prefix of the folder.
+        FakeHost::linux().with_mount(Some("/elsewhere")),
+    ];
+    for (i, h) in hosts.iter().enumerate() {
+        let e = Estate::new(&format!("remote-uuid-root-{i}"));
+        h.put("/storage/sub/f.bin", b"f", T0);
+        let s = e.add_remote(URL, h).unwrap();
+        assert_eq!(s.uuid, "ssh://adroid:/storage", "host {i}");
+        let (_, root, _) = loc_row(&e, "ssh://adroid:/storage");
+        assert_eq!(root, "/storage", "host {i}");
+        assert_eq!(scan_roots_of(&e, "ssh://adroid:/storage"), [""], "host {i}");
+        assert_eq!(remote_rows(&e, "ssh://adroid:/storage")[0].0, "sub/f.bin");
+    }
 }
 
 // ---- plan and apply --------------------------------------------------
