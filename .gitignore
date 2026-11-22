@@ -13,3 +13,5 @@ gui/src-tauri/binaries/
 .DS_Store
 Thumbs.db
 *.log
+gui/src-tauri/gen/
+.claude/
