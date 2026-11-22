@@ -309,6 +309,7 @@ pub struct LocalMount {
 /// Filesystem types that hold data on local storage. An explicit allowlist:
 /// anything else (`tmpfs`, `proc`, `overlay`, `squashfs`, `autofs`, …) is
 /// never a drive.
+#[cfg_attr(not(any(test, unix)), allow(dead_code))]
 const REAL_FS: &[&str] = &[
     "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "reiserfs", "jfs", "nilfs2", "bcachefs", "zfs",
     "ufs", "ffs", "hfs", "hfsplus", "apfs", "ntfs", "ntfs3", "fuseblk", "exfat", "vfat", "msdos",
@@ -317,6 +318,7 @@ const REAL_FS: &[&str] = &[
 
 /// The real local filesystems of a `/proc/self/mountinfo` text, each once
 /// (first mountpoint of a device wins), in mount-table order.
+#[cfg_attr(not(any(test, unix)), allow(dead_code))]
 pub(crate) fn local_mounts_from(info: &str) -> Vec<LocalMount> {
     let mut seen = HashSet::new();
     info.lines()
@@ -338,6 +340,7 @@ pub(crate) fn local_mounts_from(info: &str) -> Vec<LocalMount> {
 
 /// Whether `fstype` holds data on local storage: [`REAL_FS`], or a FUSE
 /// filesystem that only re-presents local storage ([`LOCAL_FUSE`]).
+#[cfg_attr(not(any(test, unix)), allow(dead_code))]
 fn is_storage_fs(fstype: &str) -> bool {
     REAL_FS.contains(&fstype)
         || fstype

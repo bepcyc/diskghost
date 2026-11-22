@@ -983,6 +983,9 @@ fn agent_binary() -> Option<diskghost_core::remote::AgentBinary> {
     let on_path = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        // An empty or relative entry would pick a `diskghost` from the
+        // current directory — never upload and run that.
+        .filter(|d| d.is_absolute())
         .map(|d| d.join("diskghost"));
     beside
         .into_iter()
