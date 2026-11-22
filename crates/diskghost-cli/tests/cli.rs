@@ -674,7 +674,7 @@ fn index_add_rejects_remote_hosts() {
     let out = index_cmd(&db, &["add", "--host", "nas.lan", d.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("remote locations not yet supported"),
+        String::from_utf8_lossy(&out.stderr).contains("ssh://"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1025,5 +1025,128 @@ fn undo_moves_journaled_files_back() {
     let last = std::fs::read_to_string(&journal).unwrap();
     let last: serde_json::Value = serde_json::from_str(last.lines().last().unwrap()).unwrap();
     assert_eq!(last["status"], "undone");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+// ---- remote locations (`ssh://`) -------------------------------------------
+// No real ssh: `DISKGHOST_SSH` points at a stand-in script that drops the ssh
+// options and host and runs the (read-only) command locally, inside the
+// test's own scratch dir. A marker file makes the "host" unreachable.
+
+fn fake_ssh(d: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = d.join("fake-ssh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         while [ \"$1\" = \"-o\" ]; do shift 2; done\n\
+         [ \"$1\" = \"--\" ] && shift\n\
+         host=$1; shift\n\
+         if [ -e \"$FAKE_SSH_DOWN\" ]; then echo \"ssh: connect to host $host port 22: Connection refused\" >&2; exit 255; fi\n\
+         exec sh -c \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn remote_cmd(d: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .env("DISKGHOST_SSH", d.join("fake-ssh"))
+        .env("FAKE_SSH_DOWN", d.join("host-down"))
+        .args(args)
+        .output()
+        .expect("run diskghost")
+}
+
+#[test]
+fn index_add_ssh_status_and_dupes_over_a_stand_in_ssh() {
+    let d = scratch("index-ssh");
+    fake_ssh(&d);
+    let remote = std::fs::canonicalize(&d).unwrap().join("remote");
+    std::fs::create_dir_all(remote.join("sub")).unwrap();
+    let same: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(remote.join("a.bin"), &same).unwrap();
+    std::fs::write(remote.join("sub/b.bin"), &same).unwrap();
+    std::fs::write(remote.join("c.txt"), b"unique").unwrap();
+    let db = d.join("db/index.db");
+    let db_s = db.to_str().unwrap();
+    let url = format!("ssh://fakehost/{}", remote.display());
+
+    let out = remote_cmd(&d, &["index", "--db", db_s, "--json", "add", &url]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let added: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let s = &added[0];
+    let uuid = s["uuid"].as_str().unwrap().to_string();
+    assert!(uuid.starts_with("ssh://fakehost/"), "{uuid}");
+    assert!(uuid.ends_with(&format!(":{}", remote.display())), "{uuid}");
+    assert_eq!(s["new"], 3);
+    assert_eq!(s["hashed"], 2);
+    assert!(remote.join("a.bin").exists() && remote.join("sub/b.bin").exists());
+
+    let out = remote_cmd(&d, &["index", "--db", db_s, "status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(st[0]["host"], "ssh://fakehost");
+    assert_eq!(st[0]["online"], true);
+    assert_eq!(st[0]["files"], 3);
+
+    let out = remote_cmd(
+        &d,
+        &["dupes", "--index", "--db", db_s, "--min-mb", "0", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let groups = r["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{r:#}");
+    assert_eq!(groups[0]["unique_copies"], 2);
+    assert!(r["unverifiable"].as_array().unwrap().is_empty());
+
+    // The host goes away: status says offline, a new add fails cleanly.
+    std::fs::write(d.join("host-down"), b"").unwrap();
+    let out = remote_cmd(&d, &["index", "--db", db_s, "status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(st[0]["online"], false);
+    assert_eq!(st[0]["files"], 3, "rows kept");
+    let out = remote_cmd(&d, &["index", "--db", db_s, "add", &url]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unreachable"), "{err}");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn index_add_rejects_a_malformed_ssh_url() {
+    let d = scratch("index-ssh-bad");
+    fake_ssh(&d);
+    let db = d.join("index.db");
+    let out = remote_cmd(
+        &d,
+        &[
+            "index",
+            "--db",
+            db.to_str().unwrap(),
+            "add",
+            "ssh://-oProxyCommand=x/y",
+        ],
+    );
+    assert!(!out.status.success());
     std::fs::remove_dir_all(&d).ok();
 }

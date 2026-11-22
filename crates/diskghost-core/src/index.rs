@@ -73,7 +73,7 @@ const SCHEMA_VERSION: i64 = 3;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     r"
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
@@ -175,6 +175,12 @@ pub struct ScanSummary {
     /// The walk covered the whole subtree. Vanished rows are only dropped
     /// after a complete walk: unreadable or cut-off is not gone.
     pub complete: bool,
+    /// Remote locations: files hashed whole on the remote host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashed: Option<u64>,
+    /// Remote locations: the digest algorithm the host offers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algo: Option<String>,
 }
 
 /// One location as `diskghost index status` reports it.
@@ -267,6 +273,12 @@ impl Index {
     /// Every location with its file count and bytes, and whether it is
     /// reachable *now*. Read-only: an offline location keeps all its rows.
     pub fn status(&self) -> io::Result<Vec<LocationStatus>> {
+        self.status_with(&Probe::REAL)
+    }
+
+    /// [`Index::status`] asking `probe` whether a location is reachable.
+    pub(crate) fn status_with(&self, probe: &Probe) -> io::Result<Vec<LocationStatus>> {
+        let _ = probe.remote_online;
         let mut st = self
             .conn
             .prepare(
@@ -619,6 +631,8 @@ pub(crate) struct Probe<'a> {
     pub(crate) rotational: &'a dyn Fn(&Path) -> bool,
     /// Told every file whose content is read.
     pub(crate) on_read: &'a (dyn Fn(&Path) + Sync),
+    /// Whether a remote location (`host` column, root) is reachable now.
+    pub(crate) remote_online: &'a dyn Fn(&str, &str) -> bool,
 }
 
 fn no_read(_: &Path) {}
@@ -631,6 +645,7 @@ impl Probe<'static> {
         cow: &is_cow_fs,
         rotational: &crate::rotational::is_rotational,
         on_read: &no_read,
+        remote_online: &crate::remote::ssh_online,
     };
 }
 
@@ -678,6 +693,28 @@ fn scan_observed(
         ..Probe::REAL
     };
     scan_with(idx, root, opts, progress, &probe)
+}
+
+/// Index a remote folder `ssh://host/path` over ssh (see [`crate::remote`]):
+/// the host enumerates and hashes its own files; no content is copied.
+pub fn index_remote(idx: &Index, url: &str, progress: &Progress) -> io::Result<ScanSummary> {
+    let (host, _) = crate::remote::parse_ssh_url(url)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    remote_scan_with(idx, url, &crate::remote::SshExec::new(&host), progress)
+}
+
+/// [`index_remote`] running its commands through `x`.
+pub(crate) fn remote_scan_with(
+    idx: &Index,
+    url: &str,
+    x: &dyn crate::remote::RemoteExec,
+    progress: &Progress,
+) -> io::Result<ScanSummary> {
+    let _ = (idx, url, x, progress);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "not implemented",
+    ))
 }
 
 /// [`index_scan`] asking `probe` instead of the machine.
@@ -1262,7 +1299,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION);
         // Version 2 records whether a location's filesystem is copy-on-write.
         let cow: Option<i64> = idx
             .conn
@@ -1316,7 +1353,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION);
         let mv: i64 = idx
             .conn
             .query_row(
@@ -1325,7 +1362,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(mv, 3);
+        assert_eq!(mv, SCHEMA_VERSION);
         assert_eq!(row_count(&idx), 3, "files survive the migration");
         let st = idx.status().unwrap();
         assert_eq!(st.len(), 1);

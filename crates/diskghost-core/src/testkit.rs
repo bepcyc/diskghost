@@ -3,13 +3,17 @@
 //! Tests create and delete files only inside their own temp directory —
 //! never anywhere else (owner's hard safety rule).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 
-use crate::index::{scan_with, Index, Probe, Volume};
+use crate::index::{remote_scan_with, scan_with, Index, Probe, ScanSummary, Volume};
 use crate::index_report::{report_with, IndexDupesReport, IndexReportOptions};
+use crate::remote::{
+    ExecOut, RemoteExec, HASH_SCRIPT, PRINTF_FORMAT, PROBE_SCRIPT, RESOLVE_SCRIPT, STAT_SCRIPT,
+};
 use crate::{Options, Progress};
 
 // ---- fixtures -------------------------------------------------------
@@ -54,6 +58,8 @@ pub(crate) struct Estate {
     pub(crate) cow: bool,
     pub(crate) rotational: bool,
     pub(crate) reads: Mutex<Vec<PathBuf>>,
+    /// Remote hosts (`ssh://h`) that do not answer.
+    pub(crate) hosts_down: Mutex<HashSet<String>>,
 }
 
 impl Estate {
@@ -66,6 +72,7 @@ impl Estate {
             cow: false,
             rotational: false,
             reads: Mutex::new(Vec::new()),
+            hosts_down: Mutex::new(HashSet::new()),
         }
     }
 
@@ -106,7 +113,10 @@ impl Estate {
         let rotational = move |_: &Path| rot;
         let reads = &self.reads;
         let on_read = move |p: &Path| reads.lock().unwrap().push(p.to_path_buf());
+        let down = &self.hosts_down;
+        let remote_online = move |host: &str, _root: &str| !down.lock().unwrap().contains(host);
         let probe = Probe {
+            remote_online: &remote_online,
             volume: &volume,
             online: &online,
             cow: &cow,
@@ -137,6 +147,11 @@ impl Estate {
             })
             .unwrap();
         assert!(s.complete, "{s:?}");
+    }
+
+    /// `index add ssh://…` through a fake host.
+    pub(crate) fn add_remote(&self, url: &str, host: &FakeHost) -> io::Result<ScanSummary> {
+        remote_scan_with(&self.idx, url, host, &Progress::default())
     }
 
     pub(crate) fn report(&self, opts: &IndexReportOptions) -> IndexDupesReport {
@@ -208,5 +223,304 @@ impl Estate {
 impl Drop for Estate {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// ---- a fake remote host ---------------------------------------------
+
+/// One file on a [`FakeHost`].
+#[derive(Debug, Clone)]
+pub(crate) struct FakeFile {
+    pub(crate) content: Vec<u8>,
+    pub(crate) mtime_ns: u64,
+    pub(crate) ino: u64,
+    /// The hash tool cannot read it.
+    pub(crate) unreadable: bool,
+}
+
+/// A remote host in memory: answers exactly the commands `remote` sends
+/// (it recognises their scripts) and records every argv. Nothing here
+/// touches a real file or network.
+pub(crate) struct FakeHost {
+    pub(crate) os: String,
+    pub(crate) tools: Vec<&'static str>,
+    pub(crate) printf: bool,
+    /// `gnu`, `bsd` or `none`.
+    pub(crate) stat: &'static str,
+    pub(crate) home: String,
+    pub(crate) fsid: Option<String>,
+    pub(crate) fstype: Option<String>,
+    pub(crate) files: Mutex<BTreeMap<String, FakeFile>>,
+    pub(crate) dirs: Mutex<BTreeSet<String>>,
+    pub(crate) down: AtomicBool,
+    /// Exit code of `find` (non-zero: some folder could not be read).
+    pub(crate) find_code: AtomicI32,
+    pub(crate) calls: Mutex<Vec<Vec<String>>>,
+    next_ino: Mutex<u64>,
+}
+
+impl FakeHost {
+    /// GNU/Linux with every tool.
+    pub(crate) fn linux() -> FakeHost {
+        FakeHost {
+            os: "Linux".into(),
+            tools: vec!["b3sum", "md5sum", "sha1sum", "find", "stat"],
+            printf: true,
+            stat: "gnu",
+            home: "/home/u".into(),
+            fsid: Some("a1b2c3d4".into()),
+            fstype: Some("ext2/ext3".into()),
+            files: Mutex::new(BTreeMap::new()),
+            dirs: Mutex::new(["/".to_string(), "/home".into(), "/home/u".into()].into()),
+            down: AtomicBool::new(false),
+            find_code: AtomicI32::new(0),
+            calls: Mutex::new(Vec::new()),
+            next_ino: Mutex::new(1000),
+        }
+    }
+
+    /// FreeBSD-like: no `find -printf`, BSD `stat`, no b3sum.
+    pub(crate) fn bsd() -> FakeHost {
+        FakeHost {
+            os: "FreeBSD".into(),
+            tools: vec!["md5sum", "sha1sum", "find", "stat"],
+            printf: false,
+            stat: "bsd",
+            fsid: None,
+            fstype: None,
+            ..FakeHost::linux()
+        }
+    }
+
+    pub(crate) fn with_tools(mut self, tools: &[&'static str]) -> FakeHost {
+        self.tools = tools.to_vec();
+        self
+    }
+
+    /// Put a file at `abs` (its folders appear too); returns its inode.
+    pub(crate) fn put(&self, abs: &str, content: &[u8], mtime_ns: u64) -> u64 {
+        let ino = {
+            let mut n = self.next_ino.lock().unwrap();
+            *n += 1;
+            *n
+        };
+        self.put_ino(abs, content, mtime_ns, ino);
+        ino
+    }
+
+    pub(crate) fn put_ino(&self, abs: &str, content: &[u8], mtime_ns: u64, ino: u64) {
+        let mut dirs = self.dirs.lock().unwrap();
+        let mut d = Path::new(abs).parent();
+        while let Some(p) = d {
+            dirs.insert(p.to_str().unwrap().to_string());
+            d = p.parent();
+        }
+        self.files.lock().unwrap().insert(
+            abs.to_string(),
+            FakeFile {
+                content: content.to_vec(),
+                mtime_ns,
+                ino,
+                unreadable: false,
+            },
+        );
+    }
+
+    pub(crate) fn remove(&self, abs: &str) {
+        self.files.lock().unwrap().remove(abs);
+    }
+
+    pub(crate) fn set_unreadable(&self, abs: &str) {
+        self.files.lock().unwrap().get_mut(abs).unwrap().unreadable = true;
+    }
+
+    pub(crate) fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// Calls whose argv starts with `head` (`["sh", "-c", SCRIPT]` …).
+    pub(crate) fn count(&self, pred: impl Fn(&[String]) -> bool) -> usize {
+        self.calls().iter().filter(|c| pred(c)).count()
+    }
+
+    /// The digest `tool` prints for `content` (real BLAKE3 for b3sum; for
+    /// md5sum / sha1sum a stand-in of the right length — only equality
+    /// matters to the index).
+    pub(crate) fn digest(tool: &str, content: &[u8]) -> Vec<u8> {
+        match tool {
+            "b3sum" => blake3::hash(content).as_bytes().to_vec(),
+            "md5sum" => fake_digest(b"md5:", content, 16),
+            "sha1sum" => fake_digest(b"sha1:", content, 20),
+            _ => panic!("no such tool {tool}"),
+        }
+    }
+
+    fn resolve(&self, p: &str) -> String {
+        let joined = if p == "." {
+            self.home.clone()
+        } else if p.starts_with('/') {
+            p.to_string()
+        } else {
+            format!("{}/{p}", self.home)
+        };
+        let mut out = String::new();
+        for c in joined.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            out.push('/');
+            out.push_str(c);
+        }
+        if out.is_empty() {
+            "/".into()
+        } else {
+            out
+        }
+    }
+
+    fn under<'f>(
+        files: &'f BTreeMap<String, FakeFile>,
+        root: &'f str,
+    ) -> impl Iterator<Item = (&'f String, &'f FakeFile)> {
+        files
+            .iter()
+            .filter(move |(p, _)| root == "/" || p.starts_with(&format!("{root}/")))
+    }
+}
+
+fn fake_digest(tag: &[u8], content: &[u8], len: usize) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(tag);
+    h.update(content);
+    h.finalize().as_bytes()[..len].to_vec()
+}
+
+fn ok(stdout: Vec<u8>) -> io::Result<ExecOut> {
+    Ok(ExecOut {
+        stdout,
+        stderr: Vec::new(),
+        code: 0,
+    })
+}
+
+fn fail(code: i32, msg: &str) -> io::Result<ExecOut> {
+    Ok(ExecOut {
+        stdout: Vec::new(),
+        stderr: msg.as_bytes().to_vec(),
+        code,
+    })
+}
+
+impl RemoteExec for FakeHost {
+    fn exec(&self, argv: &[&str]) -> io::Result<ExecOut> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(argv.iter().map(|s| s.to_string()).collect());
+        if self.down.load(Ordering::SeqCst) {
+            return fail(255, "ssh: connect to host fake port 22: Connection refused");
+        }
+        let has = |t: &str| self.tools.contains(&t);
+        match argv {
+            ["sh", "-c", s] if *s == PROBE_SCRIPT => {
+                let mut o = format!("os {}\n", self.os);
+                for t in ["b3sum", "md5sum", "sha1sum", "find", "stat"] {
+                    o += &format!("tool {t} {}\n", if has(t) { "yes" } else { "no" });
+                }
+                o += &format!("printf {}\n", if self.printf { "yes" } else { "no" });
+                o += &format!("stat {}\n", self.stat);
+                ok(o.into_bytes())
+            }
+            ["sh", "-c", s, "sh", path, flavor] if *s == RESOLVE_SCRIPT => {
+                let root = self.resolve(path);
+                if !self.dirs.lock().unwrap().contains(&root) {
+                    return fail(3, "sh: cd: can't cd to it");
+                }
+                let fs = match (*flavor, &self.fsid) {
+                    ("gnu", Some(id)) => format!(
+                        "{id} {}",
+                        self.fstype.clone().unwrap_or_else(|| "ext2/ext3".into())
+                    ),
+                    ("bsd", _) => "66".to_string(),
+                    _ => String::new(),
+                };
+                ok(format!("{root}\n{fs}\n").into_bytes())
+            }
+            ["find", root, "-xdev", "-type", "f", "-printf", fmt] => {
+                if !self.printf {
+                    return fail(1, "find: -printf: unknown primary or operator");
+                }
+                assert_eq!(*fmt, PRINTF_FORMAT);
+                let files = self.files.lock().unwrap();
+                let mut o = Vec::new();
+                for (p, f) in FakeHost::under(&files, root) {
+                    let (s, ns) = (f.mtime_ns / 1_000_000_000, f.mtime_ns % 1_000_000_000);
+                    o.extend(
+                        format!("{}\t{s}.{ns:09}0\t{}\t{p}", f.content.len(), f.ino).as_bytes(),
+                    );
+                    o.push(0);
+                }
+                Ok(ExecOut {
+                    stdout: o,
+                    stderr: Vec::new(),
+                    code: self.find_code.load(Ordering::SeqCst),
+                })
+            }
+            ["find", root, "-xdev", "-type", "f", "-print0"] => {
+                let files = self.files.lock().unwrap();
+                let mut o = Vec::new();
+                for (p, _) in FakeHost::under(&files, root) {
+                    o.extend(p.as_bytes());
+                    o.push(0);
+                }
+                Ok(ExecOut {
+                    stdout: o,
+                    stderr: Vec::new(),
+                    code: self.find_code.load(Ordering::SeqCst),
+                })
+            }
+            ["sh", "-c", s, "sh", flavor, paths @ ..] if *s == STAT_SCRIPT => {
+                let files = self.files.lock().unwrap();
+                let mut o = Vec::new();
+                for p in paths {
+                    if let (Some(f), true) = (files.get(*p), *flavor == self.stat) {
+                        o.extend(
+                            format!(
+                                "{} {} {}",
+                                f.content.len(),
+                                f.mtime_ns / 1_000_000_000,
+                                f.ino
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    o.push(0);
+                }
+                ok(o)
+            }
+            ["sh", "-c", s, "sh", tool, paths @ ..] if *s == HASH_SCRIPT => {
+                let files = self.files.lock().unwrap();
+                let mut o = Vec::new();
+                for p in paths {
+                    match files.get(*p) {
+                        Some(f) if has(tool) && !f.unreadable => o.extend(
+                            format!(
+                                "{}  -",
+                                crate::remote::hex(&FakeHost::digest(tool, &f.content))
+                            )
+                            .as_bytes(),
+                        ),
+                        _ => {}
+                    }
+                    o.push(0);
+                }
+                ok(o)
+            }
+            ["test", "-d", root] => {
+                if self.dirs.lock().unwrap().contains(*root) {
+                    ok(Vec::new())
+                } else {
+                    fail(1, "")
+                }
+            }
+            _ => fail(127, "fake host: unknown command"),
+        }
     }
 }

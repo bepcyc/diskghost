@@ -26,6 +26,9 @@ mod index_report;
 mod mft;
 pub mod plan;
 pub mod policy;
+pub mod remote;
+#[cfg(test)]
+mod remote_tests;
 mod rotational;
 mod snapshot;
 #[cfg(test)]
@@ -39,7 +42,8 @@ pub use apply::{
 };
 pub use dupes::{HashCache, CHECKPOINT_INTERVAL, MERGE_INTERVAL, TRASH_DIRS};
 pub use index::{
-    index_scan, is_cow_fs, validate_host, volume_uuid, Index, LocationStatus, Role, ScanSummary,
+    index_remote, index_scan, is_cow_fs, validate_host, volume_uuid, Index, LocationStatus, Role,
+    ScanSummary,
 };
 pub use index_report::{
     index_dupes, GroupCopy, HashStats, IndexDupesReport, IndexGroup, IndexReportOptions,

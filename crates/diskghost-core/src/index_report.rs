@@ -51,14 +51,41 @@ pub struct IndexDupesReport {
     pub stats: HashStats,
     /// Problems that did not stop the report (missing or unreadable files).
     pub warnings: Vec<String>,
+    /// Same-size files whose digests were made with different algorithms
+    /// (BLAKE3 here, MD5 or SHA-1 on a remote host without `b3sum`): whether
+    /// they are copies of each other cannot be told — never a group.
+    pub unverifiable: Vec<Unverifiable>,
+}
+
+/// Same-size files hashed with different algorithms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unverifiable {
+    pub size: u64,
+    /// Algorithms present, sorted (`blake3`, `md5`, `sha1`).
+    pub algos: Vec<String>,
+    pub copies: Vec<UnverifiableCopy>,
+}
+
+/// One file of an [`Unverifiable`] set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnverifiableCopy {
+    pub location_uuid: String,
+    pub path: PathBuf,
+    pub algo: String,
+    /// Its whole-file digest, hex, when known.
+    pub hash: Option<String>,
+    pub available: bool,
 }
 
 /// Files of one content (size + whole-file hash).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexGroup {
-    /// BLAKE3 of the whole file, hex. `None` when no copy has one yet (all
-    /// members are offline and only their ends were ever read).
+    /// Whole-file digest, hex (`algo`). `None` when no copy has one yet
+    /// (all members are offline and only their ends were ever read).
     pub hash: Option<String>,
+    /// The algorithm of `hash`: `blake3`, or `md5` / `sha1` for a group of
+    /// remote files hashed by a host without `b3sum`.
+    pub algo: String,
     /// BLAKE3 of both ends, hex, when known.
     pub sample: Option<String>,
     pub size: u64,
@@ -208,6 +235,7 @@ pub(crate) fn report_with(
             .collect(),
         stats: c.stats,
         warnings: c.warnings,
+        unverifiable: Vec::new(),
     })
 }
 
@@ -875,6 +903,7 @@ fn render(locs: &[Loc], rows: &[Row], phys: &[Phys], g: &Draft) -> IndexGroup {
     let available = reachable.len() as u64;
     let hex = |h: [u8; 32]| blake3::Hash::from(h).to_hex().to_string();
     IndexGroup {
+        algo: "blake3".into(),
         hash: g.full.map(hex),
         sample: g.sample.map(hex),
         size: g.size,

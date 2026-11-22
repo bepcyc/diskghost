@@ -75,13 +75,20 @@ pub struct PlanSummary {
     /// on a copy-on-write filesystem).
     pub quarantine_bytes: u64,
     pub under_protected_groups: u64,
+    /// Actions on remote locations: listed, never applied (`apply` records
+    /// them `remote_skipped`); not in `actions` / `quarantine_bytes`.
+    #[serde(default)]
+    pub remote_actions: u64,
 }
 
 /// One content and what happens to its copies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanGroup {
-    /// BLAKE3 of the whole file, hex.
+    /// Whole-file digest, hex (`algo`).
     pub hash: String,
+    /// `blake3`, or `md5` / `sha1` for a group of remote files.
+    #[serde(default = "blake3_name")]
+    pub algo: String,
     pub size: u64,
     /// Confirmed physical copies, offline included.
     pub unique_copies: u64,
@@ -105,6 +112,9 @@ pub struct KeptCopy {
     pub shared_inodes: Vec<PathBuf>,
     pub role: Role,
     pub available: bool,
+    /// On a remote (ssh) location.
+    #[serde(default)]
+    pub remote: bool,
     pub why: KeepReason,
     /// What the copy looked like (reachable copies only): `apply
     /// --paranoid` compares a target against it byte by byte.
@@ -138,8 +148,12 @@ pub struct Action {
     pub kind: ActionKind,
     pub location_uuid: String,
     pub role: Role,
-    /// The file to move (absolute).
+    /// The file to move (absolute; on the remote host when `remote`).
     pub path: PathBuf,
+    /// On a remote (ssh) location: `apply` never acts on it and records
+    /// `remote_skipped`.
+    #[serde(default)]
+    pub remote: bool,
     /// What it must still be, or `apply` leaves it alone.
     pub expect: Expect,
 }
@@ -206,6 +220,7 @@ pub(crate) fn plan_with(
         actions: groups.iter().map(|g| g.actions.len() as u64).sum(),
         quarantine_bytes: groups.iter().map(freed).sum(),
         under_protected_groups: groups.iter().filter(|g| g.under_protected).count() as u64,
+        remote_actions: 0,
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -232,6 +247,10 @@ pub(crate) fn plan_with(
         groups,
         warnings,
     })
+}
+
+fn blake3_name() -> String {
+    "blake3".into()
 }
 
 fn is_local(host: &str) -> bool {
@@ -357,6 +376,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
             shared_inodes: n,
             role: k.role,
             available: k.available,
+            remote: false,
             why,
             expect: c.locs[row_loc(rep)].available.then(|| expect_of(rep)),
         }
@@ -389,6 +409,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
                     location_uuid: c.locs[l].uuid.clone(),
                     role: roles[l],
                     path: abs(&c.locs[l].root, &c.rows[r].path),
+                    remote: false,
                     expect: expect_of(r),
                 });
             }
@@ -404,6 +425,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
         a.id = format!("{}-{}", &hash[..16], n + 1);
     }
     Some(PlanGroup {
+        algo: blake3_name(),
         hash,
         size: d.size,
         unique_copies: unique,

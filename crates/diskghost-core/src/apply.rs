@@ -72,6 +72,9 @@ pub enum Status {
     ParanoidNoReference,
     /// Its location is not reachable now: untouched.
     Offline,
+    /// On a remote (ssh) location: `apply` never acts there — recorded so
+    /// the skip is explicit, never silent.
+    RemoteSkipped,
     /// The destination exists (never replaced): untouched.
     Conflict,
     /// Refused or failed (master location, path outside its location,
