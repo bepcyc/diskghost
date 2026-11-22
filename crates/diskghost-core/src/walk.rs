@@ -486,6 +486,7 @@ fn visit<'s, 'c: 's>(
                     .map(|mut s| s.insert(id))
                     .unwrap_or(true);
                 if !first {
+                    b.aliases.push(path);
                     continue;
                 }
             }

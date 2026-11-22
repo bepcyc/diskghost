@@ -346,6 +346,7 @@ version = "0.12.6"
 dependencies = [
  "clap",
  "diskghost-core",
+ "rusqlite",
  "serde",
  "serde_json",
 ]

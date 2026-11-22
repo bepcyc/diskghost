@@ -46,7 +46,7 @@ pub const TRASH_DIRS: [&str; 6] = [
 const SAMPLE: u64 = 16 * 1024;
 
 /// Files at least this big are hashed with several threads each.
-const PARALLEL_HASH_MIN: u64 = 64 << 20;
+pub(crate) const PARALLEL_HASH_MIN: u64 = 64 << 20;
 
 const CACHE_MAGIC: &[u8; 8] = b"DGHASH01";
 
@@ -435,8 +435,16 @@ pub(crate) fn sample_file(path: &Path, size: u64) -> Option<Sampled> {
 /// BLAKE3 of the whole file: memory-mapped (several threads for big files),
 /// streamed where mapping is not possible.
 pub(crate) fn full_hash(path: &Path, size: u64) -> Option<[u8; 32]> {
+    full_hash_with(path, size, true)
+}
+
+/// [`full_hash`], with several threads per big file only when `parallel`
+/// (a spinning disk reads one file front to back, not at scattered offsets).
+/// A big file's pages are then dropped from the page cache: a multi-terabyte
+/// search must not evict the owner's working set.
+pub(crate) fn full_hash_with(path: &Path, size: u64, parallel: bool) -> Option<[u8; 32]> {
     let mut h = blake3::Hasher::new();
-    let mapped = if size >= PARALLEL_HASH_MIN {
+    let mapped = if parallel && size >= PARALLEL_HASH_MIN {
         h.update_mmap_rayon(path)
     } else {
         h.update_mmap(path)
@@ -446,8 +454,29 @@ pub(crate) fn full_hash(path: &Path, size: u64) -> Option<[u8; 32]> {
         let mut f = std::fs::File::open(path).ok()?;
         std::io::copy(&mut f, &mut h).ok()?;
     }
+    if size > PARALLEL_HASH_MIN {
+        drop_from_page_cache(path, size);
+    }
     Some(*h.finalize().as_bytes())
 }
+
+/// Best effort `posix_fadvise(POSIX_FADV_DONTNEED)` over a file just read
+/// (the mapping is gone by now). Errors are ignored: this is hygiene only.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn drop_from_page_cache(path: &Path, size: u64) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(f) = std::fs::File::open(path) {
+        let len = libc::off_t::try_from(size).unwrap_or(0); // 0 = to the end
+                                                            // SAFETY: `f` is an open file descriptor for the whole call.
+        unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), 0, len, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+}
+
+/// No `posix_fadvise` here (macOS, Windows): nothing to do.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn drop_from_page_cache(_path: &Path, _size: u64) {}
 
 /// Run `run` on a scoped thread, handing it a sender for the entries it
 /// learns, while the calling thread merges them into `cache`: in one batch at

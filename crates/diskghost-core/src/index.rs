@@ -12,7 +12,7 @@
 //! disk fills one location, and each scan only answers for the subtree it
 //! walked.
 //!
-//! # Schema (version 1, `PRAGMA user_version`)
+//! # Schema (version 2, `PRAGMA user_version`)
 //!
 //! ```sql
 //! meta      (key TEXT PRIMARY KEY, value INTEGER NOT NULL)
@@ -23,7 +23,8 @@
 //!            root TEXT NOT NULL,          -- last known mountpoint
 //!            role TEXT NOT NULL DEFAULT 'normal'  -- normal | master | scratch
 //!            online INTEGER NOT NULL,     -- reachable at its last scan
-//!            last_seen INTEGER NOT NULL)  -- unix seconds of that scan
+//!            last_seen INTEGER NOT NULL,  -- unix seconds of that scan
+//!            cow INTEGER)                 -- v2: copy-on-write fs at that scan
 //! files     (location_id → locations(id) ON DELETE CASCADE,
 //!            path TEXT,                   -- relative to locations.root
 //!            size, mtime_ns, dev, ino INTEGER,
@@ -55,11 +56,12 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
-const MIGRATIONS: &[&str] = &[r"
+const MIGRATIONS: &[&str] = &[
+    r"
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -89,7 +91,11 @@ CREATE TABLE files (
 ) WITHOUT ROWID;
 CREATE INDEX files_size ON files(size);
 CREATE INDEX files_full ON files(full) WHERE full IS NOT NULL;
-"];
+",
+    r"
+ALTER TABLE locations ADD COLUMN cow INTEGER CHECK (cow IS NULL OR cow IN (0, 1));
+",
+];
 
 /// Role of a location in later copy policies: which copy to keep
 /// (`master`), which copies are expendable (`scratch`).
@@ -110,7 +116,7 @@ impl Role {
         }
     }
 
-    fn parse(s: &str) -> Role {
+    pub(crate) fn parse(s: &str) -> Role {
         match s {
             "master" => Role::Master,
             "scratch" => Role::Scratch,
@@ -168,7 +174,7 @@ pub struct LocationStatus {
     pub last_seen: i64,
 }
 
-fn db_err(e: rusqlite::Error) -> io::Error {
+pub(crate) fn db_err(e: rusqlite::Error) -> io::Error {
     io::Error::other(e)
 }
 
@@ -180,7 +186,7 @@ fn now_secs() -> i64 {
 
 /// SQLite integers are signed 64-bit: device and inode numbers are stored by
 /// bit pattern, so every `u64` round-trips.
-fn to_sql(v: u64) -> i64 {
+pub(crate) fn to_sql(v: u64) -> i64 {
     v as i64
 }
 
@@ -349,19 +355,39 @@ pub(crate) struct Volume {
     pub(crate) mount_point: PathBuf,
 }
 
-#[cfg(unix)]
-fn volume(path: &Path) -> io::Result<Volume> {
-    use std::os::unix::fs::MetadataExt;
-    let path = std::fs::canonicalize(path)?;
-    let dev = std::fs::metadata(&path)?.dev();
-    let mounts: Vec<MountEntry> = std::fs::read("/proc/self/mountinfo")
+/// This process's mount table (empty where there is none).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn mount_table() -> Vec<MountEntry> {
+    std::fs::read("/proc/self/mountinfo")
         .map(|b| {
             String::from_utf8_lossy(&b)
                 .lines()
                 .filter_map(crate::walk::parse_mountinfo_entry)
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// The mount holding `path`, as [`volume_uuid`] picks it.
+#[cfg(unix)]
+pub(crate) fn mount_of(path: &Path) -> Option<MountEntry> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(path).ok()?;
+    let dev = std::fs::metadata(&path).ok()?.dev();
+    pick_mount(&mount_table(), dev, &path).cloned()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mount_of(_path: &Path) -> Option<MountEntry> {
+    None
+}
+
+#[cfg(unix)]
+fn volume(path: &Path) -> io::Result<Volume> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(path)?;
+    let dev = std::fs::metadata(&path)?.dev();
+    let mounts = mount_table();
     if let Some(v) = resolve_volume(&mounts, dev, &path, &uuid_of_source) {
         return Ok(v);
     }
@@ -416,6 +442,21 @@ fn resolve_volume(
     path: &Path,
     uuid_of: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Volume> {
+    let m = pick_mount(mounts, dev, path)?;
+    let key = match uuid_of(&m.source) {
+        Some(uuid) if m.root == "/" => uuid,
+        Some(uuid) => format!("{uuid}:{}", m.root),
+        None => dev_key(m.major, m.minor),
+    };
+    Some(Volume {
+        key,
+        mount_point: m.mount_point.clone(),
+    })
+}
+
+/// The mount of `path` (canonical) on device `dev` among `mounts`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn pick_mount<'m>(mounts: &'m [MountEntry], dev: u64, path: &Path) -> Option<&'m MountEntry> {
     // Longest mountpoint that is a prefix of `path`; later lines win ties
     // (a later mount covers an earlier one on the same directory).
     let longest = |pred: &dyn Fn(&MountEntry) -> bool| {
@@ -432,19 +473,10 @@ fn resolve_volume(
         }
         best
     };
-    let m = longest(&|m| m.dev == dev).or_else(|| {
+    longest(&|m| m.dev == dev).or_else(|| {
         // A nested btrfs subvolume has its own anonymous st_dev that no
         // mountinfo line carries; it is part of the enclosing btrfs mount.
         longest(&|_| true).filter(|m| m.fstype == "btrfs")
-    })?;
-    let key = match uuid_of(&m.source) {
-        Some(uuid) if m.root == "/" => uuid,
-        Some(uuid) => format!("{uuid}:{}", m.root),
-        None => dev_key(m.major, m.minor),
-    };
-    Some(Volume {
-        key,
-        mount_point: m.mount_point.clone(),
     })
 }
 
@@ -553,15 +585,15 @@ impl Probe<'static> {
 }
 
 /// A file as `stat` sees it, in the index's terms.
-struct Stat {
-    size: u64,
-    mtime_ns: u64,
-    dev: u64,
-    ino: u64,
+pub(crate) struct Stat {
+    pub(crate) size: u64,
+    pub(crate) mtime_ns: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
 }
 
 #[cfg(unix)]
-fn stat_of(meta: &std::fs::Metadata) -> Stat {
+pub(crate) fn stat_of(meta: &std::fs::Metadata) -> Stat {
     use std::os::unix::fs::MetadataExt;
     Stat {
         size: meta.len(),
@@ -572,7 +604,7 @@ fn stat_of(meta: &std::fs::Metadata) -> Stat {
 }
 
 #[cfg(not(unix))]
-fn stat_of(meta: &std::fs::Metadata) -> Stat {
+pub(crate) fn stat_of(meta: &std::fs::Metadata) -> Stat {
     Stat {
         size: meta.len(),
         mtime_ns: crate::walk::modified_ns(meta),
@@ -637,10 +669,10 @@ pub(crate) fn scan_with(
     let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
     let loc: i64 = tx
         .query_row(
-            "INSERT INTO locations (uuid, root, online, last_seen) VALUES (?1, ?2, 1, ?3) \
+            "INSERT INTO locations (uuid, root, online, last_seen, cow) VALUES (?1, ?2, 1, ?3, ?4) \
              ON CONFLICT(uuid) DO UPDATE SET root = excluded.root, online = 1, \
-             last_seen = excluded.last_seen RETURNING id",
-            params![vol.key, mount, now_secs()],
+             last_seen = excluded.last_seen, cow = excluded.cow RETURNING id",
+            params![vol.key, mount, now_secs(), (probe.cow)(&vol.mount_point)],
             |r| r.get(0),
         )
         .map_err(db_err)?;
@@ -750,8 +782,10 @@ pub(crate) fn scan_with(
             if failed.is_some() {
                 return;
             }
-            for f in &b.files {
-                if let Err(e) = record(&f.path, &mut sum) {
+            // Every name of a hard-linked file is a row: the report needs
+            // them all to tell one physical copy from several.
+            for p in b.files.iter().map(|f| &f.path).chain(&b.aliases) {
+                if let Err(e) = record(p, &mut sum) {
                     failed = Some(e);
                     progress.cancel(); // stop the walk; the error is reported
                     return;

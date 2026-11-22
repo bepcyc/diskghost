@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
-    diff, find_duplicates_cached, format_timestamp, human_delta, human_size, index_scan, phase,
-    reclaim, remove_path, validate_globs, validate_host, DiffReport, DupGroup, HashCache, Index,
-    LocationStatus, Options, Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport,
-    Role, ScanReport, ScanSummary, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
+    diff, find_duplicates_cached, format_timestamp, human_delta, human_size, index_dupes,
+    index_scan, phase, reclaim, remove_path, validate_globs, validate_host, DiffReport, DupGroup,
+    HashCache, Index, IndexDupesReport, IndexReportOptions, LocationStatus, Options, Progress,
+    ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, Role, ScanReport, ScanSummary,
+    ScanTree, Snapshot, Suggest, CHECKPOINT_INTERVAL,
 };
 use serde::Serialize;
 
@@ -119,9 +120,12 @@ enum Command {
         top: usize,
     },
     /// Find duplicate (byte-identical) files; optionally reclaim their space.
+    /// With --index: report from the persistent index across every indexed
+    /// volume, unplugged ones included (see `diskghost index`).
     Dupes {
-        /// Directory to scan.
-        path: PathBuf,
+        /// Directory to scan (not with --index).
+        #[arg(required_unless_present = "index", conflicts_with = "index")]
+        path: Option<PathBuf>,
         /// Ignore files smaller than this many megabytes.
         #[arg(long, default_value_t = 1)]
         min_mb: u64,
@@ -129,15 +133,38 @@ enum Command {
         walk: WalkArgs,
         /// Reclaim redundant copies (one file per group is always kept).
         /// Nothing is changed unless you also pass --apply.
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, conflicts_with = "index")]
         reclaim: Option<ReclaimArg>,
         /// Actually perform the reclaim (default: dry-run).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "index")]
         apply: bool,
         /// Keep file hashes in this file between runs: a repeated search only
         /// reads files whose size or modification time changed.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE", conflicts_with = "index")]
         cache: Option<PathBuf>,
+        /// Report from the persistent index instead of walking a folder:
+        /// copies on every indexed volume count, offline ones too (never
+        /// read, never suggested for action). Hashes still missing are
+        /// computed once and stored. Report only: nothing is changed.
+        #[arg(long)]
+        index: bool,
+        /// Index database (default: as `diskghost index`).
+        #[arg(long, value_name = "FILE", requires = "index")]
+        db: Option<PathBuf>,
+        /// Also count, per volume, the files that exist only once anywhere —
+        /// the ones no other copy protects.
+        #[arg(long, requires = "index")]
+        singles: bool,
+        /// List those single-copy files too: into FILE (one path per line),
+        /// or in the output when no FILE is given. Implies --singles.
+        #[arg(
+            long,
+            value_name = "FILE",
+            num_args = 0..=1,
+            default_missing_value = "-",
+            requires = "index"
+        )]
+        singles_paths: Option<PathBuf>,
     },
     /// Persistent index of every file on registered volumes: a re-scan only
     /// re-reads files whose size, time or inode changed. Volumes are known by
@@ -393,7 +420,24 @@ fn main() -> ExitCode {
             reclaim: reclaim_arg,
             apply,
             cache,
+            index,
+            db,
+            singles,
+            singles_paths,
         } => {
+            if index {
+                let opts = IndexReportOptions {
+                    min_size: min_mb.saturating_mul(1024 * 1024),
+                    singles: singles || singles_paths.is_some(),
+                    singles_paths: singles_paths.is_some(),
+                };
+                let to_file = singles_paths.filter(|p| p.as_os_str() != "-");
+                return run_index_dupes(cli.json, db, &opts, to_file.as_deref());
+            }
+            let Some(path) = path else {
+                eprintln!("error: give a directory, or --index");
+                return ExitCode::FAILURE;
+            };
             if !path.is_dir() {
                 eprintln!("error: not a directory: {}", path.display());
                 return ExitCode::FAILURE;
@@ -481,6 +525,156 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// `dupes --index`: the report from the persistent index.
+fn run_index_dupes(
+    json: bool,
+    db: Option<PathBuf>,
+    opts: &IndexReportOptions,
+    singles_file: Option<&Path>,
+) -> ExitCode {
+    let Some(db) = db.or_else(default_index_db) else {
+        eprintln!("error: no --db given and no data directory ($XDG_DATA_HOME / $HOME) known");
+        return ExitCode::FAILURE;
+    };
+    let idx = match Index::open(&db) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error: cannot open index {}: {e}", db.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut report = match with_progress(|p| index_dupes(&idx, opts, p)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Paths into a file keep stdout short: millions of single files would
+    // flood it.
+    if let (Some(file), Some(singles)) = (singles_file, report.singles.as_mut()) {
+        let mut text = String::new();
+        for s in singles.iter_mut() {
+            for p in s.paths.take().unwrap_or_default() {
+                text.push_str(&p.to_string_lossy());
+                text.push('\n');
+            }
+        }
+        if let Err(e) = std::fs::write(file, text) {
+            eprintln!("error: cannot write {}: {e}", file.display());
+            return ExitCode::FAILURE;
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    } else {
+        print_index_dupes(&report, singles_file);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_index_dupes(r: &IndexDupesReport, singles_file: Option<&Path>) {
+    for w in &r.warnings {
+        eprintln!("warning: {w}");
+    }
+    if r.locations.is_empty() {
+        println!("index is empty — add a folder with `diskghost index add PATH`");
+        return;
+    }
+    println!("Volumes:");
+    for l in &r.locations {
+        let mut tags = vec![if l.available { "online" } else { "offline" }];
+        if l.rotational {
+            tags.push("spinning");
+        }
+        if l.cow {
+            tags.push("copy-on-write");
+        }
+        println!("  {}  {}  [{}]", l.uuid, l.root.display(), tags.join(", "));
+    }
+    println!();
+    if r.groups.is_empty() {
+        println!("No duplicates found.");
+    } else {
+        let total: u64 = r.groups.iter().map(|g| g.reclaimable_bytes).sum();
+        let now: u64 = r.groups.iter().map(|g| g.actionable_bytes).sum();
+        println!(
+            "Found {} duplicate group(s) — {} reclaimable, {} of it on volumes online now:\n",
+            r.groups.len(),
+            human_size(total),
+            human_size(now)
+        );
+        for g in &r.groups {
+            let id = g
+                .hash
+                .as_deref()
+                .or(g.sample.as_deref())
+                .map_or("", |h| &h[..12]);
+            print!(
+                "  {} cop{} x {} ({} reclaimable) [{id}]",
+                g.unique_copies,
+                if g.unique_copies == 1 { "y" } else { "ies" },
+                human_size(g.size),
+                human_size(g.reclaimable_bytes),
+            );
+            if g.probable_copies > 0 {
+                print!(" +{} probable", g.probable_copies);
+            }
+            if g.savings_may_be_shared {
+                print!(" — copy-on-write: copies may share blocks, deleting may free nothing");
+            }
+            println!();
+            for c in &g.copies {
+                let what = match (c.suggest, c.available, c.probable) {
+                    (Some(Suggest::Keep), ..) => "keep",
+                    (Some(Suggest::Reclaimable), ..) => "reclaimable",
+                    (None, _, true) => "probable (offline, not verified)",
+                    (None, false, _) => "offline",
+                    (None, true, _) => "",
+                };
+                println!("      {:<12} {}", what, c.path.display());
+                for n in &c.shared_inodes {
+                    println!("      {:<12} {} (same file, another name)", "", n.display());
+                }
+            }
+            println!();
+        }
+    }
+    if let Some(singles) = &r.singles {
+        let files: u64 = singles.iter().map(|s| s.files).sum();
+        let bytes: u64 = singles.iter().map(|s| s.bytes).sum();
+        println!(
+            "Single-copy files (no other copy anywhere): {files}, {}",
+            human_size(bytes)
+        );
+        for s in singles {
+            let state = if s.available { "online" } else { "offline" };
+            println!(
+                "  {}  {}  [{state}]: {} file(s), {}",
+                s.location_uuid,
+                s.root.display(),
+                s.files,
+                human_size(s.bytes)
+            );
+            for p in s.paths.iter().flatten() {
+                println!("      {}", p.display());
+            }
+        }
+        if let Some(f) = singles_file {
+            println!("  paths written to {}", f.display());
+        }
+    }
+    let st = &r.stats;
+    if st.sampled + st.full_hashed > 0 {
+        println!(
+            "\nRead now (stored for next time): {} file end(s), {} whole file(s), {}",
+            st.sampled,
+            st.full_hashed,
+            human_size(st.bytes_read)
+        );
+    }
 }
 
 /// Where the index lives without `--db`: the XDG data directory.

@@ -11,13 +11,22 @@
 //! mount of the same filesystem) are one copy, listed with its other names.
 //! Offline copies count but are never suggested for any action.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use rayon::prelude::*;
+use rusqlite::params;
 use serde::Serialize;
 
-use crate::index::{Index, Probe};
-use crate::Progress;
+use crate::dupes::{full_hash_with, sample_file};
+use crate::index::{db_err, stat_of, to_sql, Index, Probe, Role};
+use crate::rotational::ROTATIONAL_HASH_THREADS;
+use crate::{phase, Progress};
+
+/// Bytes [`sample_file`] reads from a file of `size` at most.
+const SAMPLE_READ: u64 = 2 * 16 * 1024;
 
 /// What the report should cover.
 #[derive(Debug, Clone, Default)]
@@ -153,8 +162,744 @@ pub(crate) fn report_with(
     progress: &Progress,
     probe: &Probe,
 ) -> io::Result<IndexDupesReport> {
-    let _ = (idx, opts, progress, probe);
-    unimplemented!("M2 report")
+    let min = opts.min_size.max(1);
+    let locs = load_locations(idx, probe)?;
+    let at: HashMap<i64, usize> = locs.iter().enumerate().map(|(i, l)| (l.id, i)).collect();
+    let mut rows = load_colliding(idx, min, &at)?;
+    let mut warnings = Vec::new();
+    let stats = Counters::default();
+
+    // 1. Every candidate on a reachable volume: still the file of its row?
+    // Re-read what changed, read the ends of what was never sampled.
+    refresh(&locs, &mut rows, &stats, progress, probe);
+    persist(idx, &locs, &rows)?;
+    if progress.cancelled() {
+        return Err(cancelled());
+    }
+
+    // 2. Physical files: names of one inode are one copy.
+    let mut phys = physical(&locs, &rows);
+    let buckets = by_size(&phys);
+
+    // 3. Whole-file hashes, only where a copy is still possible.
+    let mut items = Vec::new();
+    for members in buckets.values() {
+        for &p in members {
+            if needs_full(&phys, members, p) {
+                let r = &rows[phys[p].rows[0]];
+                items.push(HashItem {
+                    path: abs(&locs[r.loc].root, &r.path),
+                    size: phys[p].size,
+                    rotational: locs[r.loc].rotational,
+                    location: r.loc,
+                });
+            }
+        }
+    }
+    let mut by_path: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for members in buckets.values() {
+        for &p in members {
+            let r = &rows[phys[p].rows[0]];
+            by_path
+                .entry(abs(&locs[r.loc].root, &r.path))
+                .or_default()
+                .push(p);
+        }
+    }
+    let hashed = hash_all(items, &stats, progress, probe);
+    let mut unreadable = 0u64;
+    for (path, h) in hashed {
+        for &p in by_path.get(&path).map(Vec::as_slice).unwrap_or_default() {
+            match h {
+                Some(full) => {
+                    phys[p].full = Some(full);
+                    for &r in &phys[p].rows {
+                        rows[r].full = Some(full);
+                        rows[r].dirty = true;
+                    }
+                }
+                None => {
+                    phys[p].excluded = true;
+                    unreadable += 1;
+                }
+            }
+        }
+    }
+    persist(idx, &locs, &rows)?;
+    if progress.cancelled() {
+        return Err(cancelled());
+    }
+
+    // 4. Groups, then what is in none of them.
+    let mut grouped: HashSet<usize> = HashSet::new();
+    let mut groups = Vec::new();
+    for members in buckets.values() {
+        let members: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&p| !phys[p].excluded)
+            .collect();
+        for g in group_bucket(&phys, &members) {
+            grouped.extend(g.confirmed.iter().chain(&g.probable));
+            groups.push(render(&locs, &rows, &phys, &g));
+        }
+    }
+    groups.sort_by(|a, b| {
+        b.reclaimable_bytes
+            .cmp(&a.reclaimable_bytes)
+            .then(b.size.cmp(&a.size))
+            .then_with(|| a.hash.cmp(&b.hash))
+            .then_with(|| a.copies[0].path.cmp(&b.copies[0].path))
+    });
+
+    let singles = if opts.singles {
+        Some(singles(
+            idx,
+            min,
+            opts.singles_paths,
+            &locs,
+            &rows,
+            &phys,
+            &grouped,
+            &at,
+        )?)
+    } else {
+        None
+    };
+
+    let missing = stats.missing.load(Ordering::Relaxed);
+    if missing > 0 {
+        warnings.push(format!(
+            "{missing} indexed file(s) on reachable volumes are gone — left out; \
+             `diskghost index add` on their folder prunes the index"
+        ));
+    }
+    unreadable += stats.unreadable.load(Ordering::Relaxed);
+    if unreadable > 0 {
+        warnings.push(format!("{unreadable} file(s) could not be read — left out"));
+    }
+    Ok(IndexDupesReport {
+        groups,
+        singles,
+        locations: locs
+            .iter()
+            .map(|l| ReportLocation {
+                uuid: l.uuid.clone(),
+                root: l.root.clone(),
+                available: l.available,
+                rotational: l.rotational,
+                cow: l.cow,
+            })
+            .collect(),
+        stats: HashStats {
+            sampled: stats.sampled.load(Ordering::Relaxed),
+            full_hashed: stats.full_hashed.load(Ordering::Relaxed),
+            changed: stats.changed.load(Ordering::Relaxed),
+            missing,
+            bytes_read: stats.bytes_read.load(Ordering::Relaxed),
+        },
+        warnings,
+    })
+}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "cancelled")
+}
+
+#[derive(Default)]
+struct Counters {
+    sampled: AtomicU64,
+    full_hashed: AtomicU64,
+    changed: AtomicU64,
+    missing: AtomicU64,
+    unreadable: AtomicU64,
+    bytes_read: AtomicU64,
+}
+
+/// A location as this report sees it.
+struct Loc {
+    id: i64,
+    uuid: String,
+    root: PathBuf,
+    role: Role,
+    available: bool,
+    rotational: bool,
+    cow: bool,
+}
+
+fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
+    let mut st = idx
+        .conn
+        .prepare("SELECT id, uuid, root, role, cow FROM locations ORDER BY root, uuid")
+        .map_err(db_err)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .map_err(db_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, uuid, root, role, cow) = row.map_err(db_err)?;
+        let root = PathBuf::from(root);
+        let available = (probe.online)(&root, &uuid);
+        out.push(Loc {
+            id,
+            available,
+            rotational: available && (probe.rotational)(&root),
+            // Recorded at its last scan; never recorded and out of reach:
+            // it may be CoW, so savings may be shared.
+            cow: match cow {
+                Some(c) => c != 0,
+                None if available => (probe.cow)(&root),
+                None => true,
+            },
+            role: Role::parse(&role),
+            uuid,
+            root,
+        });
+    }
+    Ok(out)
+}
+
+/// One index row of a size that occurs more than once.
+struct Row {
+    loc: usize,
+    path: String,
+    size: u64,
+    mtime_ns: u64,
+    dev: u64,
+    ino: u64,
+    sample: Option<[u8; 32]>,
+    full: Option<[u8; 32]>,
+    /// On a reachable volume but gone or unreadable: left out.
+    excluded: bool,
+    /// Differs from its stored row.
+    dirty: bool,
+}
+
+fn hash32(b: Option<Vec<u8>>) -> Option<[u8; 32]> {
+    b.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+}
+
+fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result<Vec<Row>> {
+    let mut st = idx
+        .conn
+        .prepare(
+            "SELECT location_id, path, size, mtime_ns, dev, ino, sample, full FROM files \
+             WHERE size >= ?1 AND size IN \
+               (SELECT size FROM files WHERE size >= ?1 GROUP BY size HAVING COUNT(*) > 1) \
+             ORDER BY location_id, path",
+        )
+        .map_err(db_err)?;
+    let rows = st
+        .query_map([to_sql(min)], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<Vec<u8>>>(6)?,
+                r.get::<_, Option<Vec<u8>>>(7)?,
+            ))
+        })
+        .map_err(db_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (loc, path, size, mtime, dev, ino, sample, full) = row.map_err(db_err)?;
+        let Some(&loc) = at.get(&loc) else { continue };
+        out.push(Row {
+            loc,
+            path,
+            size: size as u64,
+            mtime_ns: mtime as u64,
+            dev: dev as u64,
+            ino: ino as u64,
+            sample: hash32(sample),
+            full: hash32(full),
+            excluded: false,
+            dirty: false,
+        });
+    }
+    Ok(out)
+}
+
+/// Stat every row on a reachable volume; a row whose file changed gets the
+/// new size/time/inode and loses its hashes; every row without a sample is
+/// sampled. Offline rows are left as they are — never touched.
+fn refresh(locs: &[Loc], rows: &mut [Row], stats: &Counters, progress: &Progress, probe: &Probe) {
+    let online: Vec<usize> = (0..rows.len())
+        .filter(|&i| locs[rows[i].loc].available)
+        .collect();
+    let bytes = online.iter().map(|&i| rows[i].size.min(SAMPLE_READ)).sum();
+    progress.enter(phase::SAMPLE, online.len() as u64, bytes);
+    let on_read = probe.on_read;
+    rows.par_iter_mut()
+        .filter(|r| locs[r.loc].available)
+        .for_each(|r| {
+            if progress.cancelled() {
+                r.excluded = true;
+                return;
+            }
+            let p = abs(&locs[r.loc].root, &r.path);
+            let meta = match std::fs::metadata(&p) {
+                Ok(m) if m.is_file() => m,
+                _ => {
+                    r.excluded = true;
+                    stats.missing.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            let st = stat_of(&meta);
+            if (st.size, st.mtime_ns, st.ino) != (r.size, r.mtime_ns, r.ino) {
+                r.size = st.size;
+                r.mtime_ns = st.mtime_ns;
+                r.ino = st.ino;
+                r.sample = None;
+                r.full = None;
+                r.dirty = true;
+                stats.changed.fetch_add(1, Ordering::Relaxed);
+            }
+            if st.dev != r.dev {
+                r.dev = st.dev; // device numbers move across reboots
+                r.dirty = true;
+            }
+            if r.sample.is_none() {
+                on_read(&p);
+                match sample_file(&p, r.size) {
+                    Some(s) => {
+                        r.sample = Some(s.sample);
+                        r.full = s.full;
+                        r.dirty = true;
+                        stats.sampled.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .bytes_read
+                            .fetch_add(r.size.min(SAMPLE_READ), Ordering::Relaxed);
+                    }
+                    None => {
+                        r.excluded = true;
+                        stats.unreadable.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            progress.files.fetch_add(1, Ordering::Relaxed);
+            progress
+                .bytes
+                .fetch_add(r.size.min(SAMPLE_READ), Ordering::Relaxed);
+        });
+}
+
+/// Write back every row this run learned something about.
+fn persist(idx: &Index, locs: &[Loc], rows: &[Row]) -> io::Result<()> {
+    if !rows.iter().any(|r| r.dirty && !r.excluded) {
+        return Ok(());
+    }
+    let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
+    {
+        let mut set = tx
+            .prepare_cached(
+                "UPDATE files SET size = ?3, mtime_ns = ?4, dev = ?5, ino = ?6, \
+                 sample = ?7, full = ?8 WHERE location_id = ?1 AND path = ?2",
+            )
+            .map_err(db_err)?;
+        for r in rows.iter().filter(|r| r.dirty && !r.excluded) {
+            set.execute(params![
+                locs[r.loc].id,
+                r.path,
+                to_sql(r.size),
+                to_sql(r.mtime_ns),
+                to_sql(r.dev),
+                to_sql(r.ino),
+                r.sample.as_ref().map(|h| &h[..]),
+                r.full.as_ref().map(|h| &h[..]),
+            ])
+            .map_err(db_err)?;
+        }
+    }
+    tx.commit().map_err(db_err)
+}
+
+/// One physical file: every name of one inode on one filesystem.
+struct Phys {
+    /// Row indices, the representative name first.
+    rows: Vec<usize>,
+    size: u64,
+    sample: Option<[u8; 32]>,
+    full: Option<[u8; 32]>,
+    available: bool,
+    excluded: bool,
+}
+
+/// The filesystem part of a location key: a bind mount or subvolume
+/// (`UUID:/sub`) shares inodes with the whole filesystem (`UUID`).
+fn filesystem_of(uuid: &str) -> &str {
+    if uuid.starts_with("dev:") {
+        uuid
+    } else {
+        uuid.split_once(':').map_or(uuid, |(fs, _)| fs)
+    }
+}
+
+fn physical(locs: &[Loc], rows: &[Row]) -> Vec<Phys> {
+    let mut at: HashMap<(&str, u64, u64, &str), usize> = HashMap::new();
+    let mut out: Vec<Phys> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if r.excluded {
+            continue;
+        }
+        // No inode number (not unix): every name is its own file.
+        let key = if r.ino == 0 {
+            (locs[r.loc].uuid.as_str(), r.dev, 0, r.path.as_str())
+        } else {
+            (filesystem_of(&locs[r.loc].uuid), r.dev, r.ino, "")
+        };
+        let available = locs[r.loc].available;
+        match at.get(&key) {
+            Some(&p) => {
+                let ph = &mut out[p];
+                ph.rows.push(i);
+                ph.available |= available;
+                ph.sample = ph.sample.or(r.sample);
+                ph.full = ph.full.or(r.full);
+            }
+            None => {
+                at.insert(key, out.len());
+                out.push(Phys {
+                    rows: vec![i],
+                    size: r.size,
+                    sample: r.sample,
+                    full: r.full,
+                    available,
+                    excluded: false,
+                });
+            }
+        }
+    }
+    // Representative: a reachable name first, then by path.
+    for ph in &mut out {
+        ph.rows.sort_by(|&a, &b| {
+            let (ra, rb) = (&rows[a], &rows[b]);
+            locs[rb.loc]
+                .available
+                .cmp(&locs[ra.loc].available)
+                .then_with(|| {
+                    abs(&locs[ra.loc].root, &ra.path).cmp(&abs(&locs[rb.loc].root, &rb.path))
+                })
+        });
+    }
+    out
+}
+
+/// Physical files by size, only sizes with more than one.
+fn by_size(phys: &[Phys]) -> BTreeMap<u64, Vec<usize>> {
+    let mut m: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (i, p) in phys.iter().enumerate() {
+        m.entry(p.size).or_default().push(i);
+    }
+    m
+}
+
+/// A reachable file without a whole-file hash needs one when another
+/// physical file of its size may hold the same bytes: same ends, or ends
+/// never read (offline, never sampled).
+fn needs_full(phys: &[Phys], members: &[usize], p: usize) -> bool {
+    let me = &phys[p];
+    if !me.available || me.full.is_some() || me.excluded {
+        return false;
+    }
+    members.iter().any(|&o| {
+        o != p
+            && !phys[o].excluded
+            && match (phys[o].sample, me.sample) {
+                (Some(a), Some(b)) => a == b,
+                (None, _) => !phys[o].available,
+                _ => false,
+            }
+    })
+}
+
+/// Read every planned file whole; `(path, hash)` per item, `None` when it
+/// could not be read.
+fn hash_all(
+    items: Vec<HashItem>,
+    stats: &Counters,
+    progress: &Progress,
+    probe: &Probe,
+) -> Vec<(PathBuf, Option<[u8; 32]>)> {
+    let bytes = items.iter().map(|i| i.size).sum();
+    progress.enter(phase::HASH, items.len() as u64, bytes);
+    let on_read = probe.on_read;
+    let one = |it: &HashItem| {
+        if progress.cancelled() {
+            return (it.path.clone(), None);
+        }
+        on_read(&it.path);
+        let h = full_hash_with(&it.path, it.size, !it.rotational);
+        if h.is_some() {
+            stats.full_hashed.fetch_add(1, Ordering::Relaxed);
+            stats.bytes_read.fetch_add(it.size, Ordering::Relaxed);
+        }
+        progress.files.fetch_add(1, Ordering::Relaxed);
+        progress.bytes.fetch_add(it.size, Ordering::Relaxed);
+        (it.path.clone(), h)
+    };
+    let mut out = Vec::new();
+    for batch in hash_plan(items) {
+        match batch.threads {
+            None => out.extend(batch.items.par_iter().map(one).collect::<Vec<_>>()),
+            Some(n) => out.extend(in_order(n, &batch.items, &one)),
+        }
+    }
+    out
+}
+
+/// Run `f` over `items` with `n` threads that each take the next item in
+/// order — so a spinning disk sees (nearly) one front-to-back pass.
+fn in_order<T: Send>(n: usize, items: &[HashItem], f: &(dyn Fn(&HashItem) -> T + Sync)) -> Vec<T> {
+    let next = AtomicUsize::new(0);
+    let mut out = Vec::new();
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..n.max(1))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut got = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(it) = items.get(i) else { break };
+                        got.push(f(it));
+                    }
+                    got
+                })
+            })
+            .collect();
+        for w in workers {
+            if let Ok(got) = w.join() {
+                out.extend(got);
+            }
+        }
+    });
+    out
+}
+
+/// One group before rendering.
+struct Draft {
+    size: u64,
+    full: Option<[u8; 32]>,
+    sample: Option<[u8; 32]>,
+    confirmed: Vec<usize>,
+    probable: Vec<usize>,
+}
+
+/// The groups among the physical files of one size: one per whole-file
+/// hash that has a second confirmed or a probable copy, plus offline files
+/// sharing ends that were never hashed whole.
+fn group_bucket(phys: &[Phys], members: &[usize]) -> Vec<Draft> {
+    let mut out = Vec::new();
+    let mut by_full: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
+    for &p in members {
+        if let Some(f) = phys[p].full {
+            by_full.entry(f).or_default().push(p);
+        }
+    }
+    // Offline, never hashed whole: probably a copy of a same-size file
+    // whose ends match (or whose ends were never read).
+    let unhashed: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|&p| phys[p].full.is_none() && !phys[p].available)
+        .collect();
+    let mut sample_of_groups: HashSet<[u8; 32]> = HashSet::new();
+    for (full, confirmed) in by_full {
+        let sample = confirmed.iter().find_map(|&p| phys[p].sample);
+        let probable: Vec<usize> = unhashed
+            .iter()
+            .copied()
+            .filter(|&p| phys[p].sample.is_none() || phys[p].sample == sample)
+            .collect();
+        if confirmed.len() >= 2 || !probable.is_empty() {
+            sample_of_groups.extend(sample);
+            out.push(Draft {
+                size: phys[confirmed[0]].size,
+                full: Some(full),
+                sample,
+                confirmed,
+                probable,
+            });
+        }
+    }
+    let mut by_sample: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
+    for &p in &unhashed {
+        if let Some(s) = phys[p].sample {
+            if !sample_of_groups.contains(&s) {
+                by_sample.entry(s).or_default().push(p);
+            }
+        }
+    }
+    for (sample, probable) in by_sample {
+        if probable.len() >= 2 {
+            out.push(Draft {
+                size: phys[probable[0]].size,
+                full: None,
+                sample: Some(sample),
+                confirmed: Vec::new(),
+                probable,
+            });
+        }
+    }
+    out
+}
+
+fn role_rank(r: Role) -> u8 {
+    match r {
+        Role::Master => 0,
+        Role::Normal => 1,
+        Role::Scratch => 2,
+    }
+}
+
+fn render(locs: &[Loc], rows: &[Row], phys: &[Phys], g: &Draft) -> IndexGroup {
+    let names = |p: usize| -> Vec<PathBuf> {
+        phys[p]
+            .rows
+            .iter()
+            .map(|&r| abs(&locs[rows[r].loc].root, &rows[r].path))
+            .collect()
+    };
+    let loc_of = |p: usize| &locs[rows[phys[p].rows[0]].loc];
+    // Reachable confirmed copies, best keeper first.
+    let mut reachable: Vec<usize> = g
+        .confirmed
+        .iter()
+        .copied()
+        .filter(|&p| phys[p].available)
+        .collect();
+    reachable.sort_by_key(|&p| (role_rank(loc_of(p).role), names(p)[0].clone()));
+    let mut away: Vec<usize> = g
+        .confirmed
+        .iter()
+        .copied()
+        .filter(|&p| !phys[p].available)
+        .collect();
+    away.sort_by_key(|&p| names(p)[0].clone());
+    let mut probable = g.probable.clone();
+    probable.sort_by_key(|&p| names(p)[0].clone());
+
+    let copy = |p: usize, probable: bool, suggest: Option<Suggest>| {
+        let mut n = names(p);
+        let path = n.remove(0);
+        GroupCopy {
+            location_uuid: loc_of(p).uuid.clone(),
+            path,
+            available: phys[p].available,
+            probable,
+            shared_inodes: n,
+            suggest,
+        }
+    };
+    let mut copies = Vec::new();
+    for (i, &p) in reachable.iter().enumerate() {
+        let s = if i == 0 {
+            Suggest::Keep
+        } else {
+            Suggest::Reclaimable
+        };
+        copies.push(copy(p, false, Some(s)));
+    }
+    copies.extend(away.iter().map(|&p| copy(p, false, None)));
+    copies.extend(probable.iter().map(|&p| copy(p, true, None)));
+
+    let unique = g.confirmed.len() as u64;
+    let available = reachable.len() as u64;
+    let hex = |h: [u8; 32]| blake3::Hash::from(h).to_hex().to_string();
+    IndexGroup {
+        hash: g.full.map(hex),
+        sample: g.sample.map(hex),
+        size: g.size,
+        copies,
+        unique_copies: unique,
+        available_copies: available,
+        probable_copies: g.probable.len() as u64,
+        reclaimable_bytes: g.size.saturating_mul(unique.saturating_sub(1)),
+        actionable_bytes: g.size.saturating_mul(available.saturating_sub(1)),
+        savings_may_be_shared: g.confirmed.iter().any(|&p| loc_of(p).cow),
+    }
+}
+
+/// Per location, the physical files no other file can be a copy of: a
+/// size no other indexed file has, or colliding but in no group.
+#[allow(clippy::too_many_arguments)]
+fn singles(
+    idx: &Index,
+    min: u64,
+    with_paths: bool,
+    locs: &[Loc],
+    rows: &[Row],
+    phys: &[Phys],
+    grouped: &HashSet<usize>,
+    at: &HashMap<i64, usize>,
+) -> io::Result<Vec<LocationSingles>> {
+    let mut out: Vec<LocationSingles> = locs
+        .iter()
+        .map(|l| LocationSingles {
+            location_uuid: l.uuid.clone(),
+            root: l.root.clone(),
+            available: l.available,
+            files: 0,
+            bytes: 0,
+            paths: with_paths.then(Vec::new),
+        })
+        .collect();
+    let mut add = |loc: usize, size: u64, path: PathBuf| {
+        let s = &mut out[loc];
+        s.files += 1;
+        s.bytes += size;
+        if let Some(p) = s.paths.as_mut() {
+            p.push(path);
+        }
+    };
+    for (i, p) in phys.iter().enumerate() {
+        if p.excluded || grouped.contains(&i) {
+            continue;
+        }
+        let r = &rows[p.rows[0]];
+        add(r.loc, p.size, abs(&locs[r.loc].root, &r.path));
+    }
+    let mut st = idx
+        .conn
+        .prepare(
+            "SELECT location_id, path, size FROM files WHERE size >= ?1 AND size IN \
+               (SELECT size FROM files WHERE size >= ?1 GROUP BY size HAVING COUNT(*) = 1) \
+             ORDER BY location_id, path",
+        )
+        .map_err(db_err)?;
+    let unique = st
+        .query_map([to_sql(min)], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(db_err)?;
+    for row in unique {
+        let (loc, path, size) = row.map_err(db_err)?;
+        if let Some(&l) = at.get(&loc) {
+            add(l, size as u64, abs(&locs[l].root, &path));
+        }
+    }
+    for s in &mut out {
+        if let Some(p) = s.paths.as_mut() {
+            p.sort();
+        }
+    }
+    Ok(out)
 }
 
 /// One file to hash whole.
@@ -182,8 +927,30 @@ pub(crate) struct HashBatch {
 /// files written together sit together, so path order is the cheap stand-in
 /// for physical order (no FIEMAP).
 pub(crate) fn hash_plan(items: Vec<HashItem>) -> Vec<HashBatch> {
-    let _ = items;
-    unimplemented!("M2 hash plan")
+    let mut fast = Vec::new();
+    let mut spinning: BTreeMap<usize, Vec<HashItem>> = BTreeMap::new();
+    for it in items {
+        if it.rotational {
+            spinning.entry(it.location).or_default().push(it);
+        } else {
+            fast.push(it);
+        }
+    }
+    let mut out = Vec::new();
+    if !fast.is_empty() {
+        out.push(HashBatch {
+            threads: None,
+            items: fast,
+        });
+    }
+    for (_, mut items) in spinning {
+        items.sort_by(|a, b| a.path.cmp(&b.path));
+        out.push(HashBatch {
+            threads: Some(ROTATIONAL_HASH_THREADS),
+            items,
+        });
+    }
+    out
 }
 
 /// The path of a row: location root joined with the stored relative path.
@@ -199,7 +966,6 @@ fn abs(root: &Path, rel: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::index::{scan_with, Volume};
-    use crate::rotational::ROTATIONAL_HASH_THREADS;
     use crate::Options;
     use std::collections::BTreeSet;
     use std::sync::Mutex;
@@ -372,7 +1138,7 @@ mod tests {
         }
     }
 
-    fn group_of<'a>(r: &'a IndexDupesReport, size: u64) -> Vec<&'a IndexGroup> {
+    fn group_of(r: &IndexDupesReport, size: u64) -> Vec<&IndexGroup> {
         r.groups.iter().filter(|g| g.size == size).collect()
     }
 

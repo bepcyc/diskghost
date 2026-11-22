@@ -23,15 +23,73 @@ pub(crate) const ROTATIONAL_HASH_THREADS: usize = 2;
 /// Whether block device `name` (a `/sys/class/block` entry) spins, read from
 /// the sysfs tree rooted at `sys`. `None` when unknown.
 pub(crate) fn device_rotational(sys: &Path, name: &str) -> Option<bool> {
-    let _ = (sys, name);
-    unimplemented!("M2 rotational")
+    rotational_at(sys, name, 0)
+}
+
+/// Stacks deeper than this (LVM on LUKS on md on …) are not followed.
+const MAX_STACK: u32 = 8;
+
+fn rotational_at(sys: &Path, name: &str, depth: u32) -> Option<bool> {
+    if depth > MAX_STACK || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let class = sys.join("class/block").join(name);
+    // The class entry links to the device directory; a partition's sits
+    // inside its disk's, and only the disk has the queue.
+    let dev = std::fs::canonicalize(&class).ok()?;
+    let dev = if dev.join("partition").is_file() {
+        dev.parent()?.to_path_buf()
+    } else {
+        dev
+    };
+    // A stacked device (dm, md) spins when any disk below it does.
+    if let Ok(slaves) = std::fs::read_dir(dev.join("slaves")) {
+        let below: Vec<Option<bool>> = slaves
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .map(|s| rotational_at(sys, &s, depth + 1))
+            .collect();
+        if !below.is_empty() {
+            return if below.contains(&Some(true)) {
+                Some(true)
+            } else if below.iter().all(Option::is_some) {
+                Some(false)
+            } else {
+                None
+            };
+        }
+    }
+    match std::fs::read_to_string(dev.join("queue/rotational"))
+        .ok()?
+        .trim()
+    {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Kernel name of the block device behind a mount: the device node the
 /// `source` resolves to, else `major:minor` looked up in `sys/dev/block`.
 pub(crate) fn device_name(sys: &Path, source: &str, major: u64, minor: u64) -> Option<String> {
-    let _ = (sys, source, major, minor);
-    unimplemented!("M2 rotational")
+    let name_of = |p: &Path| {
+        std::fs::canonicalize(p)
+            .ok()?
+            .file_name()?
+            .to_str()
+            .map(String::from)
+    };
+    if source.starts_with("/dev/") {
+        if let Some(n) = name_of(Path::new(source)) {
+            return Some(n);
+        }
+    }
+    // Anonymous devices (major 0: tmpfs, btrfs subvolumes, FUSE…) are no
+    // block device at all.
+    if major == 0 {
+        return None;
+    }
+    name_of(&sys.join("dev/block").join(format!("{major}:{minor}")))
 }
 
 /// Whether `path` lives on a rotational (spinning) disk. `false` when that
@@ -44,14 +102,13 @@ pub fn is_rotational(path: &Path) -> bool {
 /// spinning disk): the mount of `path` is resolved for real, its device
 /// name handed to `lookup`.
 pub(crate) fn is_rotational_with(path: &Path, lookup: &dyn Fn(&str) -> Option<bool>) -> bool {
-    let _ = (path, lookup);
-    unimplemented!("M2 rotational")
+    mount_device(path).is_some_and(|name| lookup(&name) == Some(true))
 }
 
 /// Kernel name of the block device holding `path`, when it is one.
 pub(crate) fn mount_device(path: &Path) -> Option<String> {
-    let _ = path;
-    unimplemented!("M2 rotational")
+    let m = crate::index::mount_of(path)?;
+    device_name(Path::new("/sys"), &m.source, m.major, m.minor)
 }
 
 #[cfg(all(test, unix))]
@@ -182,5 +239,22 @@ mod tests {
         // The real lookup answers without panicking wherever this runs.
         let _ = is_rotational(&d);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// On a real machine: `DISKGHOST_ROTATIONAL_CHECK="/path=1,/other=0"`
+    /// (read-only: one `stat` and sysfs reads per path).
+    #[test]
+    #[ignore = "needs real disks; run with DISKGHOST_ROTATIONAL_CHECK"]
+    fn real_disks_when_asked() {
+        let spec = std::env::var("DISKGHOST_ROTATIONAL_CHECK").unwrap_or_default();
+        for pair in spec.split(',').filter(|p| !p.is_empty()) {
+            let (path, want) = pair.rsplit_once('=').unwrap();
+            let got = is_rotational(Path::new(path));
+            eprintln!(
+                "{path}: device {:?}, rotational {got}",
+                mount_device(Path::new(path))
+            );
+            assert_eq!(got, want == "1", "{path}");
+        }
     }
 }
