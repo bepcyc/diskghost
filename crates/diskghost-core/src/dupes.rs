@@ -432,14 +432,9 @@ pub(crate) fn sample_file(path: &Path, size: u64) -> Option<Sampled> {
     })
 }
 
-/// BLAKE3 of the whole file: memory-mapped (several threads for big files),
-/// streamed where mapping is not possible.
-pub(crate) fn full_hash(path: &Path, size: u64) -> Option<[u8; 32]> {
-    full_hash_with(path, size, true)
-}
-
-/// [`full_hash`], with several threads per big file only when `parallel`
-/// (a spinning disk reads one file front to back, not at scattered offsets).
+/// BLAKE3 of the whole file: memory-mapped (several threads for big files
+/// only when `parallel`, a spinning disk reads one file front to back, not
+/// at scattered offsets), streamed where mapping is not possible.
 /// A big file's pages are then dropped from the page cache: a multi-terabyte
 /// search must not evict the owner's working set.
 pub(crate) fn full_hash_with(path: &Path, size: u64, parallel: bool) -> Option<[u8; 32]> {
@@ -458,6 +453,20 @@ pub(crate) fn full_hash_with(path: &Path, size: u64, parallel: bool) -> Option<[
         drop_from_page_cache(path, size);
     }
     Some(*h.finalize().as_bytes())
+}
+
+/// Reader threads for the whole-file phase: a spinning disk gets a small
+/// pool of [`crate::rotational::ROTATIONAL_HASH_THREADS`], anything else
+/// the shared rayon pool (`None`) — same rule the index batches follow.
+fn full_hash_workers(rotational: bool) -> Option<usize> {
+    rotational.then_some(crate::rotational::ROTATIONAL_HASH_THREADS)
+}
+
+/// Sort the pending whole-file reads in path order — the cheap stand-in
+/// for physical order on a spinning disk (files written together sit
+/// together; no FIEMAP), the same rule the index batches use.
+fn order_for_seeks(need: &mut [usize], cands: &[Cand]) {
+    need.sort_by(|&a, &b| cands[a].path.cmp(&cands[b].path));
 }
 
 /// Best effort `posix_fadvise(POSIX_FADV_DONTNEED)` over a file just read
@@ -632,35 +641,54 @@ fn find_inner(
         .flatten()
         .collect();
 
-    // 3. Whole-file hashes for whatever still looks alike, in parallel.
-    let need: Vec<usize> = alike
+    // 3. Whole-file hashes for whatever still looks alike. A spinning
+    // disk is read in path order by a small pool — parallel reads on one
+    // head are a seek storm; anything else takes the parallel storm.
+    let rotational = crate::rotational::is_rotational(root);
+    let mut need: Vec<usize> = alike
         .iter()
         .copied()
         .filter(|&i| cands[i].known.is_some_and(|k| k.full.is_none()))
         .collect();
+    if rotational {
+        order_for_seeks(&mut need, &cands);
+    }
     let need_bytes = need.iter().map(|&i| cands[i].size).sum();
     progress.enter(phase::HASH, need.len() as u64, need_bytes);
     entered(phase::HASH);
+    let pool = full_hash_workers(rotational).and_then(|n| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("diskghost-hash-{i}"))
+            .build()
+            .ok()
+    });
     let fulls: Vec<(usize, Option<[u8; 32]>)> = with_merger(cache, merge_every, |learned| {
-        need.par_iter()
-            .map_with(learned, |learned, &i| {
-                if progress.cancelled() {
-                    return (i, None);
-                }
-                let c = &cands[i];
-                let h = full_hash(&c.path, c.size);
-                if let (Some(full), Some(k)) = (h, c.known) {
-                    let k = Known {
-                        full: Some(full),
-                        ..k
-                    };
-                    let _ = learned.send((c.path.clone(), k));
-                }
-                progress.files.fetch_add(1, Ordering::Relaxed);
-                progress.bytes.fetch_add(c.size, Ordering::Relaxed);
-                (i, h)
-            })
-            .collect()
+        let run = || {
+            need.par_iter()
+                .map_with(learned, |learned, &i| {
+                    if progress.cancelled() {
+                        return (i, None);
+                    }
+                    let c = &cands[i];
+                    let h = full_hash_with(&c.path, c.size, !rotational);
+                    if let (Some(full), Some(k)) = (h, c.known) {
+                        let k = Known {
+                            full: Some(full),
+                            ..k
+                        };
+                        let _ = learned.send((c.path.clone(), k));
+                    }
+                    progress.files.fetch_add(1, Ordering::Relaxed);
+                    progress.bytes.fetch_add(c.size, Ordering::Relaxed);
+                    (i, h)
+                })
+                .collect()
+        };
+        match &pool {
+            Some(p) => p.install(run),
+            None => run(),
+        }
     });
     for (i, h) in fulls {
         if let Some(k) = cands[i].known.as_mut() {

@@ -48,6 +48,19 @@ pub(crate) fn default_threads() -> usize {
     (cores * 2).clamp(4, 64)
 }
 
+/// Reader threads for a walk: the caller's explicit choice always wins;
+/// otherwise a spinning disk gets
+/// [`crate::rotational::ROTATIONAL_SCAN_THREADS`] — many parallel
+/// directory reads on one head are a seek storm — and anything else the
+/// machine default.
+fn pick_threads(requested: Option<usize>, rotational: bool) -> usize {
+    match requested {
+        Some(t) => t.max(1),
+        None if rotational => crate::rotational::ROTATIONAL_SCAN_THREADS,
+        None => default_threads(),
+    }
+}
+
 struct Ctx<'a> {
     root: &'a Path,
     glob: globset::GlobSet,
@@ -147,7 +160,7 @@ fn walk_with_remote(
     if let Some(dev) = root_dev {
         remote.remove(&dev);
     }
-    let threads = opts.threads.unwrap_or_else(default_threads).max(1);
+    let threads = pick_threads(opts.threads, crate::rotational::is_rotational(root));
     let (tx, rx) = mpsc::channel();
     let ctx = Ctx {
         root,

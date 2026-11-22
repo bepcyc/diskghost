@@ -20,6 +20,11 @@ use std::path::Path;
 /// one request is in flight, without turning the read into a seek storm.
 pub(crate) const ROTATIONAL_HASH_THREADS: usize = 2;
 
+/// Directory readers at once on one rotational volume: the same reasoning
+/// as [`ROTATIONAL_HASH_THREADS`] — many parallel `readdir`/`stat` streams
+/// on one head are a seek storm.
+pub(crate) const ROTATIONAL_SCAN_THREADS: usize = 2;
+
 /// Whether block device `name` (a `/sys/class/block` entry) spins, read from
 /// the sysfs tree rooted at `sys`. `None` when unknown.
 pub(crate) fn device_rotational(sys: &Path, name: &str) -> Option<bool> {
