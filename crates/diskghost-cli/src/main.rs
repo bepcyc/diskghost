@@ -11,6 +11,10 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
+    apply as apply_plan, journal_path, make_plan, undo as undo_journal, ApplyOptions, Plan, Policy,
+    RunReport, Status,
+};
+use diskghost_core::{
     diff, find_duplicates_cached, format_timestamp, human_delta, human_size, index_dupes,
     index_scan, phase, reclaim, remove_path, validate_globs, validate_host, DiffReport, DupGroup,
     HashCache, Index, IndexDupesReport, IndexReportOptions, LocationStatus, Options, Progress,
@@ -177,6 +181,49 @@ enum Command {
         db: Option<PathBuf>,
         #[command(subcommand)]
         action: IndexAction,
+    },
+    /// Plan which duplicate copies to quarantine under a copy policy
+    /// (min copies, distinct devices, master/scratch locations) — written to
+    /// a JSON file to read, edit, then `apply`. Touches no file.
+    Plan {
+        /// Plan from the persistent index (the only mode).
+        #[arg(long, required = true)]
+        index: bool,
+        /// Index database (default: as `diskghost index`).
+        #[arg(long, value_name = "FILE")]
+        db: Option<PathBuf>,
+        /// Copy policy (TOML). Without it: min_copies = 2 on distinct
+        /// physical devices, roles as stored in the index.
+        #[arg(long, value_name = "FILE")]
+        policy: Option<PathBuf>,
+        /// Where to write the plan.
+        #[arg(short = 'o', long = "output", value_name = "FILE", required = true)]
+        output: PathBuf,
+    },
+    /// Carry out a plan: re-check every file (size, time, inode, full hash)
+    /// and move it into `.diskghost-quarantine/` at its volume's root — a
+    /// same-volume rename, never a delete. Journaled to
+    /// `<plan>.journal.jsonl`; a re-run resumes, `undo` reverses.
+    Apply {
+        /// The plan file.
+        plan: PathBuf,
+        /// Index database (default: as `diskghost index`).
+        #[arg(long, value_name = "FILE")]
+        db: Option<PathBuf>,
+        /// Check and report only: no move, no folder, no journal.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also compare each file byte by byte with a kept copy first.
+        #[arg(long)]
+        paranoid: bool,
+    },
+    /// Reverse an apply: move every quarantined file of a journal back.
+    Undo {
+        /// The journal (`<plan>.journal.jsonl`).
+        journal: PathBuf,
+        /// Report only; move nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Delete a file or folder — permanently, or to the OS trash. Dry-run by default.
     Rm {
@@ -488,6 +535,25 @@ fn main() -> ExitCode {
             }
         }
         Command::Index { db, action } => return run_index(cli.json, db, action),
+        Command::Plan {
+            index: _,
+            db,
+            policy,
+            output,
+        } => return run_plan(cli.json, db, policy.as_deref(), &output),
+        Command::Apply {
+            plan,
+            db,
+            dry_run,
+            paranoid,
+        } => return run_apply(cli.json, db, &plan, ApplyOptions { dry_run, paranoid }),
+        Command::Undo { journal, dry_run } => match undo_journal(&journal, dry_run) {
+            Ok(r) => return finish_run(cli.json, &r, "undo"),
+            Err(e) => {
+                eprintln!("error: {}: {e}", journal.display());
+                return ExitCode::FAILURE;
+            }
+        },
         Command::Rm { path, trash, apply } => {
             if !path.exists() {
                 eprintln!("error: no such path: {}", path.display());
@@ -525,6 +591,193 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Open the index at `--db` or the default place.
+fn open_index(db: Option<PathBuf>) -> Result<Index, ExitCode> {
+    let Some(db) = db.or_else(default_index_db) else {
+        eprintln!("error: no --db given and no data directory ($XDG_DATA_HOME / $HOME) known");
+        return Err(ExitCode::FAILURE);
+    };
+    Index::open(&db).map_err(|e| {
+        eprintln!("error: cannot open index {}: {e}", db.display());
+        ExitCode::FAILURE
+    })
+}
+
+/// `plan --index`: write the plan file, print its summary.
+fn run_plan(json: bool, db: Option<PathBuf>, policy: Option<&Path>, output: &Path) -> ExitCode {
+    let policy = match policy.map(Policy::load) {
+        None => Policy::default(),
+        Some(Ok(p)) => p,
+        Some(Err(e)) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // A journal beside the output belongs to an earlier plan of that name:
+    // a new plan there would mix its records with this one's.
+    let journal = journal_path(output);
+    if journal.exists() {
+        eprintln!(
+            "error: {} exists (an earlier apply of a plan at this path); write the \
+             new plan elsewhere or move that journal away first",
+            journal.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let idx = match open_index(db) {
+        Ok(i) => i,
+        Err(code) => return code,
+    };
+    let plan = match with_progress(|p| make_plan(&idx, &policy, p)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = serde_json::to_string_pretty(&plan).unwrap();
+    if let Err(e) = std::fs::write(output, text + "\n") {
+        eprintln!("error: cannot write {}: {e}", output.display());
+        return ExitCode::FAILURE;
+    }
+    if json {
+        let out = serde_json::json!({
+            "plan": output,
+            "summary": plan.summary,
+            "warnings": plan.warnings,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else {
+        print_plan(&plan, output);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_plan(p: &Plan, output: &Path) {
+    for w in &p.warnings {
+        eprintln!("warning: {w}");
+    }
+    let s = &p.summary;
+    println!(
+        "plan written to {} (min_copies {}, distinct {})",
+        output.display(),
+        p.policy.min_copies,
+        serde_json::to_value(p.policy.distinct)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    );
+    println!(
+        "  {} group(s), {} file(s) to quarantine ({}), {} group(s) under-protected",
+        s.groups,
+        s.actions,
+        human_size(s.quarantine_bytes),
+        s.under_protected_groups
+    );
+    for g in p.groups.iter().take(20) {
+        let tag = if g.under_protected {
+            "  under-protected: every copy stays"
+        } else {
+            ""
+        };
+        println!(
+            "\n  {}  {} × {}{}",
+            &g.hash[..16],
+            g.unique_copies,
+            human_size(g.size),
+            tag
+        );
+        for k in &g.kept {
+            let why = serde_json::to_value(k.why)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            println!("    keep        {}  ({why})", k.path.display());
+        }
+        for a in &g.actions {
+            println!("    quarantine  {}", a.path.display());
+        }
+    }
+    if p.groups.len() > 20 {
+        println!(
+            "\n  … {} more group(s) in the plan file",
+            p.groups.len() - 20
+        );
+    }
+    if s.actions > 0 {
+        println!(
+            "\nreview it, then: diskghost apply {} [--dry-run] [--paranoid]",
+            output.display()
+        );
+    }
+}
+
+/// `apply PLAN`.
+fn run_apply(json: bool, db: Option<PathBuf>, plan: &Path, opts: ApplyOptions) -> ExitCode {
+    let idx = match open_index(db) {
+        Ok(i) => i,
+        Err(code) => return code,
+    };
+    match apply_plan(plan, &idx, &opts) {
+        Ok(r) => finish_run(json, &r, "apply"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print an apply/undo report; failure when anything was refused or failed.
+fn finish_run(json: bool, r: &RunReport, what: &str) -> ExitCode {
+    if json {
+        println!("{}", serde_json::to_string_pretty(r).unwrap());
+    } else {
+        for o in &r.outcomes {
+            let st = serde_json::to_value(o.status)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.replace('_', " ")))
+                .unwrap_or_default();
+            let to =
+                o.to.as_ref()
+                    .map(|t| format!(" -> {}", t.display()))
+                    .unwrap_or_default();
+            let detail = o
+                .detail
+                .as_ref()
+                .map(|d| format!("  ({d})"))
+                .unwrap_or_default();
+            println!("{st:<20} {}{to}{detail}", o.from.display());
+        }
+        let n = |s: Status| r.count(s);
+        if r.dry_run {
+            println!(
+                "{what} dry run: {} would move, nothing touched",
+                n(Status::WouldQuarantine) + n(Status::WouldRestore)
+            );
+        } else {
+            println!(
+                "{what}: {} moved, {} restored, {} skipped, {} left alone (changed or \
+                 unverifiable), {} failed — journal {}",
+                n(Status::Done),
+                n(Status::Undone),
+                n(Status::Skipped),
+                n(Status::Stale)
+                    + n(Status::HashMismatch)
+                    + n(Status::ParanoidMismatch)
+                    + n(Status::ParanoidNoReference)
+                    + n(Status::Offline),
+                n(Status::Error) + n(Status::Conflict),
+                r.journal.display()
+            );
+        }
+    }
+    if r.has_errors() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// `dupes --index`: the report from the persistent index.

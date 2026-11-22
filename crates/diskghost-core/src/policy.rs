@@ -68,10 +68,130 @@ impl Default for Policy {
     }
 }
 
+/// The file as written, before validation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFile {
+    #[serde(default)]
+    policy: Option<RawPolicy>,
+    #[serde(default)]
+    location: Vec<RawLocation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicy {
+    min_copies: Option<i64>,
+    distinct: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLocation {
+    #[serde(rename = "match")]
+    matches: String,
+    role: String,
+}
+
+/// How a `match` string names locations.
+enum Matcher<'a> {
+    /// Only an exact location key (checked before any matcher).
+    Uuid,
+    /// Locations on `host` whose root lies under `path`.
+    Under { host: &'a str, path: &'a Path },
+}
+
+/// `local` and `localhost` both name this machine.
+fn same_host(a: &str, b: &str) -> bool {
+    fn norm(h: &str) -> &str {
+        if h == "localhost" {
+            "local"
+        } else {
+            h
+        }
+    }
+    norm(a) == norm(b)
+}
+
+fn matcher(m: &str) -> Matcher<'_> {
+    if m.starts_with('/') {
+        return Matcher::Under {
+            host: "local",
+            path: Path::new(m),
+        };
+    }
+    match m.split_once(':') {
+        // `host:/path`; anything else with a colon (`UUID:/sub` has a
+        // UUID, not a host name, before it — but is matched as a uuid
+        // first anyway, see `score`).
+        Some((host, path)) if !host.is_empty() && path.starts_with('/') => Matcher::Under {
+            host,
+            path: Path::new(path),
+        },
+        _ => Matcher::Uuid,
+    }
+}
+
 impl Policy {
     /// Parse a policy file's text. Errors name the offending field.
-    pub fn parse(_text: &str) -> Result<Policy, String> {
-        Err("policy parsing not implemented".into())
+    pub fn parse(text: &str) -> Result<Policy, String> {
+        let raw: RawFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut p = Policy::default();
+        if let Some(sec) = raw.policy {
+            if let Some(n) = sec.min_copies {
+                if n < 1 {
+                    return Err(format!(
+                        "policy.min_copies must be at least 1 (got {n}); a plan \
+                         never removes the last copy"
+                    ));
+                }
+                p.min_copies = n as u64;
+            }
+            if let Some(d) = sec.distinct {
+                p.distinct = match d.as_str() {
+                    "physical_device" => Distinct::PhysicalDevice,
+                    "none" => Distinct::None,
+                    other => {
+                        return Err(format!(
+                            "policy.distinct: unknown value {other:?} \
+                             (expected \"physical_device\" or \"none\")"
+                        ))
+                    }
+                };
+            }
+        }
+        for (i, l) in raw.location.into_iter().enumerate() {
+            let n = i + 1;
+            if l.matches.trim().is_empty() {
+                return Err(format!("location #{n}: match is empty"));
+            }
+            if l.matches.contains(':') || l.matches.starts_with('/') {
+                // a uuid with a colon, or a path: fine
+            } else if l.matches.contains('/') {
+                return Err(format!(
+                    "location #{n}: match {:?} is a relative path; use an absolute \
+                     path, host:/path, or a volume uuid",
+                    l.matches
+                ));
+            }
+            let role = match l.role.as_str() {
+                "master" => Role::Master,
+                "normal" => Role::Normal,
+                "scratch" => Role::Scratch,
+                other => {
+                    return Err(format!(
+                        "location #{n} ({}): unknown role {other:?} \
+                         (expected master, normal or scratch)",
+                        l.matches
+                    ))
+                }
+            };
+            p.locations.push(LocationRule {
+                matches: l.matches,
+                role,
+            });
+        }
+        Ok(p)
     }
 
     /// Read and parse a policy file.
@@ -82,14 +202,50 @@ impl Policy {
     }
 
     /// The role of a location: policy entry > `stored` (the index's role).
-    pub fn role_for(&self, _uuid: &str, _host: &str, _root: &Path, stored: Role) -> Role {
-        stored
+    pub fn role_for(&self, uuid: &str, host: &str, root: &Path, stored: Role) -> Role {
+        let mut best: Option<(usize, Role)> = None;
+        for r in &self.locations {
+            if let Some(s) = score(&r.matches, uuid, host, root) {
+                if best.map_or(true, |(b, _)| s > b) {
+                    best = Some((s, r.role));
+                }
+            }
+        }
+        best.map_or(stored, |(_, role)| role)
     }
 
     /// Entries that match none of `locations` (uuid, host, root) — a
     /// `master` entry that silently matches nothing protects nothing.
-    pub fn unmatched(&self, _locations: &[(&str, &str, &Path)]) -> Vec<String> {
-        Vec::new()
+    pub fn unmatched(&self, locations: &[(&str, &str, &Path)]) -> Vec<String> {
+        self.locations
+            .iter()
+            .filter(|r| {
+                !locations
+                    .iter()
+                    .any(|(u, h, root)| score(&r.matches, u, h, root).is_some())
+            })
+            .map(|r| {
+                format!(
+                    "policy entry match = {:?} (role {}) matches no indexed location",
+                    r.matches,
+                    r.role.as_str()
+                )
+            })
+            .collect()
+    }
+}
+
+/// How well `m` names the location: `None` no match; an exact uuid beats
+/// every path; a longer path (more components) beats a shorter one.
+fn score(m: &str, uuid: &str, host: &str, root: &Path) -> Option<usize> {
+    if m == uuid {
+        return Some(usize::MAX);
+    }
+    match matcher(m) {
+        Matcher::Uuid => None,
+        Matcher::Under { host: h, path } => {
+            (same_host(h, host) && root.starts_with(path)).then(|| path.components().count())
+        }
     }
 }
 

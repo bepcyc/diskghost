@@ -21,13 +21,15 @@
 //! - copies only *probably* alike (offline, never hashed whole) are neither
 //!   kept nor acted on: they do not count.
 
+use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::index::{Index, Probe, Role};
-use crate::policy::Policy;
+use crate::index_report::{abs, compute_groups, filesystem_of, role_rank, Draft, Groups};
+use crate::policy::{Distinct, Policy};
 use crate::Progress;
 
 /// Plan file format version `apply` understands.
@@ -170,20 +172,251 @@ pub fn make_plan(idx: &Index, policy: &Policy, progress: &Progress) -> io::Resul
 
 /// [`make_plan`] asking `probe` instead of the machine.
 pub(crate) fn plan_with(
-    _idx: &Index,
-    _policy: &Policy,
-    _progress: &Progress,
-    _probe: &Probe,
+    idx: &Index,
+    policy: &Policy,
+    progress: &Progress,
+    probe: &Probe,
 ) -> io::Result<Plan> {
-    Err(io::Error::other("plan not implemented"))
+    let c = compute_groups(idx, 1, progress, probe)?;
+    let roles: Vec<Role> = c
+        .locs
+        .iter()
+        .map(|l| policy.role_for(&l.uuid, &l.host, &l.root, l.role))
+        .collect();
+    let mut warnings = c.warnings.clone();
+    let named: Vec<(&str, &str, &Path)> = c
+        .locs
+        .iter()
+        .map(|l| (l.uuid.as_str(), l.host.as_str(), l.root.as_path()))
+        .collect();
+    warnings.extend(policy.unmatched(&named));
+
+    let mut groups: Vec<PlanGroup> = c
+        .drafts
+        .iter()
+        .filter_map(|d| plan_group(&c, &roles, policy, d))
+        .collect();
+    let freed = |g: &PlanGroup| g.size.saturating_mul(g.actions.len() as u64);
+    groups.sort_by(|a, b| freed(b).cmp(&freed(a)).then_with(|| a.hash.cmp(&b.hash)));
+
+    let summary = PlanSummary {
+        groups: groups.len() as u64,
+        actions: groups.iter().map(|g| g.actions.len() as u64).sum(),
+        quarantine_bytes: groups.iter().map(freed).sum(),
+        under_protected_groups: groups.iter().filter(|g| g.under_protected).count() as u64,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Ok(Plan {
+        version: PLAN_VERSION,
+        created: crate::format_timestamp(now),
+        created_unix: now,
+        policy: policy.clone(),
+        locations: c
+            .locs
+            .iter()
+            .zip(&roles)
+            .map(|(l, &role)| PlanLocation {
+                uuid: l.uuid.clone(),
+                host: l.host.clone(),
+                root: l.root.clone(),
+                stored_role: l.role,
+                role,
+                available: l.available,
+            })
+            .collect(),
+        summary,
+        groups,
+        warnings,
+    })
+}
+
+fn is_local(host: &str) -> bool {
+    matches!(host, "local" | "localhost")
+}
+
+/// One confirmed physical copy as the plan weighs it.
+struct Cand {
+    p: usize,
+    /// Best role among the locations of its names.
+    role: Role,
+    /// Its filesystem: the unit of `distinct = "physical_device"`.
+    device: String,
+    available: bool,
+    /// Why it may not be moved, if so.
+    pinned: Option<KeepReason>,
+    path: PathBuf,
+}
+
+fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<PlanGroup> {
+    let full = d.full?;
+    if d.confirmed.len() < 2 {
+        return None; // nothing to choose between
+    }
+    let hash = blake3::Hash::from(full).to_hex().to_string();
+    let row_loc = |r: usize| c.rows[r].loc;
+    let cands: Vec<Cand> = d
+        .confirmed
+        .iter()
+        .map(|&p| {
+            let ph = &c.phys[p];
+            let rep = &c.rows[ph.rows[0]];
+            let role = ph
+                .rows
+                .iter()
+                .map(|&r| roles[row_loc(r)])
+                .min_by_key(|&r| role_rank(r))
+                .unwrap_or(Role::Normal);
+            let out_of_reach = ph.rows.iter().any(|&r| {
+                let l = &c.locs[row_loc(r)];
+                !l.available || !is_local(&l.host) || roles[row_loc(r)] == Role::Master
+            });
+            let pinned = if role == Role::Master {
+                Some(KeepReason::Master)
+            } else if !ph.available {
+                Some(KeepReason::Offline)
+            } else if out_of_reach {
+                Some(KeepReason::NamesOutOfReach)
+            } else {
+                None
+            };
+            Cand {
+                p,
+                role,
+                device: filesystem_of(&c.locs[rep.loc].uuid).to_string(),
+                available: ph.available,
+                pinned,
+                path: abs(&c.locs[rep.loc].root, &rep.path),
+            }
+        })
+        .collect();
+
+    let unique = cands.len() as u64;
+    let target = policy.min_copies.min(unique);
+    let by_device = policy.distinct == Distinct::PhysicalDevice;
+    let devices = |kept: &[usize]| -> HashSet<&str> {
+        kept.iter().map(|&k| cands[k].device.as_str()).collect()
+    };
+    let met = |kept: &[usize]| {
+        let n = if by_device {
+            devices(kept).len()
+        } else {
+            kept.len()
+        };
+        n as u64 >= target
+    };
+    // Every master copy stays; then the best copies until the policy is met.
+    let mut kept: Vec<usize> = (0..cands.len())
+        .filter(|&i| cands[i].role == Role::Master)
+        .collect();
+    while !met(&kept) {
+        let used = devices(&kept);
+        let pick = (0..cands.len())
+            .filter(|i| !kept.contains(i))
+            .filter(|&i| !by_device || !used.contains(cands[i].device.as_str()))
+            .min_by_key(|&i| {
+                let k = &cands[i];
+                (role_rank(k.role), !k.available, k.path.clone())
+            });
+        match pick {
+            Some(i) => kept.push(i),
+            None => break, // no further device (or copy) exists
+        }
+    }
+    let under_protected = policy.min_copies > unique || !met(&kept);
+    let kept_devices = devices(&kept).len() as u64;
+
+    let names = |p: usize| -> Vec<PathBuf> {
+        c.phys[p]
+            .rows
+            .iter()
+            .map(|&r| abs(&c.locs[row_loc(r)].root, &c.rows[r].path))
+            .collect()
+    };
+    let expect_of = |r: usize| {
+        let row = &c.rows[r];
+        Expect {
+            size: row.size,
+            mtime_ns: row.mtime_ns,
+            dev: row.dev,
+            ino: row.ino,
+            full: hash.clone(),
+        }
+    };
+    let keep = |i: usize, why: KeepReason| {
+        let k = &cands[i];
+        let rep = c.phys[k.p].rows[0];
+        let mut n = names(k.p);
+        let path = n.remove(0);
+        KeptCopy {
+            location_uuid: c.locs[row_loc(rep)].uuid.clone(),
+            path,
+            shared_inodes: n,
+            role: k.role,
+            available: k.available,
+            why,
+            expect: c.locs[row_loc(rep)].available.then(|| expect_of(rep)),
+        }
+    };
+
+    let mut out_kept = Vec::new();
+    for &i in &kept {
+        let why = if cands[i].role == Role::Master {
+            KeepReason::Master
+        } else {
+            KeepReason::Policy
+        };
+        out_kept.push(keep(i, why));
+    }
+    let mut rest: Vec<usize> = (0..cands.len()).filter(|i| !kept.contains(i)).collect();
+    rest.sort_by(|&a, &b| cands[a].path.cmp(&cands[b].path));
+    let mut actions = Vec::new();
+    for i in rest {
+        let k = &cands[i];
+        if under_protected {
+            out_kept.push(keep(i, KeepReason::UnderProtected));
+        } else if let Some(why) = k.pinned {
+            out_kept.push(keep(i, why));
+        } else {
+            for &r in &c.phys[k.p].rows {
+                let l = row_loc(r);
+                actions.push(Action {
+                    id: String::new(),
+                    kind: ActionKind::Quarantine,
+                    location_uuid: c.locs[l].uuid.clone(),
+                    role: roles[l],
+                    path: abs(&c.locs[l].root, &c.rows[r].path),
+                    expect: expect_of(r),
+                });
+            }
+        }
+    }
+    // Scratch first, then normal; by path within a role.
+    actions.sort_by(|a, b| {
+        role_rank(b.role)
+            .cmp(&role_rank(a.role))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    for (n, a) in actions.iter_mut().enumerate() {
+        a.id = format!("{}-{}", &hash[..16], n + 1);
+    }
+    Some(PlanGroup {
+        hash,
+        size: d.size,
+        unique_copies: unique,
+        kept_devices,
+        under_protected,
+        kept: out_kept,
+        actions,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Distinct, LocationRule};
+    use crate::policy::LocationRule;
     use crate::testkit::*;
-    use std::path::Path;
 
     fn policy(min: u64, distinct: Distinct) -> Policy {
         Policy {

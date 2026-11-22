@@ -436,15 +436,22 @@ fn hash32(b: Option<Vec<u8>>) -> Option<[u8; 32]> {
     b.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
 }
 
+/// SQL condition: the row is not in a quarantine directory. Files `apply`
+/// moved there are no copies — counting them would let a later plan keep
+/// the quarantined copy and move the last real one.
+const NOT_QUARANTINED: &str = "path NOT LIKE '.diskghost-quarantine/%' \
+     AND path NOT LIKE '%/.diskghost-quarantine/%'";
+
 fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result<Vec<Row>> {
     let mut st = idx
         .conn
-        .prepare(
+        .prepare(&format!(
             "SELECT location_id, path, size, mtime_ns, dev, ino, sample, full FROM files \
-             WHERE size >= ?1 AND size IN \
-               (SELECT size FROM files WHERE size >= ?1 GROUP BY size HAVING COUNT(*) > 1) \
-             ORDER BY location_id, path",
-        )
+                 WHERE size >= ?1 AND {NOT_QUARANTINED} AND size IN \
+                   (SELECT size FROM files WHERE size >= ?1 AND {NOT_QUARANTINED} \
+                    GROUP BY size HAVING COUNT(*) > 1) \
+                 ORDER BY location_id, path"
+        ))
         .map_err(db_err)?;
     let rows = st
         .query_map([to_sql(min)], |r| {
@@ -922,11 +929,13 @@ fn singles(
     }
     let mut st = idx
         .conn
-        .prepare(
-            "SELECT location_id, path, size FROM files WHERE size >= ?1 AND size IN \
-               (SELECT size FROM files WHERE size >= ?1 GROUP BY size HAVING COUNT(*) = 1) \
-             ORDER BY location_id, path",
-        )
+        .prepare(&format!(
+            "SELECT location_id, path, size FROM files \
+                 WHERE size >= ?1 AND {NOT_QUARANTINED} AND size IN \
+                   (SELECT size FROM files WHERE size >= ?1 AND {NOT_QUARANTINED} \
+                    GROUP BY size HAVING COUNT(*) = 1) \
+                 ORDER BY location_id, path"
+        ))
         .map_err(db_err)?;
     let unique = st
         .query_map([to_sql(min)], |r| {
