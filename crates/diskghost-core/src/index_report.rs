@@ -10,8 +10,14 @@
 //! Copies are *physical*: names sharing one inode (hard links, a second
 //! mount of the same filesystem) are one copy, listed with its other names.
 //! Offline copies count but are never suggested for any action.
+//!
+//! Remote (ssh) locations are never read from here: their digests were made
+//! on the remote host by `index add`. A group keys on (size, algorithm,
+//! digest): a remote MD5 or SHA-1 digest only ever groups with digests of
+//! the same algorithm, and same-size files hashed with different algorithms
+//! are listed as `unverifiable` — never as copies of each other.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -22,6 +28,7 @@ use serde::Serialize;
 
 use crate::dupes::{full_hash_with, sample_file};
 use crate::index::{db_err, stat_of, to_sql, Index, Probe, Role};
+use crate::remote::{hex, is_remote_host, HashAlgo};
 use crate::rotational::ROTATIONAL_HASH_THREADS;
 use crate::{phase, Progress};
 
@@ -233,9 +240,13 @@ pub(crate) fn report_with(
                 cow: l.cow,
             })
             .collect(),
+        unverifiable: c
+            .unverifiable
+            .iter()
+            .map(|(size, members)| render_unverifiable(&c.locs, &c.rows, &c.phys, *size, members))
+            .collect(),
         stats: c.stats,
         warnings: c.warnings,
-        unverifiable: Vec::new(),
     })
 }
 
@@ -247,8 +258,11 @@ pub(crate) struct Groups {
     pub(crate) phys: Vec<Phys>,
     /// One per group, in size order.
     pub(crate) drafts: Vec<Draft>,
-    /// Physical files that are in some group.
+    /// Physical files that are in some group or an unverifiable set: not
+    /// single copies.
     pub(crate) grouped: HashSet<usize>,
+    /// Same-size physical files hashed with different algorithms, by size.
+    pub(crate) unverifiable: Vec<(u64, Vec<usize>)>,
     /// Location row id → index into `locs`.
     pub(crate) at: HashMap<i64, usize>,
     pub(crate) stats: HashStats,
@@ -331,10 +345,11 @@ pub(crate) fn compute_groups(
         return Err(cancelled());
     }
 
-    // 4. Groups.
+    // 4. Groups, and sets that cannot be compared (mixed algorithms).
     let mut grouped: HashSet<usize> = HashSet::new();
     let mut drafts = Vec::new();
-    for members in buckets.values() {
+    let mut unverifiable = Vec::new();
+    for (&size, members) in &buckets {
         let members: Vec<usize> = members
             .iter()
             .copied()
@@ -343,6 +358,19 @@ pub(crate) fn compute_groups(
         for g in group_bucket(&phys, &members) {
             grouped.extend(g.confirmed.iter().chain(&g.probable));
             drafts.push(g);
+        }
+        let classed: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&p| algo_class(&phys[p]).is_some())
+            .collect();
+        let algos: BTreeSet<HashAlgo> = classed
+            .iter()
+            .filter_map(|&p| algo_class(&phys[p]))
+            .collect();
+        if algos.len() > 1 {
+            grouped.extend(&classed);
+            unverifiable.push((size, classed));
         }
     }
 
@@ -363,6 +391,7 @@ pub(crate) fn compute_groups(
         phys,
         drafts,
         grouped,
+        unverifiable,
         at,
         stats: HashStats {
             sampled: stats.sampled.load(Ordering::Relaxed),
@@ -393,8 +422,10 @@ struct Counters {
 pub(crate) struct Loc {
     pub(crate) id: i64,
     pub(crate) uuid: String,
-    /// `local`, or a remote host (a later milestone).
+    /// `local`, or a remote host (`ssh://h`).
     pub(crate) host: String,
+    /// On a remote host: its files are never read from here.
+    pub(crate) remote: bool,
     pub(crate) root: PathBuf,
     pub(crate) role: Role,
     pub(crate) available: bool,
@@ -423,16 +454,25 @@ fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
     for row in rows {
         let (id, uuid, root, role, cow, host) = row.map_err(db_err)?;
         let root = PathBuf::from(root);
-        let available = (probe.online)(&root, &uuid);
+        // A remote root is a path on another machine: never stat'ed here.
+        let remote = is_remote_host(&host);
+        let available = if remote {
+            root.to_str()
+                .is_some_and(|r| (probe.remote_online)(&host, r))
+        } else {
+            (probe.online)(&root, &uuid)
+        };
+        let local = available && !remote;
         out.push(Loc {
             id,
             available,
-            rotational: available && (probe.rotational)(&root),
+            remote,
+            rotational: local && (probe.rotational)(&root),
             // Recorded at its last scan; never recorded and out of reach:
             // it may be CoW, so savings may be shared.
             cow: match cow {
                 Some(c) => c != 0,
-                None if available => (probe.cow)(&root),
+                None if local => (probe.cow)(&root),
                 None => true,
             },
             role: Role::parse(&role),
@@ -453,7 +493,10 @@ pub(crate) struct Row {
     pub(crate) dev: u64,
     pub(crate) ino: u64,
     pub(crate) sample: Option<[u8; 32]>,
+    /// BLAKE3 of the whole file.
     pub(crate) full: Option<[u8; 32]>,
+    /// A whole-file digest of another algorithm (remote MD5 / SHA-1).
+    pub(crate) alt: Option<(HashAlgo, Vec<u8>)>,
     /// On a reachable volume but gone or unreadable: left out.
     pub(crate) excluded: bool,
     /// Differs from its stored row.
@@ -474,7 +517,7 @@ fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result
     let mut st = idx
         .conn
         .prepare(&format!(
-            "SELECT location_id, path, size, mtime_ns, dev, ino, sample, full FROM files \
+            "SELECT location_id, path, size, mtime_ns, dev, ino, sample, full, algo FROM files \
                  WHERE size >= ?1 AND {NOT_QUARANTINED} AND size IN \
                    (SELECT size FROM files WHERE size >= ?1 AND {NOT_QUARANTINED} \
                     GROUP BY size HAVING COUNT(*) > 1) \
@@ -492,13 +535,20 @@ fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result
                 r.get::<_, i64>(5)?,
                 r.get::<_, Option<Vec<u8>>>(6)?,
                 r.get::<_, Option<Vec<u8>>>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        let (loc, path, size, mtime, dev, ino, sample, full) = row.map_err(db_err)?;
+        let (loc, path, size, mtime, dev, ino, sample, full, algo) = row.map_err(db_err)?;
         let Some(&loc) = at.get(&loc) else { continue };
+        let algo = HashAlgo::parse(&algo).unwrap_or(HashAlgo::Blake3);
+        let (full, alt) = match (algo, full) {
+            (HashAlgo::Blake3, f) => (hash32(f), None),
+            (a, Some(d)) if d.len() == a.digest_len() => (None, Some((a, d))),
+            _ => (None, None),
+        };
         out.push(Row {
             loc,
             path,
@@ -507,7 +557,8 @@ fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result
             dev: dev as u64,
             ino: ino as u64,
             sample: hash32(sample),
-            full: hash32(full),
+            full,
+            alt,
             excluded: false,
             dirty: false,
         });
@@ -517,16 +568,17 @@ fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result
 
 /// Stat every row on a reachable volume; a row whose file changed gets the
 /// new size/time/inode and loses its hashes; every row without a sample is
-/// sampled. Offline rows are left as they are — never touched.
+/// sampled. Offline and remote rows are left as they are — never touched.
 fn refresh(locs: &[Loc], rows: &mut [Row], stats: &Counters, progress: &Progress, probe: &Probe) {
+    let here = |l: &Loc| l.available && !l.remote;
     let online: Vec<usize> = (0..rows.len())
-        .filter(|&i| locs[rows[i].loc].available)
+        .filter(|&i| here(&locs[rows[i].loc]))
         .collect();
     let bytes = online.iter().map(|&i| rows[i].size.min(SAMPLE_READ)).sum();
     progress.enter(phase::SAMPLE, online.len() as u64, bytes);
     let on_read = probe.on_read;
     rows.par_iter_mut()
-        .filter(|r| locs[r.loc].available)
+        .filter(|r| here(&locs[r.loc]))
         .for_each(|r| {
             if progress.cancelled() {
                 r.excluded = true;
@@ -582,7 +634,10 @@ fn refresh(locs: &[Loc], rows: &mut [Row], stats: &Counters, progress: &Progress
 
 /// Write back every row this run learned something about.
 fn persist(idx: &Index, locs: &[Loc], rows: &[Row]) -> io::Result<()> {
-    if !rows.iter().any(|r| r.dirty && !r.excluded) {
+    // Only rows read here (local, BLAKE3): a remote digest is never
+    // rewritten from this side.
+    let writable = |r: &&Row| r.dirty && !r.excluded && r.alt.is_none() && !locs[r.loc].remote;
+    if !rows.iter().any(|r| writable(&r)) {
         return Ok(());
     }
     let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
@@ -590,10 +645,10 @@ fn persist(idx: &Index, locs: &[Loc], rows: &[Row]) -> io::Result<()> {
         let mut set = tx
             .prepare_cached(
                 "UPDATE files SET size = ?3, mtime_ns = ?4, dev = ?5, ino = ?6, \
-                 sample = ?7, full = ?8 WHERE location_id = ?1 AND path = ?2",
+                 sample = ?7, full = ?8, algo = 'blake3' WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
-        for r in rows.iter().filter(|r| r.dirty && !r.excluded) {
+        for r in rows.iter().filter(writable) {
             set.execute(params![
                 locs[r.loc].id,
                 r.path,
@@ -617,13 +672,39 @@ pub(crate) struct Phys {
     pub(crate) size: u64,
     pub(crate) sample: Option<[u8; 32]>,
     pub(crate) full: Option<[u8; 32]>,
+    /// A digest of another algorithm (remote MD5 / SHA-1).
+    pub(crate) alt: Option<(HashAlgo, Vec<u8>)>,
     pub(crate) available: bool,
+    /// On a remote host.
+    pub(crate) remote: bool,
     pub(crate) excluded: bool,
+}
+
+/// The algorithm a physical file can be compared under: its digest's, or
+/// BLAKE3 for any local file (it can be read and hashed); `None` for a
+/// remote file never hashed.
+fn algo_class(p: &Phys) -> Option<HashAlgo> {
+    match (&p.alt, p.full, p.remote) {
+        (Some((a, _)), _, _) => Some(*a),
+        (None, Some(_), _) | (None, None, false) => Some(HashAlgo::Blake3),
+        (None, None, true) => None,
+    }
 }
 
 /// The filesystem part of a location key: a bind mount or subvolume
 /// (`UUID:/sub`) shares inodes with the whole filesystem (`UUID`).
 pub(crate) fn filesystem_of(uuid: &str) -> &str {
+    if let Some(rest) = uuid.strip_prefix("ssh://") {
+        // `ssh://host/<fs id>:<root>` → `ssh://host/<fs id>`; without an fs
+        // id (`ssh://host:<root>`) the location is its own filesystem.
+        return match rest.split_once('/') {
+            Some((host, tail)) if !host.contains(':') => match tail.split_once(':') {
+                Some((id, _)) => &uuid[..6 + host.len() + 1 + id.len()],
+                None => uuid,
+            },
+            _ => uuid,
+        };
+    }
     if uuid.starts_with("dev:") {
         uuid
     } else {
@@ -652,6 +733,9 @@ fn physical(locs: &[Loc], rows: &[Row]) -> Vec<Phys> {
                 ph.available |= available;
                 ph.sample = ph.sample.or(r.sample);
                 ph.full = ph.full.or(r.full);
+                if ph.alt.is_none() {
+                    ph.alt = r.alt.clone();
+                }
             }
             None => {
                 at.insert(key, out.len());
@@ -660,7 +744,9 @@ fn physical(locs: &[Loc], rows: &[Row]) -> Vec<Phys> {
                     size: r.size,
                     sample: r.sample,
                     full: r.full,
+                    alt: r.alt.clone(),
                     available,
+                    remote: locs[r.loc].remote,
                     excluded: false,
                 });
             }
@@ -690,21 +776,27 @@ fn by_size(phys: &[Phys]) -> BTreeMap<u64, Vec<usize>> {
     m
 }
 
-/// A reachable file without a whole-file hash needs one when another
-/// physical file of its size may hold the same bytes: same ends, or ends
-/// never read (offline, never sampled).
+/// A reachable local file without a whole-file hash needs one when another
+/// physical file of its size may hold the same bytes: same ends, ends never
+/// read (offline, never sampled), or a remote BLAKE3 digest (remote files
+/// have no sample). A remote MD5 / SHA-1 digest cannot be compared: no.
 fn needs_full(phys: &[Phys], members: &[usize], p: usize) -> bool {
     let me = &phys[p];
-    if !me.available || me.full.is_some() || me.excluded {
+    if !me.available || me.remote || me.full.is_some() || me.excluded {
         return false;
     }
     members.iter().any(|&o| {
+        let other = &phys[o];
         o != p
-            && !phys[o].excluded
-            && match (phys[o].sample, me.sample) {
-                (Some(a), Some(b)) => a == b,
-                (None, _) => !phys[o].available,
-                _ => false,
+            && !other.excluded
+            && if other.remote {
+                other.full.is_some()
+            } else {
+                match (other.sample, me.sample) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, _) => !other.available,
+                    _ => false,
+                }
             }
     })
 }
@@ -776,6 +868,8 @@ fn in_order<T: Send>(n: usize, items: &[HashItem], f: &(dyn Fn(&HashItem) -> T +
 pub(crate) struct Draft {
     pub(crate) size: u64,
     pub(crate) full: Option<[u8; 32]>,
+    /// The digest of a group of another algorithm (then `full` is `None`).
+    pub(crate) alt: Option<(HashAlgo, Vec<u8>)>,
     pub(crate) sample: Option<[u8; 32]>,
     pub(crate) confirmed: Vec<usize>,
     pub(crate) probable: Vec<usize>,
@@ -792,12 +886,15 @@ fn group_bucket(phys: &[Phys], members: &[usize]) -> Vec<Draft> {
             by_full.entry(f).or_default().push(p);
         }
     }
-    // Offline, never hashed whole: probably a copy of a same-size file
-    // whose ends match (or whose ends were never read).
+    // Offline (or remote), never hashed whole: probably a copy of a
+    // same-size file whose ends match (or whose ends were never read).
     let unhashed: Vec<usize> = members
         .iter()
         .copied()
-        .filter(|&p| phys[p].full.is_none() && !phys[p].available)
+        .filter(|&p| {
+            let ph = &phys[p];
+            ph.full.is_none() && ph.alt.is_none() && (!ph.available || ph.remote)
+        })
         .collect();
     let mut sample_of_groups: HashSet<[u8; 32]> = HashSet::new();
     for (full, confirmed) in by_full {
@@ -812,6 +909,7 @@ fn group_bucket(phys: &[Phys], members: &[usize]) -> Vec<Draft> {
             out.push(Draft {
                 size: phys[confirmed[0]].size,
                 full: Some(full),
+                alt: None,
                 sample,
                 confirmed,
                 probable,
@@ -826,11 +924,31 @@ fn group_bucket(phys: &[Phys], members: &[usize]) -> Vec<Draft> {
             }
         }
     }
+    // Remote digests of another algorithm group only with their own kind.
+    let mut by_alt: BTreeMap<(HashAlgo, Vec<u8>), Vec<usize>> = BTreeMap::new();
+    for &p in members {
+        if let Some(a) = &phys[p].alt {
+            by_alt.entry(a.clone()).or_default().push(p);
+        }
+    }
+    for (alt, confirmed) in by_alt {
+        if confirmed.len() >= 2 {
+            out.push(Draft {
+                size: phys[confirmed[0]].size,
+                full: None,
+                alt: Some(alt),
+                sample: None,
+                confirmed,
+                probable: Vec::new(),
+            });
+        }
+    }
     for (sample, probable) in by_sample {
         if probable.len() >= 2 {
             out.push(Draft {
                 size: phys[probable[0]].size,
                 full: None,
+                alt: None,
                 sample: Some(sample),
                 confirmed: Vec::new(),
                 probable,
@@ -901,11 +1019,16 @@ fn render(locs: &[Loc], rows: &[Row], phys: &[Phys], g: &Draft) -> IndexGroup {
 
     let unique = g.confirmed.len() as u64;
     let available = reachable.len() as u64;
-    let hex = |h: [u8; 32]| blake3::Hash::from(h).to_hex().to_string();
+    let b3hex = |h: [u8; 32]| blake3::Hash::from(h).to_hex().to_string();
+    let (algo, hash) = match (&g.full, &g.alt) {
+        (Some(f), _) => (HashAlgo::Blake3, Some(b3hex(*f))),
+        (None, Some((a, d))) => (*a, Some(hex(d))),
+        (None, None) => (HashAlgo::Blake3, None),
+    };
     IndexGroup {
-        algo: "blake3".into(),
-        hash: g.full.map(hex),
-        sample: g.sample.map(hex),
+        algo: algo.as_str().into(),
+        hash,
+        sample: g.sample.map(b3hex),
         size: g.size,
         copies,
         unique_copies: unique,
@@ -914,6 +1037,45 @@ fn render(locs: &[Loc], rows: &[Row], phys: &[Phys], g: &Draft) -> IndexGroup {
         reclaimable_bytes: g.size.saturating_mul(unique.saturating_sub(1)),
         actionable_bytes: g.size.saturating_mul(available.saturating_sub(1)),
         savings_may_be_shared: g.confirmed.iter().any(|&p| loc_of(p).cow),
+    }
+}
+
+/// One unverifiable set: every member with its algorithm and digest.
+fn render_unverifiable(
+    locs: &[Loc],
+    rows: &[Row],
+    phys: &[Phys],
+    size: u64,
+    members: &[usize],
+) -> Unverifiable {
+    let mut copies: Vec<UnverifiableCopy> = members
+        .iter()
+        .map(|&p| {
+            let ph = &phys[p];
+            let r = &rows[ph.rows[0]];
+            let (algo, hash) = match (&ph.alt, ph.full) {
+                (Some((a, d)), _) => (*a, Some(hex(d))),
+                (None, f) => (HashAlgo::Blake3, f.map(|f| hex(&f))),
+            };
+            UnverifiableCopy {
+                location_uuid: locs[r.loc].uuid.clone(),
+                path: abs(&locs[r.loc].root, &r.path),
+                algo: algo.as_str().into(),
+                hash,
+                available: ph.available,
+            }
+        })
+        .collect();
+    copies.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.location_uuid.cmp(&b.location_uuid))
+    });
+    let algos: BTreeSet<&str> = copies.iter().map(|c| c.algo.as_str()).collect();
+    Unverifiable {
+        size,
+        algos: algos.into_iter().map(String::from).collect(),
+        copies,
     }
 }
 

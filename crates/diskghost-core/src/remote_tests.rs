@@ -846,7 +846,11 @@ fn every_remote_command_of_a_whole_run_is_read_only() {
                 ] {
                     assert_ne!(w, bad, "{argv:?}");
                 }
-                let stripped = w.replace("2>/dev/null", "").replace(">/dev/null", "");
+                // Only output to /dev/null or another descriptor — never a file.
+                let stripped = w
+                    .replace("2>/dev/null", "")
+                    .replace(">/dev/null", "")
+                    .replace("2>&1", "");
                 assert!(!stripped.contains('>'), "redirect to a file: {argv:?}");
                 for bad in ["rm ", "mv ", "chmod", "truncate", "touch "] {
                     assert!(!w.contains(bad), "{argv:?}");

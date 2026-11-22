@@ -340,6 +340,17 @@ impl Run<'_> {
     /// then nothing more may be moved.
     fn go(&self, prev: Option<&JournalEntry>, journal: &mut Journal) -> io::Result<Outcome> {
         let a = self.action;
+        // Before anything else (a remote group's hash may be MD5): apply
+        // never acts on a remote host. Recorded, never silent.
+        if self.is_remote() {
+            return self.record(
+                verdict(
+                    Status::RemoteSkipped,
+                    "remote location: apply never acts on a remote host",
+                ),
+                journal,
+            );
+        }
         if let Some(p) = prev {
             match p.status {
                 Status::Done => {
@@ -400,6 +411,19 @@ impl Run<'_> {
         self.record(v, journal)
     }
 
+    /// The action is on a remote (ssh) location — by its own mark, the
+    /// plan's location list, or its location id.
+    fn is_remote(&self) -> bool {
+        let a = self.action;
+        a.remote
+            || a.location_uuid.starts_with("ssh://")
+            || self
+                .plan
+                .locations
+                .iter()
+                .any(|l| l.uuid == a.location_uuid && crate::remote::is_remote_host(&l.host))
+    }
+
     /// A `pending` line without `done`: the run was killed around the
     /// rename. Moved (gone from `from`, its inode at `to`) → done; still at
     /// `from` → `None`, check and move it again.
@@ -435,7 +459,9 @@ impl Run<'_> {
     /// Every check before a move; `Ok` carries the quarantine target.
     fn check(&self) -> Result<Verdict, Verdict> {
         let (a, g) = (self.action, self.group);
-        let hash_ok = g.hash.len() == 64 && g.hash.bytes().all(|b| b.is_ascii_hexdigit());
+        let hash_ok = g.algo == "blake3"
+            && g.hash.len() == 64
+            && g.hash.bytes().all(|b| b.is_ascii_hexdigit());
         if !hash_ok {
             return Err(verdict(
                 Status::Error,
@@ -473,7 +499,7 @@ impl Run<'_> {
         if !matches!(host.as_str(), "local" | "localhost") {
             return Err(verdict(
                 Status::Error,
-                format!("location on host {host:?}: remote locations are not supported yet"),
+                format!("location on host {host:?}: apply never acts on a remote host"),
             ));
         }
         if !(self.probe.online)(&root, &a.location_uuid) {

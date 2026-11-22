@@ -10,16 +10,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use diskghost_core::remote::parse_ssh_url;
 use diskghost_core::{
     apply as apply_plan, journal_path, make_plan, undo as undo_journal, ApplyOptions, Plan, Policy,
     RunReport, Status,
 };
 use diskghost_core::{
     diff, find_duplicates_cached, format_timestamp, human_delta, human_size, index_dupes,
-    index_scan, phase, reclaim, remove_path, validate_globs, validate_host, DiffReport, DupGroup,
-    HashCache, Index, IndexDupesReport, IndexReportOptions, LocationStatus, Options, Progress,
-    ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, Role, ScanReport, ScanSummary,
-    ScanTree, Snapshot, Suggest, CHECKPOINT_INTERVAL,
+    index_remote, index_scan, phase, reclaim, remove_path, validate_globs, validate_host,
+    DiffReport, DupGroup, HashCache, Index, IndexDupesReport, IndexReportOptions, LocationStatus,
+    Options, Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, Role, ScanReport,
+    ScanSummary, ScanTree, Snapshot, Suggest, CHECKPOINT_INTERVAL,
 };
 use serde::Serialize;
 
@@ -245,15 +246,21 @@ enum IndexAction {
     /// entered): new and changed files are recorded, unchanged ones are not
     /// read, files gone from the folder are dropped from the index, and files
     /// whose size matches another indexed file get their ends hashed.
+    ///
+    /// A folder may be remote: `ssh://host/path` (`ssh://host//abs/path`
+    /// for an absolute path). The host lists and hashes its own files with
+    /// its own tools (find, stat, b3sum / md5sum / sha1sum) — nothing is
+    /// installed there, and no file content crosses the network. Without
+    /// b3sum its MD5 / SHA-1 digests are only compared with each other.
     Add {
-        /// Folders to index.
+        /// Folders to index (local paths or ssh://host/path).
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// Role of the volume in later copy policies.
         #[arg(long, value_enum)]
         role: Option<RoleArg>,
-        /// Host the volume lives on. Only this machine (local / localhost)
-        /// for now.
+        /// Host the volume lives on: local / localhost. A remote folder is
+        /// given as ssh://host/path instead.
         #[arg(long, default_value = "local")]
         host: String,
         #[command(flatten)]
@@ -677,6 +684,12 @@ fn print_plan(p: &Plan, output: &Path) {
         human_size(s.quarantine_bytes),
         s.under_protected_groups
     );
+    if s.remote_actions > 0 {
+        println!(
+            "  {} redundant cop(ies) on remote hosts: listed only — apply never acts there",
+            s.remote_actions
+        );
+    }
     for g in p.groups.iter().take(20) {
         let tag = if g.under_protected {
             "  under-protected: every copy stays"
@@ -698,7 +711,11 @@ fn print_plan(p: &Plan, output: &Path) {
             println!("    keep        {}  ({why})", k.path.display());
         }
         for a in &g.actions {
-            println!("    quarantine  {}", a.path.display());
+            if a.remote {
+                println!("    remote      {}  (not applied)", a.path.display());
+            } else {
+                println!("    quarantine  {}", a.path.display());
+            }
         }
     }
     if p.groups.len() > 20 {
@@ -759,11 +776,12 @@ fn finish_run(json: bool, r: &RunReport, what: &str) -> ExitCode {
             );
         } else {
             println!(
-                "{what}: {} moved, {} restored, {} skipped, {} left alone (changed or \
-                 unverifiable), {} failed — journal {}",
+                "{what}: {} moved, {} restored, {} skipped, {} remote (never applied), {} left \
+                 alone (changed or unverifiable), {} failed — journal {}",
                 n(Status::Done),
                 n(Status::Undone),
                 n(Status::Skipped),
+                n(Status::RemoteSkipped),
                 n(Status::Stale)
                     + n(Status::HashMismatch)
                     + n(Status::ParanoidMismatch)
@@ -866,8 +884,13 @@ fn print_index_dupes(r: &IndexDupesReport, singles_file: Option<&Path>) {
                 .as_deref()
                 .or(g.sample.as_deref())
                 .map_or("", |h| &h[..12]);
+            let algo = if g.algo == "blake3" {
+                String::new()
+            } else {
+                format!(" {}", g.algo)
+            };
             print!(
-                "  {} cop{} x {} ({} reclaimable) [{id}]",
+                "  {} cop{} x {} ({} reclaimable) [{id}{algo}]",
                 g.unique_copies,
                 if g.unique_copies == 1 { "y" } else { "ies" },
                 human_size(g.size),
@@ -895,6 +918,20 @@ fn print_index_dupes(r: &IndexDupesReport, singles_file: Option<&Path>) {
             }
             println!();
         }
+    }
+    if !r.unverifiable.is_empty() {
+        println!(
+            "Unverifiable: {} set(s) of same-size files hashed with different algorithms \
+             (install b3sum on the remote host to compare them):",
+            r.unverifiable.len()
+        );
+        for u in &r.unverifiable {
+            println!("  {} [{}]", human_size(u.size), u.algos.join(" vs "));
+            for c in &u.copies {
+                println!("      {:<7} {}", c.algo, c.path.display());
+            }
+        }
+        println!();
     }
     if let Some(singles) = &r.singles {
         let files: u64 = singles.iter().map(|s| s.files).sum();
@@ -954,9 +991,24 @@ fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
         if !check_globs(&walk.exclude) {
             return ExitCode::FAILURE;
         }
-        if let Some(p) = paths.iter().find(|p| !p.is_dir()) {
-            eprintln!("error: not a directory: {}", p.display());
-            return ExitCode::FAILURE;
+        for p in paths {
+            match ssh_url(p) {
+                Some(url) => {
+                    if let Err(e) = parse_ssh_url(url) {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    if !matches!(host.as_str(), "local" | "localhost") {
+                        eprintln!("error: --host does not apply to {url}: its host is in the URL");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                None if !p.is_dir() => {
+                    eprintln!("error: not a directory: {}", p.display());
+                    return ExitCode::FAILURE;
+                }
+                None => {}
+            }
         }
     }
     let Some(db) = db.or_else(default_index_db) else {
@@ -981,8 +1033,17 @@ fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
             let role = role.map(Role::from);
             let mut done = Vec::new();
             for path in &paths {
-                let scanned = with_progress(|p| index_scan(&idx, path, &opts, p))
-                    .and_then(|s| idx.configure(&s.uuid, role, &host).map(|()| s));
+                let scanned = match ssh_url(path) {
+                    Some(url) => {
+                        let h = parse_ssh_url(url).map(|(h, _)| h).unwrap_or_default();
+                        with_progress(|p| index_remote(&idx, url, p)).and_then(|s| {
+                            idx.configure(&s.uuid, role, &format!("ssh://{h}"))
+                                .map(|()| s)
+                        })
+                    }
+                    None => with_progress(|p| index_scan(&idx, path, &opts, p))
+                        .and_then(|s| idx.configure(&s.uuid, role, &host).map(|()| s)),
+                };
                 match scanned {
                     Ok(s) => {
                         if !json {
@@ -1029,6 +1090,11 @@ fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The `ssh://…` URL a path argument is, if it is one.
+fn ssh_url(p: &Path) -> Option<&str> {
+    p.to_str().filter(|s| s.starts_with("ssh://"))
+}
+
 fn print_index_add(path: &Path, s: &ScanSummary) {
     println!(
         "{}  →  volume {} ({})",
@@ -1036,10 +1102,22 @@ fn print_index_add(path: &Path, s: &ScanSummary) {
         s.uuid,
         s.root.display()
     );
-    println!(
-        "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} sampled",
-        s.seen, s.new, s.changed, s.unchanged, s.vanished, s.sampled
-    );
+    match (s.hashed, &s.algo) {
+        (Some(h), Some(algo)) => println!(
+            "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} hashed on the host ({algo})",
+            s.seen, s.new, s.changed, s.unchanged, s.vanished, h
+        ),
+        _ => println!(
+            "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} sampled",
+            s.seen, s.new, s.changed, s.unchanged, s.vanished, s.sampled
+        ),
+    }
+    if s.algo.as_deref().is_some_and(|a| a != "blake3") {
+        println!(
+            "  note: no b3sum on the host — its digests are compared only with each other; \
+             same-size local files are reported unverifiable"
+        );
+    }
     if s.skipped > 0 {
         println!(
             "  {} entries skipped (unreadable, non-UTF-8 name, or another device)",

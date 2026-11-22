@@ -16,8 +16,17 @@
 //!   asks for) the group is `under_protected` and gets **no** actions: every
 //!   copy stays;
 //! - every other copy is quarantined — scratch first — only when all its
-//!   names are on reachable, local, non-master locations; otherwise it stays
+//!   names are on reachable, non-master locations; otherwise it stays
 //!   (`why` says which rule kept it);
+//! - a copy on a remote (ssh) location is marked `remote: true`. Among
+//!   equal candidates a local copy is kept first (it can be verified and
+//!   reached). A remote copy the policy does not need becomes an action
+//!   with `remote: true` — listed so the user sees it, but `apply` never
+//!   acts on a remote host and records it `remote_skipped`. Remote actions
+//!   are counted in `summary.remote_actions`, not in `actions` or
+//!   `quarantine_bytes`;
+//! - a group of remote MD5 / SHA-1 digests is planned like any other
+//!   (`algo` says which); all its copies are remote.
 //! - copies only *probably* alike (offline, never hashed whole) are neither
 //!   kept nor acted on: they do not count.
 
@@ -30,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::index::{Index, Probe, Role};
 use crate::index_report::{abs, compute_groups, filesystem_of, role_rank, Draft, Groups};
 use crate::policy::{Distinct, Policy};
+use crate::remote::hex;
 use crate::Progress;
 
 /// Plan file format version `apply` understands.
@@ -134,7 +144,7 @@ pub enum KeepReason {
     UnderProtected,
     /// Not reachable now (offline volume) — never touched.
     Offline,
-    /// A name of this inode is on an unreachable, remote or master
+    /// A name of this inode is on an unreachable or master
     /// location: moving the other names would free nothing.
     NamesOutOfReach,
 }
@@ -212,15 +222,19 @@ pub(crate) fn plan_with(
         .iter()
         .filter_map(|d| plan_group(&c, &roles, policy, d))
         .collect();
-    let freed = |g: &PlanGroup| g.size.saturating_mul(g.actions.len() as u64);
+    let local = |g: &PlanGroup| g.actions.iter().filter(|a| !a.remote).count() as u64;
+    let freed = |g: &PlanGroup| g.size.saturating_mul(local(g));
     groups.sort_by(|a, b| freed(b).cmp(&freed(a)).then_with(|| a.hash.cmp(&b.hash)));
 
     let summary = PlanSummary {
         groups: groups.len() as u64,
-        actions: groups.iter().map(|g| g.actions.len() as u64).sum(),
+        actions: groups.iter().map(local).sum(),
         quarantine_bytes: groups.iter().map(freed).sum(),
         under_protected_groups: groups.iter().filter(|g| g.under_protected).count() as u64,
-        remote_actions: 0,
+        remote_actions: groups
+            .iter()
+            .map(|g| g.actions.len() as u64 - local(g))
+            .sum(),
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -253,10 +267,6 @@ fn blake3_name() -> String {
     "blake3".into()
 }
 
-fn is_local(host: &str) -> bool {
-    matches!(host, "local" | "localhost")
-}
-
 /// One confirmed physical copy as the plan weighs it.
 struct Cand {
     p: usize,
@@ -265,17 +275,22 @@ struct Cand {
     /// Its filesystem: the unit of `distinct = "physical_device"`.
     device: String,
     available: bool,
+    /// On a remote (ssh) location.
+    remote: bool,
     /// Why it may not be moved, if so.
     pinned: Option<KeepReason>,
     path: PathBuf,
 }
 
 fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<PlanGroup> {
-    let full = d.full?;
+    let (hash, algo) = match (&d.full, &d.alt) {
+        (Some(f), _) => (blake3::Hash::from(*f).to_hex().to_string(), blake3_name()),
+        (None, Some((a, dig))) => (hex(dig), a.as_str().to_string()),
+        (None, None) => return None,
+    };
     if d.confirmed.len() < 2 {
         return None; // nothing to choose between
     }
-    let hash = blake3::Hash::from(full).to_hex().to_string();
     let row_loc = |r: usize| c.rows[r].loc;
     let cands: Vec<Cand> = d
         .confirmed
@@ -289,10 +304,10 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
                 .map(|&r| roles[row_loc(r)])
                 .min_by_key(|&r| role_rank(r))
                 .unwrap_or(Role::Normal);
-            let out_of_reach = ph.rows.iter().any(|&r| {
-                let l = &c.locs[row_loc(r)];
-                !l.available || !is_local(&l.host) || roles[row_loc(r)] == Role::Master
-            });
+            let out_of_reach = ph
+                .rows
+                .iter()
+                .any(|&r| !c.locs[row_loc(r)].available || roles[row_loc(r)] == Role::Master);
             let pinned = if role == Role::Master {
                 Some(KeepReason::Master)
             } else if !ph.available {
@@ -307,6 +322,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
                 role,
                 device: filesystem_of(&c.locs[rep.loc].uuid).to_string(),
                 available: ph.available,
+                remote: ph.rows.iter().any(|&r| c.locs[row_loc(r)].remote),
                 pinned,
                 path: abs(&c.locs[rep.loc].root, &rep.path),
             }
@@ -338,7 +354,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
             .filter(|&i| !by_device || !used.contains(cands[i].device.as_str()))
             .min_by_key(|&i| {
                 let k = &cands[i];
-                (role_rank(k.role), !k.available, k.path.clone())
+                (role_rank(k.role), !k.available, k.remote, k.path.clone())
             });
         match pick {
             Some(i) => kept.push(i),
@@ -376,7 +392,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
             shared_inodes: n,
             role: k.role,
             available: k.available,
-            remote: false,
+            remote: k.remote,
             why,
             expect: c.locs[row_loc(rep)].available.then(|| expect_of(rep)),
         }
@@ -409,7 +425,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
                     location_uuid: c.locs[l].uuid.clone(),
                     role: roles[l],
                     path: abs(&c.locs[l].root, &c.rows[r].path),
-                    remote: false,
+                    remote: c.locs[l].remote,
                     expect: expect_of(r),
                 });
             }
@@ -425,7 +441,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
         a.id = format!("{}-{}", &hash[..16], n + 1);
     }
     Some(PlanGroup {
-        algo: blake3_name(),
+        algo,
         hash,
         size: d.size,
         unique_copies: unique,

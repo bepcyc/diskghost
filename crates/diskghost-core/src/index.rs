@@ -12,14 +12,14 @@
 //! disk fills one location, and each scan only answers for the subtree it
 //! walked.
 //!
-//! # Schema (version 3, `PRAGMA user_version`)
+//! # Schema (version 4, `PRAGMA user_version`)
 //!
 //! ```sql
 //! meta      (key TEXT PRIMARY KEY, value INTEGER NOT NULL)
 //!           -- 'schema_version', 'scan_generation'
 //! locations (id INTEGER PRIMARY KEY,
 //!            uuid TEXT NOT NULL UNIQUE,   -- fs UUID[:subtree] | dev:<major>:<minor>
-//!            host TEXT NOT NULL DEFAULT 'local',  -- seam for remote hosts
+//!            host TEXT NOT NULL DEFAULT 'local',  -- local | ssh://<host>
 //!            root TEXT NOT NULL,          -- last known mountpoint
 //!            role TEXT NOT NULL DEFAULT 'normal'  -- normal | master | scratch
 //!            online INTEGER NOT NULL,     -- reachable at its last scan
@@ -29,7 +29,8 @@
 //!            path TEXT,                   -- relative to locations.root
 //!            size, mtime_ns, dev, ino INTEGER,
 //!            sample BLOB,  -- BLAKE3 of first+last 16 KiB; NULL = not computed
-//!            full BLOB,    -- BLAKE3 of the whole file; NULL = not computed
+//!            algo TEXT,    -- v4: algorithm of `full`: blake3 | md5 | sha1
+//!            full BLOB,    -- whole-file digest (32/16/20 bytes); NULL = not computed
 //!            seen INTEGER, -- scan generation that last saw the row
 //!            PRIMARY KEY (location_id, path)) WITHOUT ROWID
 //! INDEX files_size ON files(size); INDEX files_full ON files(full)
@@ -38,6 +39,16 @@
 //!                                         -- '' = the mountpoint itself
 //!            UNIQUE (location_id, path))
 //! ```
+//!
+//! A **remote location** (`index add ssh://host/path`, see [`crate::remote`])
+//! has `host = 'ssh://host'`, uuid `ssh://host/<fs id>:<root>` (or
+//! `ssh://host:<root>` when the host tells no filesystem id), `root` = the
+//! remote folder, paths relative to it, `dev` 0. Its files are listed and
+//! hashed by the remote host; this machine never reads them, and no local
+//! check ever looks at its `root` (that path may exist here too, holding
+//! other files). Its `full` digest is BLAKE3 when the host has `b3sum`, else
+//! MD5 / SHA-1 (`algo`) — comparable only with digests of the same
+//! algorithm. `sample` stays NULL.
 //!
 //! A **scan root** is a folder `index add` was given. One volume may have
 //! several. `apply` quarantines a file into the longest scan root holding
@@ -69,7 +80,7 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
@@ -114,6 +125,30 @@ CREATE TABLE scan_roots (
     path        TEXT NOT NULL,
     UNIQUE (location_id, path)
 );
+",
+    // v4: `full` may be an MD5 or SHA-1 digest made on a remote host, so it
+    // carries its algorithm. A CHECK cannot be altered in SQLite: rebuild.
+    r"
+CREATE TABLE files_v4 (
+    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    mtime_ns    INTEGER NOT NULL,
+    dev         INTEGER NOT NULL,
+    ino         INTEGER NOT NULL,
+    sample      BLOB CHECK (sample IS NULL OR length(sample) = 32),
+    algo        TEXT NOT NULL DEFAULT 'blake3' CHECK (algo IN ('blake3', 'md5', 'sha1')),
+    full        BLOB CHECK (full IS NULL OR length(full) =
+                    CASE algo WHEN 'md5' THEN 16 WHEN 'sha1' THEN 20 ELSE 32 END),
+    seen        INTEGER NOT NULL,
+    PRIMARY KEY (location_id, path)
+) WITHOUT ROWID;
+INSERT INTO files_v4 (location_id, path, size, mtime_ns, dev, ino, sample, algo, full, seen)
+    SELECT location_id, path, size, mtime_ns, dev, ino, sample, 'blake3', full, seen FROM files;
+DROP TABLE files;
+ALTER TABLE files_v4 RENAME TO files;
+CREATE INDEX files_size ON files(size);
+CREATE INDEX files_full ON files(full) WHERE full IS NOT NULL;
 ",
 ];
 
@@ -278,7 +313,6 @@ impl Index {
 
     /// [`Index::status`] asking `probe` whether a location is reachable.
     pub(crate) fn status_with(&self, probe: &Probe) -> io::Result<Vec<LocationStatus>> {
-        let _ = probe.remote_online;
         let mut st = self
             .conn
             .prepare(
@@ -310,8 +344,14 @@ impl Index {
                 .iter()
                 .map(|rel| under(&root, rel))
                 .collect();
+            let online = if crate::remote::is_remote_host(&host) {
+                root.to_str()
+                    .is_some_and(|r| (probe.remote_online)(&host, r))
+            } else {
+                (probe.online)(&root, &uuid)
+            };
             out.push(LocationStatus {
-                online: is_online(&root, &uuid),
+                online,
                 uuid,
                 host,
                 role: Role::parse(&role),
@@ -382,14 +422,18 @@ fn is_online(root: &Path, uuid: &str) -> bool {
     root.is_dir() && volume(root).is_ok_and(|v| v.key == uuid && v.mount_point == root)
 }
 
-/// Hosts a location may live on. Only this machine for now: remote
-/// locations are a later milestone, and the flag exists so the seam does.
+/// Hosts a location may live on: this machine (`local`, `localhost`) or a
+/// remote one reached over ssh (`ssh://host`).
 pub fn validate_host(host: &str) -> Result<(), String> {
     match host {
         "local" | "localhost" => Ok(()),
-        other => Err(format!(
-            "remote locations not yet supported (host {other:?}); use local"
-        )),
+        other => match other.strip_prefix("ssh://") {
+            Some(h) => crate::remote::validate_remote_host(h),
+            None => Err(format!(
+                "host {other:?}: a remote location is given as an ssh://{other}/path \
+                 folder, not with --host"
+            )),
+        },
     }
 }
 
@@ -710,11 +754,173 @@ pub(crate) fn remote_scan_with(
     x: &dyn crate::remote::RemoteExec,
     progress: &Progress,
 ) -> io::Result<ScanSummary> {
-    let _ = (idx, url, x, progress);
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "not implemented",
-    ))
+    use crate::remote::{enum_remote, hash_remote, parse_ssh_url, probe, resolve_root};
+    let (host, path) =
+        parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // Everything the host is asked before the index changes: an
+    // unreachable or unusable host records nothing.
+    let caps = probe(x)?;
+    let rr = resolve_root(x, &caps, &path)?;
+    let uuid = match &rr.fsid {
+        Some(id) => format!("ssh://{host}/{id}:{}", rr.root),
+        None => format!("ssh://{host}:{}", rr.root),
+    };
+    let listing = enum_remote(x, &caps, &rr.root)?;
+    let cow = rr.fstype.as_deref().map(|t| {
+        matches!(
+            t,
+            "btrfs" | "zfs" | "xfs" | "bcachefs" | "overlayfs" | "overlay"
+        )
+    });
+    let mut sum = ScanSummary {
+        uuid: uuid.clone(),
+        root: PathBuf::from(&rr.root),
+        skipped: listing.skipped,
+        algo: Some(caps.hash.as_str().to_string()),
+        ..ScanSummary::default()
+    };
+
+    let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
+    let loc: i64 = tx
+        .query_row(
+            "INSERT INTO locations (uuid, host, root, online, last_seen, cow) \
+             VALUES (?1, ?2, ?3, 1, ?4, ?5) \
+             ON CONFLICT(uuid) DO UPDATE SET host = excluded.host, root = excluded.root, \
+             online = 1, last_seen = excluded.last_seen, cow = excluded.cow RETURNING id",
+            params![uuid, format!("ssh://{host}"), rr.root, now_secs(), cow],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO scan_roots (location_id, path) VALUES (?1, '')",
+        [loc],
+    )
+    .map_err(db_err)?;
+    let gen: i64 = tx
+        .query_row(
+            "UPDATE meta SET value = value + 1 WHERE key = 'scan_generation' RETURNING value",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    {
+        let mut get = tx
+            .prepare_cached(
+                "SELECT size, mtime_ns, ino FROM files WHERE location_id = ?1 AND path = ?2",
+            )
+            .map_err(db_err)?;
+        let mut insert = tx
+            .prepare_cached(
+                "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, seen) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            )
+            .map_err(db_err)?;
+        let mut touch = tx
+            .prepare_cached("UPDATE files SET seen = ?3 WHERE location_id = ?1 AND path = ?2")
+            .map_err(db_err)?;
+        let mut reset = tx
+            .prepare_cached(
+                "UPDATE files SET size = ?3, mtime_ns = ?4, dev = 0, ino = ?5, sample = NULL, \
+                 full = NULL, algo = 'blake3', seen = ?6 WHERE location_id = ?1 AND path = ?2",
+            )
+            .map_err(db_err)?;
+        for f in &listing.files {
+            if progress.cancelled() {
+                break;
+            }
+            let (size, mtime, ino) = (to_sql(f.size), to_sql(f.mtime_ns), to_sql(f.ino));
+            sum.seen += 1;
+            let old: Option<(i64, i64, i64)> = get
+                .query_row(params![loc, f.path], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .optional()
+                .map_err(db_err)?;
+            match old {
+                None => {
+                    insert
+                        .execute(params![loc, f.path, size, mtime, ino, gen])
+                        .map_err(db_err)?;
+                    sum.new += 1;
+                }
+                Some(o) if o == (size, mtime, ino) => {
+                    touch.execute(params![loc, f.path, gen]).map_err(db_err)?;
+                    sum.unchanged += 1;
+                }
+                Some(_) => {
+                    reset
+                        .execute(params![loc, f.path, size, mtime, ino, gen])
+                        .map_err(db_err)?;
+                    sum.changed += 1;
+                }
+            }
+        }
+    }
+    sum.complete = listing.complete && !progress.cancelled();
+    if sum.complete {
+        sum.vanished = drop_vanished(&tx, loc, gen, "", &[]).map_err(db_err)? as u64;
+    }
+    tx.commit().map_err(db_err)?;
+    if progress.cancelled() {
+        return Ok(sum);
+    }
+
+    // Hash, on the host, every file of this location whose size collides
+    // with another indexed file and that has no digest yet.
+    let pending: Vec<(String, i64, i64, i64)> = {
+        let mut st = idx
+            .conn
+            .prepare(
+                "SELECT path, size, mtime_ns, ino FROM files \
+                 WHERE location_id = ?1 AND full IS NULL AND size > 0 AND size IN \
+                   (SELECT size FROM files WHERE size > 0 GROUP BY size HAVING COUNT(*) > 1) \
+                 ORDER BY path",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([loc], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(db_err)?;
+        rows.collect::<Result<_, _>>().map_err(db_err)?
+    };
+    let abs: Vec<String> = pending
+        .iter()
+        .map(|(p, ..)| {
+            if rr.root == "/" {
+                format!("/{p}")
+            } else {
+                format!("{}/{p}", rr.root)
+            }
+        })
+        .collect();
+    progress.enter(
+        phase::HASH,
+        abs.len() as u64,
+        pending.iter().map(|(_, s, ..)| *s as u64).sum(),
+    );
+    let digests = hash_remote(x, &caps, &abs)?;
+    let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
+    let mut hashed = 0;
+    {
+        // Only while the row is still the listed file.
+        let mut set = tx
+            .prepare_cached(
+                "UPDATE files SET full = ?3, algo = ?4 WHERE location_id = ?1 AND path = ?2 \
+                 AND size = ?5 AND mtime_ns = ?6 AND ino = ?7",
+            )
+            .map_err(db_err)?;
+        for ((path, size, mtime, ino), d) in pending.iter().zip(digests) {
+            progress.files.fetch_add(1, Ordering::Relaxed);
+            progress.bytes.fetch_add(*size as u64, Ordering::Relaxed);
+            if let Some(d) = d {
+                hashed += set
+                    .execute(params![loc, path, d, caps.hash.as_str(), size, mtime, ino])
+                    .map_err(db_err)? as u64;
+            }
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    sum.hashed = Some(hashed);
+    Ok(sum)
 }
 
 /// [`index_scan`] asking `probe` instead of the machine.
@@ -959,7 +1165,8 @@ fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Res
             .prepare(
                 "SELECT l.id, l.uuid, l.root, f.path, f.size, f.mtime_ns, f.ino \
                  FROM files f JOIN locations l ON l.id = f.location_id \
-                 WHERE f.sample IS NULL AND f.size > 0 AND f.size IN \
+                 WHERE l.host NOT LIKE 'ssh://%' \
+                   AND f.sample IS NULL AND f.size > 0 AND f.size IN \
                    (SELECT size FROM files WHERE size > 0 GROUP BY size HAVING COUNT(*) > 1) \
                  ORDER BY l.id, f.path",
             )
@@ -1696,10 +1903,11 @@ mod tests {
     }
 
     #[test]
-    fn only_local_hosts_are_accepted() {
+    fn only_local_and_ssh_hosts_are_accepted() {
         assert!(validate_host("local").is_ok());
         assert!(validate_host("localhost").is_ok());
         let e = validate_host("nas.lan").unwrap_err();
-        assert!(e.contains("remote locations not yet supported"), "{e}");
+        assert!(e.contains("ssh://nas.lan/path"), "{e}");
+        assert!(validate_host("ssh://nas.lan").is_ok());
     }
 }
