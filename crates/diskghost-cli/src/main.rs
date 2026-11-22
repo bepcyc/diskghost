@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use diskghost_core::remote::parse_ssh_url;
+use diskghost_core::remote::{parse_ssh_url, AgentMode};
 use diskghost_core::{
     apply as apply_plan, journal_path, make_plan, undo as undo_journal, ApplyOptions, Plan, Policy,
     RunReport, Status,
@@ -93,6 +93,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve the remote agent protocol on stdin/stdout (run by `index add
+    /// ssh://…` on the remote host, not by hand): line-delimited JSON
+    /// requests `hello`, `enumerate`, `stat_fs`, `hash` — read-only by
+    /// construction. Nothing else is opened, created or written.
+    #[command(hide = true)]
+    Agent,
     /// Scan a directory: total size, biggest sub-folders and biggest files.
     Scan {
         /// Directory to scan.
@@ -263,6 +269,12 @@ enum IndexAction {
         /// given as ssh://host/path instead.
         #[arg(long, default_value = "local")]
         host: String,
+        /// Remote folders: `auto` uploads this program to
+        /// ~/.cache/diskghost/ on a Linux x86_64 host and lets it list and
+        /// hash there (falling back to the host's shell tools when it cannot
+        /// run); `never` always uses the shell tools.
+        #[arg(long, value_enum, default_value = "auto")]
+        agent: AgentArg,
         #[command(flatten)]
         walk: WalkArgs,
     },
@@ -274,6 +286,21 @@ enum IndexAction {
         /// The volume's id as `status` shows it.
         uuid: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AgentArg {
+    Auto,
+    Never,
+}
+
+impl From<AgentArg> for AgentMode {
+    fn from(a: AgentArg) -> Self {
+        match a {
+            AgentArg::Auto => AgentMode::Auto,
+            AgentArg::Never => AgentMode::Never,
+        }
+    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -363,6 +390,18 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
+        // Before anything else: the agent opens no index, no cache, no
+        // config — stdout carries protocol frames only.
+        Command::Agent => {
+            let stdin = std::io::stdin();
+            return match diskghost_core::agent::serve(stdin.lock(), std::io::stdout().lock()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("agent: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::Scan {
             path,
             top,
@@ -1027,6 +1066,7 @@ fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
             paths,
             role,
             host,
+            agent,
             walk,
         } => {
             let opts = walk.to_options();
@@ -1036,7 +1076,7 @@ fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
                 let scanned = match ssh_url(path) {
                     Some(url) => {
                         let h = parse_ssh_url(url).map(|(h, _)| h).unwrap_or_default();
-                        with_progress(|p| index_remote(&idx, url, p)).and_then(|s| {
+                        with_progress(|p| index_remote(&idx, url, agent.into(), p)).and_then(|s| {
                             idx.configure(&s.uuid, role, &format!("ssh://{h}"))
                                 .map(|()| s)
                         })

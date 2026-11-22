@@ -75,6 +75,16 @@ pub trait RemoteExec: Sync {
     /// Run `argv` (program and arguments, no shell syntax: each element is
     /// one word) on the host.
     fn exec(&self, argv: &[&str]) -> io::Result<ExecOut>;
+
+    /// [`RemoteExec::exec`] with `input` written to the command's stdin
+    /// (the agent upload, and the agent's request frames).
+    fn exec_stdin(&self, argv: &[&str], input: &[u8]) -> io::Result<ExecOut> {
+        let _ = (argv, input);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this transport cannot send input to a remote command",
+        ))
+    }
 }
 
 /// The real thing: `ssh <extra> -- <host> <argv, shell-quoted>`.
@@ -719,5 +729,138 @@ pub fn ssh_online(host: &str, root: &str) -> bool {
     match host.strip_prefix("ssh://") {
         Some(h) if validate_remote_host(h).is_ok() => remote_online(&SshExec::new(h), root),
         _ => false,
+    }
+}
+
+// ---- the agent tier (M5) ---------------------------------------------
+
+/// What [`probe_host`] tells about a host before any tool check.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostInfo {
+    /// `uname -s` (`Linux`).
+    pub os: String,
+    /// `uname -m` (`x86_64`); empty when not told.
+    pub arch: String,
+}
+
+/// Probe a host: its os/arch, and the shell-tier capabilities (`Err` when
+/// it has no usable hash tool or `find` — the agent tier may still work).
+/// The outer `Err` is a host that cannot be reached or runs no command.
+pub fn probe_host(x: &dyn RemoteExec) -> io::Result<(HostInfo, io::Result<Capabilities>)> {
+    let _ = x;
+    unimplemented!("M5 RED")
+}
+
+/// Whether to try the agent tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    /// Upload/reuse the agent where the host can run it, else the shell tier.
+    Auto,
+    /// Always the shell tier (parity tests, hosts that forbid binaries).
+    Never,
+}
+
+/// How a remote location's files were listed and hashed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    /// `diskghost agent` at `agent_path` on the host.
+    Agent { agent_path: std::path::PathBuf },
+    /// The host's own `find` / `stat` / hash tools.
+    Shell,
+}
+
+impl Transport {
+    /// The `locations.transport` value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Transport::Agent { .. } => "agent",
+            Transport::Shell => "shell",
+        }
+    }
+}
+
+/// The only (os, arch) an agent is built for today.
+pub const AGENT_TARGET: (&str, &str) = ("Linux", "x86_64");
+
+/// A binary that can serve as the agent: this program's own bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBinary {
+    pub bytes: Vec<u8>,
+    /// Version it answers in `hello`.
+    pub ver: String,
+    /// `uname -s` / `uname -m` it runs on.
+    pub os: String,
+    pub arch: String,
+}
+
+impl AgentBinary {
+    /// This very program, when it is built for [`AGENT_TARGET`].
+    pub fn current() -> Option<AgentBinary> {
+        None
+    }
+
+    /// Content-addressed remote file name:
+    /// `diskghost-agent-<ver>-<first 8 hex of BLAKE3(bytes)>`.
+    pub fn name(&self) -> String {
+        String::new()
+    }
+}
+
+/// `$1` = agent file name: `have <abs path>` when it is already there and
+/// executable, else `need <abs path>`. Read-only.
+pub const LOCATE_SCRIPT: &str = "";
+
+/// `$1` = agent file name, `$2` = its byte length; stdin = the binary.
+pub const UPLOAD_SCRIPT: &str = "";
+
+/// Make sure the host has a working agent: reuse or upload it, then check
+/// its `hello`. `Ok(None)` = use the shell tier (unsupported os/arch, any
+/// upload failure, a hello that does not match).
+pub fn ensure_agent(
+    exec: &dyn RemoteExec,
+    probe: &HostInfo,
+    bin: &AgentBinary,
+) -> io::Result<Option<std::path::PathBuf>> {
+    let _ = (exec, probe, bin);
+    Ok(None)
+}
+
+/// The agent's answer to `stat_fs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFs {
+    pub root: RemoteRoot,
+    pub cow: bool,
+    pub rotational: bool,
+}
+
+/// The agent's answer to `hello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    pub ver: String,
+    pub os: String,
+    pub arch: String,
+}
+
+/// Talks to `agent` (`<agent_path> agent`) on the host through `exec`.
+pub struct AgentExec<'a> {
+    pub exec: &'a dyn RemoteExec,
+    pub agent: String,
+}
+
+impl AgentExec<'_> {
+    pub fn hello(&self) -> io::Result<Hello> {
+        unimplemented!("M5 RED")
+    }
+    pub fn stat_fs(&self, path: &str) -> io::Result<AgentFs> {
+        let _ = path;
+        unimplemented!("M5 RED")
+    }
+    pub fn enumerate(&self, root: &str) -> io::Result<Listing> {
+        let _ = root;
+        unimplemented!("M5 RED")
+    }
+    pub fn hash(&self, paths: &[String]) -> io::Result<Vec<Option<Vec<u8>>>> {
+        let _ = paths;
+        unimplemented!("M5 RED")
     }
 }

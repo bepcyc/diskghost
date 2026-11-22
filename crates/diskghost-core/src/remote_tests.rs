@@ -476,7 +476,7 @@ fn schema_4_adds_the_digest_algorithm_and_migrates_v3_rows() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 4);
+    assert_eq!(v, 5);
     let rows = remote_rows(&e, &Estate::uuid("A"));
     assert_eq!(rows[0].3, "blake3", "default for local rows");
     // An md5 digest is 16 bytes; blake3 must stay 32.
@@ -1009,5 +1009,555 @@ fn the_real_fallback_commands_list_a_local_folder_without_printf() {
             m.mtime() as u64 * 1_000_000_000,
             "whole seconds"
         );
+    }
+}
+
+// ---- the agent tier (M5) ---------------------------------------------
+
+use crate::remote::{AgentBinary, AgentMode};
+use std::sync::atomic::Ordering as AtomicOrdering;
+
+fn test_bin() -> AgentBinary {
+    AgentBinary {
+        bytes: b"\x7fELF not really an agent, only bytes to upload".to_vec(),
+        ver: env!("CARGO_PKG_VERSION").into(),
+        os: "Linux".into(),
+        arch: "x86_64".into(),
+    }
+}
+
+fn x86() -> FakeHost {
+    FakeHost::linux().with_arch("x86_64")
+}
+
+/// The kind of call: `probe`, `locate`, `upload`, `agent`, or the program.
+fn kind(argv: &[String]) -> String {
+    match argv {
+        [sh, c, s, ..] if sh == "sh" && c == "-c" => match s.as_str() {
+            s if s == PROBE_SCRIPT => "probe".into(),
+            s if s == LOCATE_SCRIPT => "locate".into(),
+            s if s == UPLOAD_SCRIPT => "upload".into(),
+            s if s == RESOLVE_SCRIPT => "resolve".into(),
+            s if s == HASH_SCRIPT => "hash".into(),
+            s if s == STAT_SCRIPT => "stat".into(),
+            _ => "sh?".into(),
+        },
+        [_, a] if a == "agent" => "agent".into(),
+        [p, ..] => p.clone(),
+        [] => String::new(),
+    }
+}
+
+fn kinds(h: &FakeHost) -> Vec<String> {
+    h.calls().iter().map(|c| kind(c)).collect()
+}
+
+#[test]
+fn the_probe_tells_os_and_arch_even_without_hash_tools() {
+    let h = x86().with_tools(&["find", "stat"]);
+    let (info, caps) = probe_host(&h).unwrap();
+    assert_eq!((info.os.as_str(), info.arch.as_str()), ("Linux", "x86_64"));
+    // The shell tier is unusable, but that is not the probe's verdict on
+    // the host: the agent tier may still serve it.
+    assert_eq!(caps.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    assert!(PROBE_SCRIPT.contains("uname -m"));
+    assert_eq!(h.calls().len(), 1, "still one call");
+}
+
+#[test]
+fn the_agent_file_name_is_content_addressed() {
+    let b = test_bin();
+    let hex8 = &blake3::hash(&b.bytes).to_hex()[..8];
+    assert_eq!(
+        b.name(),
+        format!("diskghost-agent-{}-{hex8}", env!("CARGO_PKG_VERSION"))
+    );
+    let mut other = test_bin();
+    other.bytes.push(0);
+    assert_ne!(other.name(), b.name());
+    assert!(!b.name().contains(' ') && !b.name().contains('/'));
+}
+
+#[test]
+fn ensure_agent_locates_uploads_then_says_hello_in_that_order() {
+    let h = x86();
+    let b = test_bin();
+    let (info, _) = probe_host(&h).unwrap();
+    let p = ensure_agent(&h, &info, &b).unwrap().expect("agent");
+    let want = format!("/home/u/.cache/diskghost/{}", b.name());
+    assert_eq!(p, PathBuf::from(&want));
+    assert_eq!(kinds(&h), ["probe", "locate", "upload", "agent"]);
+    let calls = h.calls();
+    // The upload: one script, streamed via stdin, into the cache dir only.
+    let up = &calls[2];
+    assert_eq!(&up[4..], [b.name(), b.bytes.len().to_string()]);
+    let s = &up[2];
+    let at = |n: &str| s.find(n).unwrap_or_else(|| panic!("{n} in {s}"));
+    assert!(s.contains(r#""$HOME/.cache/diskghost""#), "{s}");
+    assert!(at("mkdir -p") < at("cat >") && at("cat >") < at("chmod 755"));
+    assert!(at("chmod 755") < at("mv -n"));
+    assert_eq!(h.inputs.lock().unwrap()[0], b.bytes, "binary sent on stdin");
+    assert_eq!(h.cache.lock().unwrap().get(&want), Some(&b.bytes));
+    // The hello: run the uploaded file itself.
+    assert_eq!(calls[3], [want.clone(), "agent".into()]);
+    let hello = String::from_utf8(h.inputs.lock().unwrap()[1].clone()).unwrap();
+    assert!(hello.contains(r#""op":"hello""#), "{hello}");
+}
+
+#[test]
+fn a_second_run_reuses_the_uploaded_agent() {
+    let h = x86();
+    let b = test_bin();
+    let (info, _) = probe_host(&h).unwrap();
+    let first = ensure_agent(&h, &info, &b).unwrap();
+    h.calls.lock().unwrap().clear();
+    let again = ensure_agent(&h, &info, &b).unwrap();
+    assert_eq!(first, again);
+    assert_eq!(kinds(&h), ["locate", "agent"], "no second upload");
+}
+
+#[test]
+fn unsupported_os_or_arch_never_uploads() {
+    let b = test_bin();
+    for h in [
+        FakeHost::linux().with_arch("aarch64"),
+        FakeHost::linux(), // no arch told
+        FakeHost::bsd().with_arch("x86_64"),
+    ] {
+        let (info, _) = probe_host(&h).unwrap();
+        assert_eq!(ensure_agent(&h, &info, &b).unwrap(), None);
+        assert_eq!(kinds(&h), ["probe"], "{info:?}");
+    }
+    // A local binary for another target is not offered either.
+    let h = x86();
+    let (info, _) = probe_host(&h).unwrap();
+    let mut arm = test_bin();
+    arm.arch = "aarch64".into();
+    assert_eq!(ensure_agent(&h, &info, &arm).unwrap(), None);
+    assert_eq!(kinds(&h), ["probe"]);
+}
+
+#[test]
+fn a_hello_mismatch_falls_back_to_the_shell_and_records_it() {
+    let e = Estate::new("agent-mismatch");
+    let h = x86();
+    h.put("/storage/a.bin", &content(1), T0);
+    h.put("/storage/b.bin", &content(1), T0);
+    *h.hello.lock().unwrap() = Some(
+        r#"{"v":1,"agent":"diskghost","ver":"0.0.1","os":"linux","arch":"x86_64","blake3":true}"#
+            .into(),
+    );
+    let b = test_bin();
+    let (info, _) = probe_host(&h).unwrap();
+    assert_eq!(ensure_agent(&h, &info, &b).unwrap(), None);
+    let s = e
+        .add_remote_via(URL, &h, AgentMode::Auto, Some(&b))
+        .unwrap();
+    assert_eq!(s.transport.as_deref(), Some("shell"));
+    assert_eq!((s.seen, s.hashed), (2, Some(2)));
+    assert_eq!(transport_of(&e, UUID), "shell");
+    // The broken agent is not uploaded again on the next run.
+    let uploads = h.count(|c| kind(c) == "upload");
+    e.add_remote_via(URL, &h, AgentMode::Auto, Some(&b))
+        .unwrap();
+    assert_eq!(h.count(|c| kind(c) == "upload"), uploads);
+    assert_eq!(uploads, 1);
+}
+
+#[test]
+fn a_failed_upload_falls_back_to_the_shell() {
+    let e = Estate::new("agent-upload-fail");
+    let h = x86();
+    h.upload_fail.store(true, AtomicOrdering::SeqCst);
+    h.put("/storage/a.bin", &content(1), T0);
+    let s = e
+        .add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()))
+        .unwrap();
+    assert_eq!(s.transport.as_deref(), Some("shell"));
+    assert!(
+        !kinds(&h).contains(&"agent".to_string()),
+        "no hello of a failed upload"
+    );
+}
+
+#[test]
+fn agent_never_forces_the_shell_tier_without_a_single_agent_call() {
+    let e = Estate::new("agent-never");
+    let h = x86();
+    h.put("/storage/a.bin", &content(1), T0);
+    let s = e
+        .add_remote_via(URL, &h, AgentMode::Never, Some(&test_bin()))
+        .unwrap();
+    assert_eq!(s.transport.as_deref(), Some("shell"));
+    for k in kinds(&h) {
+        assert!(!["locate", "upload", "agent"].contains(&k.as_str()), "{k}");
+    }
+}
+
+#[test]
+fn an_sftp_only_host_says_files_would_be_read_over_the_network() {
+    let e = Estate::new("agent-sftp-only");
+    let h = x86();
+    h.no_shell.store(true, AtomicOrdering::SeqCst);
+    let err = e
+        .add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()))
+        .unwrap_err();
+    let m = err.to_string();
+    assert!(m.contains("remote shell unavailable on adroid"), "{m}");
+    assert!(m.contains("read over the network"), "{m}");
+    assert!(m.contains("upload an agent or enable shell"), "{m}");
+    assert_eq!(location_count(&e), 0);
+    // A host that cannot be reached at all is still "unreachable".
+    let h = x86();
+    h.down.store(true, AtomicOrdering::SeqCst);
+    let err = e
+        .add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()))
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+    assert!(err.to_string().contains("unreachable"), "{err}");
+    assert!(!err.to_string().contains("read over the network"), "{err}");
+}
+
+#[test]
+fn a_host_with_neither_tools_nor_an_agent_is_unusable() {
+    let e = Estate::new("agent-unusable");
+    let h = FakeHost::linux().with_arch("aarch64").with_tools(&["find"]);
+    let err = e
+        .add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()))
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    assert!(err.to_string().contains("unusable"), "{err}");
+}
+
+fn transport_of(e: &Estate, uuid: &str) -> String {
+    e.idx
+        .conn
+        .query_row(
+            "SELECT transport FROM locations WHERE uuid = ?1",
+            [uuid],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_v4_index_migrates_to_v5_keeping_its_rows_as_shell_locations() {
+    let e = Estate::new("agent-migrate-v5");
+    let path = e.dir.join("v4.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        for m in &crate::index::MIGRATIONS[..4] {
+            c.execute_batch(m).unwrap();
+        }
+        c.pragma_update(None, "user_version", 4).unwrap();
+        c.execute(
+            "INSERT INTO locations (uuid, host, root, online, last_seen) \
+             VALUES ('ssh://h/1', 'ssh://h', '/', 1, 1)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, algo, full, seen) \
+             VALUES (1, 'a', 5, 1, 0, 1, 'md5', ?1, 1)",
+            [vec![7u8; 16]],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO scan_roots (location_id, path) VALUES (1, 'data')",
+            [],
+        )
+        .unwrap();
+    }
+    let idx = crate::index::Index::open(&path).unwrap();
+    let v: i64 = idx
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 5);
+    let row: (Vec<u8>, String, String, String) = idx
+        .conn
+        .query_row(
+            "SELECT f.full, f.algo, l.transport, (SELECT path FROM scan_roots) \
+             FROM files f JOIN locations l ON l.id = f.location_id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (vec![7u8; 16], "md5".into(), "shell".into(), "data".into())
+    );
+    assert!(idx
+        .conn
+        .execute("UPDATE locations SET transport = 'ftp'", [])
+        .is_err());
+    assert!(idx
+        .conn
+        .execute("UPDATE locations SET transport = 'agent'", [])
+        .is_ok());
+}
+
+/// The real commands on this machine (like [`LocalExec`]), with the agent
+/// "already uploaded": `locate` answers `have`, and running it serves the
+/// request frames in-process with [`crate::agent::serve`]. Records every
+/// argv and every frame; refuses any upload.
+struct LocalAgent {
+    calls: std::sync::Mutex<Vec<Vec<String>>>,
+    frames: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+const LOCAL_AGENT: &str = "/nonexistent/.cache/diskghost/diskghost-agent-test";
+
+impl LocalAgent {
+    fn new() -> LocalAgent {
+        LocalAgent {
+            calls: std::sync::Mutex::new(Vec::new()),
+            frames: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl RemoteExec for LocalAgent {
+    fn exec(&self, argv: &[&str]) -> io::Result<ExecOut> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(argv.iter().map(|s| s.to_string()).collect());
+        match argv {
+            ["sh", "-c", s, "sh", _] if *s == LOCATE_SCRIPT => Ok(ExecOut {
+                stdout: format!("have {LOCAL_AGENT}\n").into_bytes(),
+                ..ExecOut::default()
+            }),
+            _ => LocalExec.exec(argv),
+        }
+    }
+
+    fn exec_stdin(&self, argv: &[&str], input: &[u8]) -> io::Result<ExecOut> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(argv.iter().map(|s| s.to_string()).collect());
+        match argv {
+            [p, "agent"] if *p == LOCAL_AGENT => {
+                for l in String::from_utf8_lossy(input).lines() {
+                    self.frames
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(l).unwrap());
+                }
+                let mut out = Vec::new();
+                crate::agent::serve(input, &mut out)?;
+                Ok(ExecOut {
+                    stdout: out,
+                    ..ExecOut::default()
+                })
+            }
+            _ => Err(io::Error::other(format!("LocalAgent refuses {argv:?}"))),
+        }
+    }
+}
+
+fn local_target_ok() -> bool {
+    let (info, _) = probe_host(&LocalExec).unwrap();
+    (info.os.as_str(), info.arch.as_str()) == crate::remote::AGENT_TARGET
+}
+
+type Row = (String, i64, i64, i64, Option<Vec<u8>>, String);
+
+fn all_rows(idx: &crate::index::Index, uuid: &str) -> Vec<Row> {
+    let mut st = idx
+        .conn
+        .prepare(
+            "SELECT f.path, f.size, f.mtime_ns, f.ino, f.full, f.algo FROM files f \
+             JOIN locations l ON l.id = f.location_id WHERE l.uuid = ?1 ORDER BY f.path",
+        )
+        .unwrap();
+    let rows = st
+        .query_map([uuid], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+#[test]
+fn the_agent_tier_resolves_the_same_location_as_the_shell_tier() {
+    if !local_target_ok() {
+        return;
+    }
+    let e = Estate::new("agent-statfs-parity");
+    let root = e.loc("r");
+    write(&root.join("a.bin"), b"a");
+    let c = probe(&LocalExec).unwrap();
+    let shell = resolve_root(&LocalExec, &c, root.to_str().unwrap()).unwrap();
+    let a = crate::remote::AgentExec {
+        exec: &LocalAgent::new(),
+        agent: LOCAL_AGENT.into(),
+    };
+    let fs = a.stat_fs(root.to_str().unwrap()).unwrap();
+    assert_eq!(fs.root.root, shell.root);
+    if c.stat == StatFlavor::Gnu {
+        // Same fs id and mountpoint as GNU `stat -f -c %i` / `stat -c %m`:
+        // one remote filesystem is one location whichever tier lists it.
+        assert_eq!(fs.root.fsid, shell.fsid);
+        assert_eq!(fs.root.mount, shell.mount);
+    }
+}
+
+#[test]
+fn the_agent_tier_and_the_shell_tier_index_the_same_rows() {
+    if !local_target_ok() {
+        return;
+    }
+    let e = Estate::new("agent-parity");
+    let root = e.loc("r");
+    write(&root.join("a.bin"), &content(1));
+    write(&root.join("sub dir/it's b.bin"), &content(1));
+    write(&root.join("c.bin"), &content(2));
+    write(&root.join("u.txt"), b"unique");
+    std::fs::hard_link(root.join("a.bin"), root.join("a-link.bin")).unwrap();
+    let url = format!("ssh://local/{}", root.display());
+    let shell = e
+        .add_remote_via(&url, &LocalExec, AgentMode::Never, None)
+        .unwrap();
+    assert_eq!(shell.transport.as_deref(), Some("shell"));
+
+    let idx2 = crate::index::Index::open(&e.dir.join("db2/index.db")).unwrap();
+    let la = LocalAgent::new();
+    let agent = crate::index::remote_scan_with(
+        &idx2,
+        &url,
+        &la,
+        AgentMode::Auto,
+        Some(&test_bin()),
+        &crate::Progress::default(),
+    )
+    .unwrap();
+    assert_eq!(agent.transport.as_deref(), Some("agent"));
+    assert_eq!(agent.algo.as_deref(), Some("blake3"));
+    assert_eq!(agent.uuid, shell.uuid, "one filesystem, one location");
+    assert_eq!(agent.root, shell.root);
+    assert_eq!((agent.seen, agent.new), (shell.seen, shell.new));
+    assert_eq!(agent.hashed, Some(4), "a, its link, b and c collide");
+    assert!(agent.complete);
+    assert_eq!(transport_of_idx(&idx2, &agent.uuid), "agent");
+    let (s_rows, a_rows) = (all_rows(&e.idx, &shell.uuid), all_rows(&idx2, &agent.uuid));
+    assert_eq!(s_rows.len(), 5);
+    let strip = |r: &[Row]| -> Vec<(String, i64, i64, i64)> {
+        r.iter()
+            .map(|(p, s, m, i, ..)| (p.clone(), *s, *m, *i))
+            .collect()
+    };
+    assert_eq!(strip(&a_rows), strip(&s_rows));
+    for r in &a_rows {
+        // Rows are relative to the location root (the mountpoint).
+        let bytes = std::fs::read(agent.root.join(&r.0)).unwrap();
+        let want = (r.1 == BIG as i64).then(|| blake3::hash(&bytes).as_bytes().to_vec());
+        assert_eq!(r.4, want, "{}", r.0);
+    }
+    if shell.algo.as_deref() == Some("blake3") {
+        assert_eq!(a_rows, s_rows);
+    }
+    // Rescan through the agent: nothing changed, nothing re-hashed.
+    let again = crate::index::remote_scan_with(
+        &idx2,
+        &url,
+        &la,
+        AgentMode::Auto,
+        Some(&test_bin()),
+        &crate::Progress::default(),
+    )
+    .unwrap();
+    assert_eq!((again.unchanged, again.hashed), (5, Some(0)));
+}
+
+fn transport_of_idx(idx: &crate::index::Index, uuid: &str) -> String {
+    idx.conn
+        .query_row(
+            "SELECT transport FROM locations WHERE uuid = ?1",
+            [uuid],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_whole_agent_run_only_ever_sends_read_requests() {
+    if !local_target_ok() {
+        return;
+    }
+    let e = Estate::new("agent-readonly");
+    let root = e.loc("r");
+    write(&root.join("a.bin"), &content(1));
+    write(&root.join("b.bin"), &content(1));
+    let url = format!("ssh://local/{}", root.display());
+    let la = LocalAgent::new();
+    let s = e
+        .add_remote_via(&url, &la, AgentMode::Auto, Some(&test_bin()))
+        .unwrap();
+    assert_eq!(s.transport.as_deref(), Some("agent"));
+    assert!(std::fs::read(root.join("a.bin")).unwrap() == content(1));
+    let frames = la.frames.lock().unwrap().clone();
+    assert!(!frames.is_empty());
+    for f in &frames {
+        let op = f["op"].as_str().unwrap_or("");
+        assert!(
+            ["hello", "enumerate", "stat_fs", "hash"].contains(&op),
+            "{f}"
+        );
+    }
+    for argv in la.calls.lock().unwrap().iter() {
+        let k = kind(argv);
+        assert_ne!(k, "upload", "agent already there: no upload");
+        for w in argv {
+            for bad in ["rm ", "mv ", "chmod", "truncate", "touch ", "cat >"] {
+                assert!(!w.contains(bad), "{argv:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_upload_is_the_only_writing_command_and_stays_in_the_cache_dir() {
+    let e = Estate::new("agent-upload-scope");
+    let h = x86();
+    h.put("/storage/a.bin", &content(1), T0);
+    // The fake agent answers hello only, so the scan itself errors out
+    // after the handshake; what matters here is every argv sent.
+    let _ = e.add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()));
+    let writing: Vec<Vec<String>> = h
+        .calls()
+        .into_iter()
+        .filter(|argv| {
+            argv.iter().any(|w| {
+                ["mkdir", "cat >", "chmod", "mv "]
+                    .iter()
+                    .any(|bad| w.contains(bad))
+            })
+        })
+        .collect();
+    assert_eq!(writing.len(), 1, "{writing:#?}");
+    assert_eq!(kind(&writing[0]), "upload");
+    let script = &writing[0][2];
+    for w in ["rm ", "rm -", "unlink", "-delete", "truncate"] {
+        assert!(!script.contains(w), "{script}");
+    }
+    // Every path the script writes is under the cache dir.
+    for line in script.lines() {
+        if line.contains("cat >") || line.contains("chmod") || line.contains("mv -n") {
+            assert!(line.contains("\"$t\"") || line.contains("\"$d/"), "{line}");
+        }
+    }
+    assert!(script.contains(r#"d="$HOME/.cache/diskghost""#), "{script}");
+    let cached: Vec<String> = h.cache.lock().unwrap().keys().cloned().collect();
+    for p in cached {
+        assert!(p.starts_with(&h.agent_dir()), "{p}");
     }
 }

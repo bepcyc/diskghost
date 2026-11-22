@@ -221,6 +221,9 @@ pub struct ScanSummary {
     /// Remote locations: the digest algorithm the host offers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub algo: Option<String>,
+    /// Remote locations: `agent` or `shell` (see [`crate::remote::Transport`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 /// One location as `diskghost index status` reports it.
@@ -746,10 +749,23 @@ fn scan_observed(
 
 /// Index a remote folder `ssh://host/path` over ssh (see [`crate::remote`]):
 /// the host enumerates and hashes its own files; no content is copied.
-pub fn index_remote(idx: &Index, url: &str, progress: &Progress) -> io::Result<ScanSummary> {
+pub fn index_remote(
+    idx: &Index,
+    url: &str,
+    mode: crate::remote::AgentMode,
+    progress: &Progress,
+) -> io::Result<ScanSummary> {
     let (host, _) = crate::remote::parse_ssh_url(url)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    remote_scan_with(idx, url, &crate::remote::SshExec::new(&host), progress)
+    let bin = crate::remote::AgentBinary::current();
+    remote_scan_with(
+        idx,
+        url,
+        &crate::remote::SshExec::new(&host),
+        mode,
+        bin.as_ref(),
+        progress,
+    )
 }
 
 /// [`index_remote`] running its commands through `x`.
@@ -757,8 +773,11 @@ pub(crate) fn remote_scan_with(
     idx: &Index,
     url: &str,
     x: &dyn crate::remote::RemoteExec,
+    mode: crate::remote::AgentMode,
+    bin: Option<&crate::remote::AgentBinary>,
     progress: &Progress,
 ) -> io::Result<ScanSummary> {
+    let _ = (mode, bin);
     use crate::remote::{enum_remote, hash_remote, parse_ssh_url, probe, resolve_root};
     let (host, path) =
         parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;

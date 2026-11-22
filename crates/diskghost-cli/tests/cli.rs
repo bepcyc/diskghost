@@ -1051,7 +1051,10 @@ fn fake_ssh(d: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn remote_cmd(d: &std::path::Path, args: &[&str]) -> std::process::Output {
+    // The "remote" home is the scratch dir: an agent upload lands in
+    // <scratch>/home/.cache/diskghost, never in the real home.
     Command::new(bin())
+        .env("HOME", d.join("home"))
         .env("DISKGHOST_SSH", d.join("fake-ssh"))
         .env("FAKE_SSH_DOWN", d.join("host-down"))
         .args(args)
@@ -1155,5 +1158,155 @@ fn index_add_rejects_a_malformed_ssh_url() {
         ],
     );
     assert!(!out.status.success());
+    std::fs::remove_dir_all(&d).ok();
+}
+
+// ---- the remote agent (M5) -------------------------------------------------
+
+#[test]
+fn agent_subcommand_speaks_json_lines_on_stdout_and_creates_nothing() {
+    use std::io::Write;
+    let d = scratch("agent-stdio");
+    let root = std::fs::canonicalize(&d).unwrap().join("tree");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.bin"), b"aaaa").unwrap();
+    std::fs::write(root.join("sub/b.bin"), b"bbbb").unwrap();
+    let home = d.join("home");
+    let mut child = Command::new(bin())
+        .arg("agent")
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", d.join("xdg"))
+        .env("XDG_CACHE_HOME", d.join("xdg-cache"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run diskghost agent");
+    let a = root.join("a.bin");
+    let req = format!(
+        "{}\n{}\n{}\nnot json\n{}\n",
+        r#"{"v":1,"op":"hello"}"#,
+        serde_json::json!({"op": "enumerate", "root": root}),
+        serde_json::json!({"op": "hash", "paths": [a, root.join("gone")], "sample": false}),
+        r#"{"op":"stat_fs","root":"/"}"#,
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(req.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let frames: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l:?}: {e}")))
+        .collect();
+    assert_eq!(frames[0]["agent"], "diskghost");
+    assert_eq!(frames[0]["ver"], env!("CARGO_PKG_VERSION"));
+    let files = frames.iter().filter(|f| f.get("f").is_some()).count();
+    assert_eq!(files, 2);
+    let hs: Vec<&serde_json::Value> = frames.iter().filter_map(|f| f.get("h")).collect();
+    assert_eq!(hs.len(), 2);
+    assert!(hs.iter().any(|h| h["err"].is_string()), "{hs:?}");
+    assert!(frames.iter().any(|f| f["error"]["code"] == "bad_request"));
+    assert!(
+        frames.last().unwrap().get("fs").is_some(),
+        "served after an error"
+    );
+    for p in [home, d.join("xdg"), d.join("xdg-cache")] {
+        assert!(!p.exists(), "agent created {p:?}");
+    }
+    std::fs::remove_dir_all(&d).ok();
+}
+
+fn agent_files(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(d.join("home/.cache/diskghost"))
+        .map(|r| r.filter_map(Result::ok).map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn index_add_ssh_uploads_the_agent_into_the_remote_cache_once_and_uses_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+        return;
+    }
+    let d = scratch("index-ssh-agent");
+    fake_ssh(&d);
+    let remote = std::fs::canonicalize(&d).unwrap().join("remote");
+    std::fs::create_dir_all(remote.join("sub")).unwrap();
+    let same: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(remote.join("a.bin"), &same).unwrap();
+    std::fs::write(remote.join("sub/b.bin"), &same).unwrap();
+    let db = d.join("db/index.db");
+    let db_s = db.to_str().unwrap();
+    let url = format!("ssh://fakehost/{}", remote.display());
+
+    let out = remote_cmd(&d, &["index", "--db", db_s, "--json", "add", &url]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(s[0]["transport"], "agent", "{s:#}");
+    assert_eq!(s[0]["algo"], "blake3");
+    assert_eq!(
+        (s[0]["new"].clone(), s[0]["hashed"].clone()),
+        (2.into(), 2.into())
+    );
+    let files = agent_files(&d);
+    assert_eq!(files.len(), 1, "{files:?}");
+    let name = files[0].file_name().unwrap().to_str().unwrap().to_string();
+    let prefix = format!("diskghost-agent-{}-", env!("CARGO_PKG_VERSION"));
+    assert!(name.starts_with(&prefix), "{name}");
+    let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+    assert_eq!(
+        std::fs::read(&files[0]).unwrap(),
+        std::fs::read(bin()).unwrap()
+    );
+    let mtime = std::fs::metadata(&files[0]).unwrap().modified().unwrap();
+
+    // Again: the same file is reused, not uploaded a second time.
+    let out = remote_cmd(&d, &["index", "--db", db_s, "--json", "add", &url]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(s[0]["transport"], "agent");
+    assert_eq!(s[0]["unchanged"], 2);
+    assert_eq!(agent_files(&d), files);
+    assert_eq!(
+        std::fs::metadata(&files[0]).unwrap().modified().unwrap(),
+        mtime
+    );
+
+    // `--agent never`: the shell tier, same location.
+    let out = remote_cmd(
+        &d,
+        &[
+            "index", "--db", db_s, "--json", "add", "--agent", "never", &url,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let n: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(n[0]["transport"], "shell");
+    assert_eq!(n[0]["uuid"], s[0]["uuid"], "one location whichever tier");
+    assert_eq!(n[0]["unchanged"], 2);
+    // The remote files were only read.
+    assert_eq!(std::fs::read(remote.join("a.bin")).unwrap(), same);
     std::fs::remove_dir_all(&d).ok();
 }

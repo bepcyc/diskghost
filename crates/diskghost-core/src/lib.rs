@@ -16,6 +16,9 @@
 //! [`Options`] controls the walk: exclude globs, max depth, follow-symlinks.
 //! Everything is `serde`-serialisable so a CLI, a GUI or an agent can consume it.
 
+pub mod agent;
+#[cfg(test)]
+mod agent_tests;
 pub mod apply;
 #[cfg(test)]
 mod apply_tests;

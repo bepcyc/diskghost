@@ -12,7 +12,8 @@ use std::sync::Mutex;
 use crate::index::{remote_scan_with, scan_with, Index, Probe, ScanSummary, Volume};
 use crate::index_report::{report_with, IndexDupesReport, IndexReportOptions};
 use crate::remote::{
-    ExecOut, RemoteExec, HASH_SCRIPT, PRINTF_FORMAT, PROBE_SCRIPT, RESOLVE_SCRIPT, STAT_SCRIPT,
+    ExecOut, RemoteExec, HASH_SCRIPT, LOCATE_SCRIPT, PRINTF_FORMAT, PROBE_SCRIPT, RESOLVE_SCRIPT,
+    STAT_SCRIPT, UPLOAD_SCRIPT,
 };
 use crate::{Options, Progress};
 
@@ -151,7 +152,25 @@ impl Estate {
 
     /// `index add ssh://…` through a fake host.
     pub(crate) fn add_remote(&self, url: &str, host: &FakeHost) -> io::Result<ScanSummary> {
-        remote_scan_with(&self.idx, url, host, &Progress::default())
+        remote_scan_with(
+            &self.idx,
+            url,
+            host,
+            crate::remote::AgentMode::Never,
+            None,
+            &Progress::default(),
+        )
+    }
+
+    /// `index add ssh://…` through `x`, with the agent tier offered `bin`.
+    pub(crate) fn add_remote_via(
+        &self,
+        url: &str,
+        x: &dyn crate::remote::RemoteExec,
+        mode: crate::remote::AgentMode,
+        bin: Option<&crate::remote::AgentBinary>,
+    ) -> io::Result<ScanSummary> {
+        remote_scan_with(&self.idx, url, x, mode, bin, &Progress::default())
     }
 
     pub(crate) fn report(&self, opts: &IndexReportOptions) -> IndexDupesReport {
@@ -260,6 +279,22 @@ pub(crate) struct FakeHost {
     pub(crate) find_code: AtomicI32,
     pub(crate) calls: Mutex<Vec<Vec<String>>>,
     next_ino: Mutex<u64>,
+    /// `uname -m`; `None`: the probe prints no `arch` line (so the agent
+    /// tier is never tried — the pre-M5 behaviour).
+    pub(crate) arch: Option<String>,
+    /// sshd refuses to run commands (an SFTP-only account): every exec
+    /// ends with ssh's exit 255.
+    pub(crate) no_shell: AtomicBool,
+    /// The upload script fails (disk full, `noexec` home, …).
+    pub(crate) upload_fail: AtomicBool,
+    /// Files the upload wrote, by absolute path (only ever under
+    /// `$HOME/.cache/diskghost/`).
+    pub(crate) cache: Mutex<BTreeMap<String, Vec<u8>>>,
+    /// What an uploaded agent answers `hello`; `None` = a matching agent
+    /// of this build's version.
+    pub(crate) hello: Mutex<Option<String>>,
+    /// stdin of every `exec_stdin`, in call order.
+    pub(crate) inputs: Mutex<Vec<Vec<u8>>>,
 }
 
 impl FakeHost {
@@ -280,6 +315,12 @@ impl FakeHost {
             find_code: AtomicI32::new(0),
             calls: Mutex::new(Vec::new()),
             next_ino: Mutex::new(1000),
+            arch: None,
+            no_shell: AtomicBool::new(false),
+            upload_fail: AtomicBool::new(false),
+            cache: Mutex::new(BTreeMap::new()),
+            hello: Mutex::new(None),
+            inputs: Mutex::new(Vec::new()),
         }
     }
 
@@ -306,6 +347,17 @@ impl FakeHost {
     pub(crate) fn with_stat(mut self, stat: &'static str) -> FakeHost {
         self.stat = stat;
         self
+    }
+
+    /// `uname -m` answers `arch`.
+    pub(crate) fn with_arch(mut self, arch: &str) -> FakeHost {
+        self.arch = Some(arch.to_string());
+        self
+    }
+
+    /// The agent's directory on this host.
+    pub(crate) fn agent_dir(&self) -> String {
+        format!("{}/.cache/diskghost", self.home)
     }
 
     pub(crate) fn with_tools(mut self, tools: &[&'static str]) -> FakeHost {
@@ -433,10 +485,21 @@ impl RemoteExec for FakeHost {
         if self.down.load(Ordering::SeqCst) {
             return fail(255, "ssh: connect to host fake port 22: Connection refused");
         }
+        if self.no_shell.load(Ordering::SeqCst) {
+            return fail(255, "exec request failed on channel 0");
+        }
         let has = |t: &str| self.tools.contains(&t);
         match argv {
+            ["sh", "-c", s, "sh", name] if *s == LOCATE_SCRIPT => {
+                let path = format!("{}/{name}", self.agent_dir());
+                let have = self.cache.lock().unwrap().contains_key(&path);
+                ok(format!("{} {path}\n", if have { "have" } else { "need" }).into_bytes())
+            }
             ["sh", "-c", s] if *s == PROBE_SCRIPT => {
                 let mut o = format!("os {}\n", self.os);
+                if let Some(a) = &self.arch {
+                    o += &format!("arch {a}\n");
+                }
                 for t in ["b3sum", "md5sum", "sha1sum", "find", "stat"] {
                     o += &format!("tool {t} {}\n", if has(t) { "yes" } else { "no" });
                 }
@@ -543,6 +606,58 @@ impl RemoteExec for FakeHost {
                 }
             }
             _ => fail(127, "fake host: unknown command"),
+        }
+    }
+
+    fn exec_stdin(&self, argv: &[&str], input: &[u8]) -> io::Result<ExecOut> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(argv.iter().map(|s| s.to_string()).collect());
+        self.inputs.lock().unwrap().push(input.to_vec());
+        if self.down.load(Ordering::SeqCst) {
+            return fail(255, "ssh: connect to host fake port 22: Connection refused");
+        }
+        if self.no_shell.load(Ordering::SeqCst) {
+            return fail(255, "exec request failed on channel 0");
+        }
+        match argv {
+            ["sh", "-c", s, "sh", name, len] if *s == UPLOAD_SCRIPT => {
+                if self.upload_fail.load(Ordering::SeqCst) {
+                    return fail(1, "cat: write error: No space left on device");
+                }
+                if len.parse::<usize>().ok() != Some(input.len()) {
+                    return fail(4, "short upload");
+                }
+                let path = format!("{}/{name}", self.agent_dir());
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .entry(path.clone())
+                    .or_insert_with(|| input.to_vec());
+                ok(format!("{path}\n").into_bytes())
+            }
+            [path, "agent"] if self.cache.lock().unwrap().contains_key(*path) => {
+                let hello = self.hello.lock().unwrap().clone().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "v": 1, "agent": "diskghost", "ver": env!("CARGO_PKG_VERSION"),
+                        "os": "linux", "arch": "x86_64", "blake3": true
+                    })
+                    .to_string()
+                });
+                let mut o = String::new();
+                for line in String::from_utf8_lossy(input).lines() {
+                    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+                    if v["op"] == "hello" {
+                        o += &hello;
+                    } else {
+                        o += r#"{"error":{"code":"unknown_op","msg":"fake agent"}}"#;
+                    }
+                    o.push('\n');
+                }
+                ok(o.into_bytes())
+            }
+            _ => fail(127, "fake host: no such program"),
         }
     }
 }
