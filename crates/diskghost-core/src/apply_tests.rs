@@ -461,3 +461,141 @@ fn quarantined_files_are_no_copies_in_later_reports_and_plans() {
     let (_, plan) = make(&e, &policy(1));
     assert!(plan.groups.is_empty(), "{plan:#?}");
 }
+
+// ---- quarantine under the scan root -----------------------------------
+
+/// The quarantine target `apply` should pick for `from` under `scan_root`.
+fn target(scan_root: &Path, hash: &str, from: &Path) -> PathBuf {
+    scan_root
+        .join(QUARANTINE_DIR)
+        .join(&hash[..16])
+        .join(format!(
+            "{}.{}",
+            from.file_name().unwrap().to_str().unwrap(),
+            ino(from)
+        ))
+}
+
+/// `content(1)` on A (kept, normal) and at each `rel` inside volume B
+/// (scratch); each folder of `roots` (inside B) added as a scan root.
+fn setup_roots(label: &str, files: &[&str], roots: &[&str]) -> (Estate, PathBuf, Plan) {
+    let e = Estate::new(label);
+    write(&e.loc("A").join("f.bin"), &content(1));
+    for f in files {
+        write(&e.loc("B").join(f), &content(1));
+    }
+    e.add("A");
+    for r in roots {
+        e.add_at(&e.loc("B").join(r));
+    }
+    set_role(&e, "B", Role::Scratch);
+    let (path, plan) = make(&e, &policy(1));
+    (e, path, plan)
+}
+
+#[test]
+fn two_scan_roots_of_one_volume_quarantine_under_their_own_root() {
+    let (e, plan_path, plan) = setup_roots("roots-two", &["x/f.bin", "y/f.bin"], &["x", "y"]);
+    let g = &plan.groups[0];
+    assert_eq!(g.actions.len(), 2, "{plan:#?}");
+    let (fx, fy) = (e.loc("B").join("x/f.bin"), e.loc("B").join("y/f.bin"));
+    let (tx, ty) = (
+        target(&e.loc("B").join("x"), &g.hash, &fx),
+        target(&e.loc("B").join("y"), &g.hash, &fy),
+    );
+    let r = run(&e, &plan_path, false, false);
+    assert_eq!(status_of(&r, &fx), Status::Done, "{r:#?}");
+    assert_eq!(status_of(&r, &fy), Status::Done, "{r:#?}");
+    assert_eq!(std::fs::read(&tx).unwrap(), content(1));
+    assert_eq!(std::fs::read(&ty).unwrap(), content(1));
+    assert!(!qdir(&e, "B").exists(), "never at the mount root");
+    // undo brings both back from their scan roots.
+    let u = undo(&journal_path(&plan_path), false).unwrap();
+    assert_eq!(u.count(Status::Undone), 2, "{u:#?}");
+    assert!(fx.exists() && fy.exists());
+}
+
+#[test]
+fn nested_scan_roots_the_longest_covering_one_wins() {
+    let (e, plan_path, plan) =
+        setup_roots("roots-nested", &["x/f.bin", "x/y/f.bin"], &["x", "x/y"]);
+    let g = &plan.groups[0];
+    assert_eq!(g.actions.len(), 2, "{plan:#?}");
+    let (outer, inner) = (e.loc("B").join("x/f.bin"), e.loc("B").join("x/y/f.bin"));
+    let (to_outer, to_inner) = (
+        target(&e.loc("B").join("x"), &g.hash, &outer),
+        target(&e.loc("B").join("x/y"), &g.hash, &inner),
+    );
+    let r = run(&e, &plan_path, false, false);
+    assert_eq!(status_of(&r, &outer), Status::Done, "{r:#?}");
+    assert_eq!(status_of(&r, &inner), Status::Done, "{r:#?}");
+    assert!(to_outer.is_file(), "{r:#?}");
+    assert!(to_inner.is_file(), "{r:#?}");
+    assert!(!qdir(&e, "B").exists());
+}
+
+#[test]
+fn a_path_no_scan_root_covers_falls_back_to_the_mount_root() {
+    // Scan roots `a` and `ab`; then `ab` is dropped from the index (as an
+    // index from before scan roots were recorded would lack it). `ab/f.bin`
+    // is covered by no scan root — `a` is a string prefix, not a folder one.
+    let (e, plan_path, plan) = setup_roots("roots-fallback", &["ab/f.bin", "a/keep"], &["a", "ab"]);
+    let n = e
+        .idx
+        .conn
+        .execute("DELETE FROM scan_roots WHERE path = 'ab'", [])
+        .unwrap();
+    assert_eq!(n, 1, "the scan root of `ab` was recorded");
+    let g = &plan.groups[0];
+    let from = e.loc("B").join("ab/f.bin");
+    let to = target(&e.loc("B"), &g.hash, &from);
+    let r = run(&e, &plan_path, false, false);
+    assert_eq!(status_of(&r, &from), Status::Done, "{r:#?}");
+    assert!(to.is_file(), "{r:#?}");
+    assert!(!e.loc("B").join("a").join(QUARANTINE_DIR).exists());
+    assert!(!e.loc("B").join("ab").join(QUARANTINE_DIR).exists());
+}
+
+#[test]
+fn an_unwritable_scan_root_is_an_error_never_a_fallback_and_resume_retries() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let (e, plan_path, plan) = setup_roots("roots-perm", &["x/f.bin"], &["x"]);
+    let x = e.loc("B").join("x");
+    let from = x.join("f.bin");
+    let to = target(&x, &plan.groups[0].hash, &from);
+    std::fs::set_permissions(&x, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = run(&e, &plan_path, false, false);
+    std::fs::set_permissions(&x, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(status_of(&r, &from), Status::Error, "{r:#?}");
+    assert!(from.exists());
+    assert!(
+        !qdir(&e, "B").exists(),
+        "no silent fallback to the mount root"
+    );
+    // The error is retried by the next run.
+    let r = run(&e, &plan_path, false, false);
+    assert_eq!(status_of(&r, &from), Status::Done, "{r:#?}");
+    assert!(to.is_file(), "{r:#?}");
+}
+
+#[test]
+fn files_quarantined_under_a_scan_root_are_no_copies_after_its_rescan() {
+    let (e, plan_path, _) = setup_roots("roots-rescan", &["x/f.bin"], &["x"]);
+    let r = run(&e, &plan_path, false, false);
+    assert_eq!(r.count(Status::Done), 1, "{r:#?}");
+    assert!(e.loc("B").join("x").join(QUARANTINE_DIR).is_dir());
+    e.add_at(&e.loc("B").join("x"));
+    let rep = e.report(&Estate::opts());
+    assert!(
+        rep.groups.is_empty(),
+        "quarantine is no copy: {:#?}",
+        rep.groups
+    );
+    let (_, plan) = make(&e, &policy(1));
+    assert!(plan.groups.is_empty(), "{plan:#?}");
+}

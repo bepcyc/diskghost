@@ -636,11 +636,19 @@ fn index_add_then_status_json() {
     assert_eq!(loc["role"], "master");
     assert_eq!(loc["files"], 3);
     assert_eq!(loc["bytes"], 15);
+    let canon = std::fs::canonicalize(&tree).unwrap();
+    assert_eq!(
+        loc["roots"],
+        serde_json::json!([canon.to_str().unwrap()]),
+        "{loc:#}"
+    );
 
-    // Human output names the location too.
+    // Human output names the location and its scan root too.
     let out = index_cmd(&db, &["status"]);
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains(&uuid));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&uuid));
+    assert!(text.contains(canon.to_str().unwrap()), "{text}");
 
     // forget removes it from the index (and only from the index).
     let out = index_cmd(&db, &["forget", &uuid]);
@@ -955,10 +963,15 @@ fn apply_dry_run_reports_and_touches_nothing() {
     let v = json_only(&out);
     let o = &v["outcomes"][0];
     assert_eq!(o["status"], "would_quarantine", "{v:#}");
-    assert!(o["to"]
-        .as_str()
-        .unwrap()
-        .contains("/.diskghost-quarantine/"));
+    // Under the folder `index add` was given, never at the volume root
+    // (which may be `/`, unwritable and outside the user's scope).
+    let to = std::path::Path::new(o["to"].as_str().unwrap());
+    assert!(
+        to.starts_with(tree.join(".diskghost-quarantine")),
+        "{} not under {}",
+        to.display(),
+        tree.display()
+    );
     assert!(tree.join("sub/b.bin").exists());
     assert!(!d.join("plan.json.journal.jsonl").exists());
     // Human output too.

@@ -172,6 +172,10 @@ pub struct LocationStatus {
     pub bytes: u64,
     /// Unix seconds of the last scan.
     pub last_seen: i64,
+    /// Folders `index add` was given on this volume (absolute, under the
+    /// current `root`): apply quarantines into the longest one covering
+    /// a file. A root whose folder was later removed may stay listed.
+    pub roots: Vec<PathBuf>,
 }
 
 pub(crate) fn db_err(e: rusqlite::Error) -> io::Error {
@@ -278,6 +282,7 @@ impl Index {
                 files: files.max(0) as u64,
                 bytes: bytes.max(0) as u64,
                 last_seen,
+                roots: Vec::new(),
             });
         }
         Ok(out)
@@ -1206,7 +1211,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         // Version 2 records whether a location's filesystem is copy-on-write.
         let cow: Option<i64> = idx
             .conn
@@ -1230,6 +1235,94 @@ mod tests {
         drop(idx);
         let idx = open_db(&d);
         assert_eq!(row_count(&idx), 1);
+    }
+
+    #[test]
+    fn a_version_2_index_migrates_to_3_keeping_its_rows() {
+        let d = tmpdir("migrate-v2");
+        let path = d.join("db/index.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(MIGRATIONS[0]).unwrap();
+            c.execute_batch(MIGRATIONS[1]).unwrap();
+            c.pragma_update(None, "user_version", 2).unwrap();
+            c.execute("UPDATE meta SET value = 2 WHERE key = 'schema_version'", [])
+                .unwrap();
+        }
+        {
+            let idx = Index::open(&path).unwrap();
+            insert_location(&idx, "old-vol", "/nowhere-old");
+        }
+        // Downgrade the version mark again to replay v2 → v3 on real rows.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("DROP TABLE IF EXISTS scan_roots").unwrap();
+            c.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let idx = Index::open(&path).unwrap();
+        let v: i64 = idx
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+        let mv: i64 = idx
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mv, 3);
+        assert_eq!(row_count(&idx), 3, "files survive the migration");
+        let st = idx.status().unwrap();
+        assert_eq!(st.len(), 1);
+        assert!(st[0].roots.is_empty(), "an old index knows no scan roots");
+        let n: i64 = idx
+            .conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn scans_record_their_roots_listed_by_status_and_dropped_by_forget() {
+        let d = tmpdir("scanroots");
+        write(&d.join("t/a/x"), b"x");
+        write(&d.join("t/b/y"), b"y");
+        let idx = open_db(&d);
+        let s = scan(&idx, &d.join("t/a")).0;
+        scan(&idx, &d.join("t/b")).0;
+        // Re-adding a root records it once; a non-canonical spelling too.
+        scan(&idx, &d.join("t/b/../a")).0;
+        let st = idx.status().unwrap();
+        let l = st.iter().find(|l| l.uuid == s.uuid).unwrap();
+        let mut roots = l.roots.clone();
+        roots.sort();
+        assert_eq!(roots, vec![d.join("t/a"), d.join("t/b")]);
+        // Stored relative to the mountpoint, like file paths.
+        let stored: Vec<String> = {
+            let mut q = idx
+                .conn
+                .prepare("SELECT path FROM scan_roots ORDER BY path")
+                .unwrap();
+            q.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        for p in &stored {
+            assert!(!p.starts_with('/'), "{p}");
+            assert_eq!(s.root.join(p).parent(), Some(d.join("t").as_path()));
+        }
+        assert_eq!(stored.len(), 2);
+        assert!(idx.forget(&s.uuid).unwrap());
+        let n: i64 = idx
+            .conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "forget cascades to scan roots");
     }
 
     #[test]

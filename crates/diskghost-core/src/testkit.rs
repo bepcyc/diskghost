@@ -117,7 +117,13 @@ impl Estate {
     }
 
     pub(crate) fn add(&self, name: &str) {
-        let root = self.loc(name);
+        self.add_at(&self.loc(name));
+    }
+
+    /// `index add` of any folder inside the estate — a whole fake volume
+    /// (`loc(name)`) or a subfolder of one (a scan root below its mount).
+    pub(crate) fn add_at(&self, root: &Path) {
+        let root = root.to_path_buf();
         std::fs::create_dir_all(&root).unwrap();
         let s = self
             .with_probe(|p| {
