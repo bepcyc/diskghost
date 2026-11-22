@@ -53,7 +53,12 @@ function adaptToElevation() {
 
 function applyI18n() {
   document.documentElement.lang = lang();
-  document.querySelectorAll("[data-i18n]").forEach((e) => (e.textContent = t(e.dataset.i18n)));
+  document.querySelectorAll("[data-i18n]").forEach((e) => {
+    // Buttons with an icon keep it: icon + label span.
+    if (e.dataset.icon) e.replaceChildren(icon(e.dataset.icon), el("span", { text: t(e.dataset.i18n) }));
+    else e.textContent = t(e.dataset.i18n);
+  });
+  document.querySelectorAll("[data-icon]:not([data-i18n])").forEach((e) => e.replaceChildren(icon(e.dataset.icon)));
   document.querySelectorAll("[data-i18n-ph]").forEach((e) => (e.placeholder = t(e.dataset.i18nPh)));
   document.querySelectorAll("[data-i18n-title]").forEach((e) => (e.title = t(e.dataset.i18nTitle)));
   adaptToElevation();

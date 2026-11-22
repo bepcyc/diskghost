@@ -10,7 +10,7 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   return {
   en: {
-    pathLabel: "Folder path", placeholder: "Paste a folder path, drop folders anywhere, or use Browse…",
+    pathLabel: "Folder path", pathKeys: "Ctrl+L focuses this field · Enter scans", placeholder: "Paste a folder path, drop folders anywhere, or use Browse…",
     browse: "Browse…", scan: "Scan", dupes: "Find duplicates", settings: "Settings", refresh: "Refresh",
     drives: "Drives", scanAll: "Scan all drives", scans: "Scans", clearDone: "Clear finished",
     dropHint: "Drop folders anywhere — each one is queued as its own scan.",
@@ -137,7 +137,7 @@
     pre_logs: "Log files", pre_winsys: "Windows system files", pre_macos: "macOS system files",
   },
   de: {
-    pathLabel: "Ordnerpfad", placeholder: "Ordnerpfad einfügen, Ordner irgendwo hinziehen oder Durchsuchen…",
+    pathLabel: "Ordnerpfad", pathKeys: "Strg+L springt hierher · Enter scannt", placeholder: "Ordnerpfad einfügen, Ordner irgendwo hinziehen oder Durchsuchen…",
     browse: "Durchsuchen…", scan: "Scannen", dupes: "Duplikate finden", settings: "Einstellungen", refresh: "Aktualisieren",
     drives: "Laufwerke", scanAll: "Alle Laufwerke scannen", scans: "Scans", clearDone: "Fertige entfernen",
     dropHint: "Ordner irgendwo hinziehen — jeder wird als eigener Scan eingereiht.",

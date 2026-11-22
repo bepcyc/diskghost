@@ -544,3 +544,9 @@ button.chip { cursor: pointer; }
 .addrow input { flex: 1; }
 
 .fd.bad { color: var(--danger); }
+
+/* icons (icons.js): one 16 px line set in currentColor */
+.ic { width: 1rem; height: 1rem; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; vertical-align: -0.1875rem; }
+button:has(> .ic) { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-xs); }
+.wordmark { font-family: var(--font-mono); font-weight: var(--weight-figure); letter-spacing: -0.02em; }
+.brand .ver { margin-left: var(--space-xs); }
