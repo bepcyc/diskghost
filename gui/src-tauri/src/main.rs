@@ -1171,26 +1171,44 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn every_local_filesystem_is_a_drive_root_first_then_by_mount_point() {
-        let got = drive_list(&[
-            mount(1, "/", "btrfs"),
-            mount(5, "/mnt/fast", "xfs"),
-            mount(2, "/d/models2", "ext4"),
-            mount(3, "/run/media/u/stick", "exfat"),
-            mount(4, "/media/u/games", "ntfs3"),
-            mount(6, "/home", "xfs"),
-        ]);
-        let want: Vec<(PathBuf, String, &str)> = [
-            ("/", "btrfs", "fixed"),
-            ("/d/models2", "ext4", "other"),
-            ("/home", "xfs", "other"),
-            ("/media/u/games", "ntfs3", "removable"),
-            ("/mnt/fast", "xfs", "other"),
-            ("/run/media/u/stick", "exfat", "removable"),
+        let ssd = |_: &Path| false;
+        let got = drive_list(
+            &[
+                mount(1, "/", "btrfs"),
+                mount(5, "/mnt/fast", "xfs"),
+                mount(2, "/d/models2", "ext4"),
+                mount(3, "/run/media/u/stick", "exfat"),
+                mount(4, "/media/u/games", "ntfs3"),
+                mount(6, "/home", "xfs"),
+            ],
+            &ssd,
+        );
+        let want: Vec<(PathBuf, String, &str, &str)> = [
+            ("/", "btrfs", "fixed", "ssd"),
+            ("/d/models2", "ext4", "other", "ssd"),
+            ("/home", "xfs", "other", "ssd"),
+            ("/media/u/games", "ntfs3", "removable", "ssd"),
+            ("/mnt/fast", "xfs", "other", "ssd"),
+            ("/run/media/u/stick", "exfat", "removable", "ssd"),
         ]
         .into_iter()
-        .map(|(p, f, k)| (PathBuf::from(p), f.to_string(), k))
+        .map(|(p, f, k, m)| (PathBuf::from(p), f.to_string(), k, m))
         .collect();
         assert_eq!(got, want);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spinning_mount_is_an_hdd_drive() {
+        // The media label follows the drive's own rotational flag, not its
+        // mount point or filesystem: the injected probe names /data spinning.
+        let rot = |p: &Path| p == Path::new("/data");
+        let got = drive_list(
+            &[mount(1, "/", "ext4"), mount(2, "/data", "ext4")],
+            &rot,
+        );
+        assert_eq!(got[1], (PathBuf::from("/data"), "ext4".into(), "other", "hdd"));
+        assert_eq!(got[0].3, "ssd");
     }
 
     #[cfg(unix)]
@@ -1198,12 +1216,16 @@ mod tests {
     fn the_root_is_a_drive_even_when_the_table_does_not_name_it() {
         // btrfs installs mount a subvolume (`/@`) at `/`: its mountinfo root
         // is not `/`, so `local_mounts` drops it — `/` must stay listed.
-        let got = drive_list(&[mount(2, "/d/models2", "ext4")]);
-        assert_eq!(got[0], (PathBuf::from("/"), String::new(), "fixed"));
+        let ssd = |_: &Path| false;
+        let got = drive_list(&[mount(2, "/d/models2", "ext4")], &ssd);
+        assert_eq!(
+            got[0],
+            (PathBuf::from("/"), String::new(), "fixed", "ssd")
+        );
         assert_eq!(got.len(), 2);
         assert_eq!(
-            drive_list(&[]),
-            [(PathBuf::from("/"), String::new(), "fixed")]
+            drive_list(&[], &ssd),
+            [(PathBuf::from("/"), String::new(), "fixed", "ssd")]
         );
     }
 }

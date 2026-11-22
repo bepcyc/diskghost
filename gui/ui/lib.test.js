@@ -447,3 +447,46 @@ test("each remote host is a drive of its own for scheduling", () => {
   ];
   assert.deepEqual(lib.jobsToStart(jobs, 2).map((j) => j.id), [3]);
 });
+
+test("drive rows group by media for the tree view", () => {
+  const ds = [
+    { path: "/", media: "ssd", kind: "fixed" },
+    { path: "/media/farm", media: "hdd", kind: "removable" },
+    { path: "/media/x9", media: "ssd", kind: "removable" },
+    { path: "ssh://nas//data", media: "remote", kind: "network" },
+  ];
+  assert.deepEqual(
+    lib.groupDrives(ds).map((g) => [g.key, g.items.length]),
+    [
+      ["ssd", 2],
+      ["hdd", 1],
+      ["remote", 1],
+    ],
+  );
+  // Empty groups are dropped; unknown media lands in "other", last.
+  assert.deepEqual(lib.groupDrives([{ path: "/x" }]).map((g) => g.key), ["other"]);
+  assert.deepEqual(lib.groupDrives([]), []);
+});
+
+test("remembered remotes become drive rows under the ssh group", () => {
+  const r = lib.remoteDrive({ url: "ssh://nas//storage" });
+  assert.equal(r.media, "remote");
+  assert.equal(r.kind, "network");
+  assert.equal(r.path, "ssh://nas//storage");
+  assert.equal(r.label, "nas");
+  // The fallback media label covers drives with no backend report.
+  assert.equal(lib.driveMedia({ media: "hdd" }), "hdd");
+  assert.equal(lib.driveMedia({ kind: "network" }), "remote");
+  assert.equal(lib.driveMedia({}), "other");
+});
+
+test("settings keep the drives view and remembered remotes", () => {
+  const s = lib.mergeSettings({
+    drive_view: "tree",
+    remotes: [{ url: "ssh://a//x", label: "a" }, { url: 5 }, "no"],
+  });
+  assert.equal(s.drive_view, "tree");
+  assert.deepEqual(s.remotes, [{ url: "ssh://a//x", label: "a" }]);
+  assert.equal(lib.mergeSettings({}).drive_view, "flat");
+  assert.deepEqual(lib.mergeSettings({}).remotes, []);
+});
