@@ -694,18 +694,9 @@ fn algo_class(p: &Phys) -> Option<HashAlgo> {
 /// The filesystem part of a location key: a bind mount or subvolume
 /// (`UUID:/sub`) shares inodes with the whole filesystem (`UUID`).
 pub(crate) fn filesystem_of(uuid: &str) -> &str {
-    if let Some(rest) = uuid.strip_prefix("ssh://") {
-        // `ssh://host/<fs id>:<root>` → `ssh://host/<fs id>`; without an fs
-        // id (`ssh://host:<root>`) the location is its own filesystem.
-        return match rest.split_once('/') {
-            Some((host, tail)) if !host.contains(':') => match tail.split_once(':') {
-                Some((id, _)) => &uuid[..6 + host.len() + 1 + id.len()],
-                None => uuid,
-            },
-            _ => uuid,
-        };
-    }
-    if uuid.starts_with("dev:") {
+    // A remote uuid is already one filesystem: `ssh://host/<fs id>`, or
+    // `ssh://host:<folder>` when the host told no usable fs id.
+    if uuid.starts_with("ssh://") || uuid.starts_with("dev:") {
         uuid
     } else {
         uuid.split_once(':').map_or(uuid, |(fs, _)| fs)

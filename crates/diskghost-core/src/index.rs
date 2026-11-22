@@ -41,9 +41,14 @@
 //! ```
 //!
 //! A **remote location** (`index add ssh://host/path`, see [`crate::remote`])
-//! has `host = 'ssh://host'`, uuid `ssh://host/<fs id>:<root>` (or
-//! `ssh://host:<root>` when the host tells no filesystem id), `root` = the
-//! remote folder, paths relative to it, `dev` 0. Its files are listed and
+//! is, like a local one, a filesystem: `host = 'ssh://host'`, uuid
+//! `ssh://host/<fs id>`, `root` = the remote mountpoint of that filesystem,
+//! paths relative to it, the folder given recorded in `scan_roots` relative
+//! to the mountpoint, `dev` 0. So two folders of one remote filesystem share
+//! one row, and a rescan of one folder drops vanished rows only below it.
+//! When the host tells no fs id, or no mountpoint that is a path prefix of
+//! the folder, the uuid is `ssh://host:<folder>`, `root` = the folder, scan
+//! root `''`. Its files are listed and
 //! hashed by the remote host; this machine never reads them, and no local
 //! check ever looks at its `root` (that path may exist here too, holding
 //! other files). Its `full` digest is BLAKE3 when the host has `b3sum`, else
@@ -761,11 +766,31 @@ pub(crate) fn remote_scan_with(
     // unreachable or unusable host records nothing.
     let caps = probe(x)?;
     let rr = resolve_root(x, &caps, &path)?;
-    let uuid = match &rr.fsid {
-        Some(id) => format!("ssh://{host}/{id}:{}", rr.root),
-        None => format!("ssh://{host}:{}", rr.root),
+    // A filesystem with its mountpoint, like a local volume; else the
+    // folder alone. `base` is the `root` column, `prefix` the scan root.
+    let (uuid, base, prefix) = match (&rr.fsid, &rr.mount) {
+        (Some(id), Some(mount)) => {
+            // resolve_root checked that `mount` is a path prefix of root.
+            let prefix = rr
+                .root
+                .strip_prefix(mount.as_str())
+                .unwrap_or("")
+                .trim_start_matches('/')
+                .to_string();
+            (format!("ssh://{host}/{id}"), mount.clone(), prefix)
+        }
+        _ => (
+            format!("ssh://{host}:{}", rr.root),
+            rr.root.clone(),
+            String::new(),
+        ),
     };
-    let listing = enum_remote(x, &caps, &rr.root)?;
+    let mut listing = enum_remote(x, &caps, &rr.root)?;
+    if !prefix.is_empty() {
+        for f in &mut listing.files {
+            f.path = format!("{prefix}/{}", f.path);
+        }
+    }
     let cow = rr.fstype.as_deref().map(|t| {
         matches!(
             t,
@@ -774,7 +799,7 @@ pub(crate) fn remote_scan_with(
     });
     let mut sum = ScanSummary {
         uuid: uuid.clone(),
-        root: PathBuf::from(&rr.root),
+        root: PathBuf::from(&base),
         skipped: listing.skipped,
         algo: Some(caps.hash.as_str().to_string()),
         ..ScanSummary::default()
@@ -787,13 +812,14 @@ pub(crate) fn remote_scan_with(
              VALUES (?1, ?2, ?3, 1, ?4, ?5) \
              ON CONFLICT(uuid) DO UPDATE SET host = excluded.host, root = excluded.root, \
              online = 1, last_seen = excluded.last_seen, cow = excluded.cow RETURNING id",
-            params![uuid, format!("ssh://{host}"), rr.root, now_secs(), cow],
+            params![uuid, format!("ssh://{host}"), base, now_secs(), cow],
             |r| r.get(0),
         )
         .map_err(db_err)?;
+    // The folder given, relative to the mountpoint (as for a local volume).
     tx.execute(
-        "INSERT OR IGNORE INTO scan_roots (location_id, path) VALUES (?1, '')",
-        [loc],
+        "INSERT OR IGNORE INTO scan_roots (location_id, path) VALUES (?1, ?2)",
+        params![loc, prefix],
     )
     .map_err(db_err)?;
     let gen: i64 = tx
@@ -858,7 +884,7 @@ pub(crate) fn remote_scan_with(
     }
     sum.complete = listing.complete && !progress.cancelled();
     if sum.complete {
-        sum.vanished = drop_vanished(&tx, loc, gen, "", &[]).map_err(db_err)? as u64;
+        sum.vanished = drop_vanished(&tx, loc, gen, &prefix, &[]).map_err(db_err)? as u64;
     }
     tx.commit().map_err(db_err)?;
     if progress.cancelled() {
@@ -884,13 +910,7 @@ pub(crate) fn remote_scan_with(
     };
     let abs: Vec<String> = pending
         .iter()
-        .map(|(p, ..)| {
-            if rr.root == "/" {
-                format!("/{p}")
-            } else {
-                format!("{}/{p}", rr.root)
-            }
-        })
+        .map(|(p, ..)| crate::remote::join_remote(&base, p))
         .collect();
     progress.enter(
         phase::HASH,

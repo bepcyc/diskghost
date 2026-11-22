@@ -1082,8 +1082,12 @@ fn index_add_ssh_status_and_dupes_over_a_stand_in_ssh() {
     let added: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let s = &added[0];
     let uuid = s["uuid"].as_str().unwrap().to_string();
-    assert!(uuid.starts_with("ssh://fakehost/"), "{uuid}");
-    assert!(uuid.ends_with(&format!(":{}", remote.display())), "{uuid}");
+    // One location per remote filesystem: `ssh://host/<fs id>`, no folder.
+    let fsid = uuid.strip_prefix("ssh://fakehost/").unwrap_or("");
+    assert!(
+        !fsid.is_empty() && fsid.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{uuid}"
+    );
     assert_eq!(s["new"], 3);
     assert_eq!(s["hashed"], 2);
     assert!(remote.join("a.bin").exists() && remote.join("sub/b.bin").exists());
@@ -1096,6 +1100,9 @@ fn index_add_ssh_status_and_dupes_over_a_stand_in_ssh() {
     );
     let st: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(st[0]["host"], "ssh://fakehost");
+    // `root` is the remote mountpoint: a path prefix of the folder given.
+    let root = std::path::PathBuf::from(st[0]["root"].as_str().unwrap());
+    assert!(remote.starts_with(&root), "{root:?} vs {remote:?}");
     assert_eq!(st[0]["online"], true);
     assert_eq!(st[0]["files"], 3);
 

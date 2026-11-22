@@ -20,7 +20,20 @@
 //!    three hash tools is unusable, and the error names what was probed.
 //! 2. [`resolve_root`] (one call): `cd` + `pwd -P` canonicalises the root;
 //!    GNU `stat -f -c '%i %T'` gives the filesystem id and type (BSD: the
-//!    device number of the root, type unknown).
+//!    device number of the root, type unknown); GNU `stat -c %m` gives the
+//!    filesystem's mountpoint (BSD, or when that fails: the last field of
+//!    `df -P .`).
+//!
+//! # The location
+//!
+//! Like a local volume, a remote location is a *filesystem*, not a folder:
+//! uuid `ssh://host/<fs id>`, `root` = the remote mountpoint, file paths
+//! relative to it, and the folder given recorded as a scan root relative to
+//! the mountpoint (`''` = the mountpoint itself). Two folders of one remote
+//! filesystem fill one location, and a rescan of one folder only drops
+//! vanished rows below that folder. When the host tells no fs id, or no
+//! mountpoint that is a path prefix of the folder, the fs id is not used:
+//! the uuid is `ssh://host:<folder>`, `root` = the folder, scan root `''`.
 //! 3. [`enum_remote`]: GNU `find ROOT -xdev -type f -printf
 //!    '%s\t%T@\t%i\t%p\0'` — one call for the whole tree. Without `-printf`:
 //!    `find ROOT -xdev -type f -print0`, then `stat` in batches of
@@ -248,13 +261,20 @@ if stat -c %s / >/dev/null 2>&1; then echo "stat gnu"; elif stat -f %z / >/dev/n
 "#;
 
 /// `$1` = root as given, `$2` = stat flavor. Prints the canonical root,
-/// then `<fs id> <fs type>` (GNU), `<device>` (BSD) or an empty line.
+/// then `<fs id> <fs type>` (GNU), `<device>` (BSD) or an empty line, then
+/// `mount <mountpoint>` (GNU `stat -c %m`) or `df <last line of df -P .>`.
 pub const RESOLVE_SCRIPT: &str = r#"cd -- "$1" || exit 3
 pwd -P
 case "$2" in
   gnu) stat -f -c '%i %T' . 2>/dev/null || echo ;;
   bsd) stat -f '%d' . 2>/dev/null || echo ;;
   *) echo ;;
+esac
+mp=
+if [ "$2" = gnu ]; then mp=$(stat -c %m . 2>/dev/null) || mp=; fi
+case "$mp" in
+  /*) echo "mount $mp" ;;
+  *) echo "df $(df -P . 2>/dev/null | tail -n 1)" ;;
 esac
 "#;
 
@@ -377,7 +397,8 @@ pub struct RemoteRoot {
     pub fsid: Option<String>,
     /// GNU `stat -f %T` (`ext2/ext3`, `btrfs`, …).
     pub fstype: Option<String>,
-    /// The mountpoint of the root's filesystem.
+    /// The mountpoint of the root's filesystem; `None` when the host told
+    /// none, or one that is not a path prefix of `root`.
     pub mount: Option<String>,
 }
 
@@ -415,12 +436,37 @@ pub fn resolve_root(x: &dyn RemoteExec, caps: &Capabilities, path: &str) -> io::
         StatFlavor::Bsd => (id.map(|d| format!("dev{d}")), None),
         StatFlavor::None => (None, None),
     };
+    let mount = lines
+        .next()
+        .and_then(|l| match l.split_once(' ') {
+            Some(("mount", m)) => Some(m.to_string()),
+            // `df -P`: the mountpoint is the last field (a mountpoint with
+            // a space fails the prefix check below).
+            Some(("df", d)) => d.split_whitespace().last().map(str::to_string),
+            _ => None,
+        })
+        .filter(|m| is_under(&root, m));
     Ok(RemoteRoot {
         root,
         fsid,
         fstype,
-        mount: None,
+        mount,
     })
+}
+
+/// Whether `path` is `mount` or below it (whole path components).
+fn is_under(path: &str, mount: &str) -> bool {
+    mount.starts_with('/')
+        && (mount == "/" || path == mount || path.starts_with(&format!("{mount}/")))
+}
+
+/// `rel` (relative, `''` = the base itself) joined to the absolute `base`.
+pub fn join_remote(base: &str, rel: &str) -> String {
+    match (base, rel) {
+        (b, "") => b.to_string(),
+        ("/", r) => format!("/{r}"),
+        (b, r) => format!("{b}/{r}"),
+    }
 }
 
 /// One remote file, path relative to the root.

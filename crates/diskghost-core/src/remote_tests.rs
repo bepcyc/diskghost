@@ -15,7 +15,7 @@ use crate::testkit::*;
 use crate::Progress;
 
 const URL: &str = "ssh://adroid//storage";
-const UUID: &str = "ssh://adroid/a1b2c3d4:/storage";
+const UUID: &str = "ssh://adroid/a1b2c3d4";
 const T0: u64 = 1_700_000_000_123_456_789;
 
 fn caps(x: &FakeHost) -> Capabilities {
@@ -548,21 +548,24 @@ fn index_add_ssh_records_a_remote_location_and_hashes_collisions_there() {
     h.put("/storage/u.bin", b"unique", T0);
     let s = e.add_remote(URL, &h).unwrap();
     assert_eq!(s.uuid, UUID);
-    assert_eq!(s.root, PathBuf::from("/storage"));
+    // The fake filesystem is mounted at `/`: root = the mountpoint, paths
+    // relative to it, the folder a scan root.
+    assert_eq!(s.root, PathBuf::from("/"));
     assert_eq!((s.seen, s.new, s.hashed), (3, 3, Some(2)));
     assert_eq!(s.algo.as_deref(), Some("blake3"));
     assert!(s.complete);
     let (host, root, cow) = loc_row(&e, UUID);
     assert_eq!(
         (host.as_str(), root.as_str(), cow),
-        ("ssh://adroid", "/storage", Some(0))
+        ("ssh://adroid", "/", Some(0))
     );
+    assert_eq!(scan_roots_of(&e, UUID), ["storage"]);
     let rows = remote_rows(&e, UUID);
     let b3 = blake3::hash(&content(1)).as_bytes().to_vec();
     assert_eq!(
         rows[0],
         (
-            "a.bin".into(),
+            "storage/a.bin".into(),
             BIG as i64,
             Some(b3.clone()),
             "blake3".into()
@@ -728,18 +731,15 @@ fn a_remote_row_never_takes_a_hash_from_a_local_file_at_the_same_path() {
 
 #[test]
 fn a_remote_location_is_its_own_device_per_filesystem() {
+    use crate::index_report::filesystem_of;
+    assert_eq!(filesystem_of("ssh://adroid/a1b2"), "ssh://adroid/a1b2");
+    assert_eq!(filesystem_of("ssh://adroid/dev66"), "ssh://adroid/dev66");
     assert_eq!(
-        crate::index_report::filesystem_of("ssh://adroid/a1b2:/storage"),
-        "ssh://adroid/a1b2"
-    );
-    assert_eq!(
-        crate::index_report::filesystem_of("ssh://adroid:/storage"),
+        filesystem_of("ssh://adroid:/storage"),
         "ssh://adroid:/storage"
     );
-    assert_ne!(
-        crate::index_report::filesystem_of("ssh://a/1:/x"),
-        crate::index_report::filesystem_of("ssh://b/1:/x")
-    );
+    assert_eq!(filesystem_of("ssh://adroid:/a:b"), "ssh://adroid:/a:b");
+    assert_ne!(filesystem_of("ssh://a/1"), filesystem_of("ssh://b/1"));
 }
 
 fn scan_roots_of(e: &Estate, uuid: &str) -> Vec<String> {
