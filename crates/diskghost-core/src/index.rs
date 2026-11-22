@@ -1293,9 +1293,9 @@ mod tests {
         write(&d.join("t/b/y"), b"y");
         let idx = open_db(&d);
         let s = scan(&idx, &d.join("t/a")).0;
-        scan(&idx, &d.join("t/b")).0;
+        scan(&idx, &d.join("t/b"));
         // Re-adding a root records it once; a non-canonical spelling too.
-        scan(&idx, &d.join("t/b/../a")).0;
+        scan(&idx, &d.join("t/b/../a"));
         let st = idx.status().unwrap();
         let l = st.iter().find(|l| l.uuid == s.uuid).unwrap();
         let mut roots = l.roots.clone();
