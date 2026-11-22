@@ -1079,4 +1079,19 @@ mod tests {
             assert!(devs.insert(e.dev), "device listed twice: {e:?}");
         }
     }
+
+    /// Threads follow the disk, not a constant: the caller's `--threads`
+    /// always wins; otherwise a spinning drive gets a small reader pool
+    /// and anything else the usual default.
+    #[test]
+    fn walk_threads_adapt_to_the_disk() {
+        assert_eq!(pick_threads(Some(7), true), 7);
+        assert_eq!(pick_threads(Some(7), false), 7);
+        assert_eq!(pick_threads(Some(0), true), 1);
+        assert_eq!(
+            pick_threads(None, true),
+            crate::rotational::ROTATIONAL_SCAN_THREADS
+        );
+        assert_eq!(pick_threads(None, false), default_threads());
+    }
 }

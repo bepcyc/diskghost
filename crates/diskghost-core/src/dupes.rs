@@ -1142,4 +1142,32 @@ mod tests {
         assert!(r.is_err());
         std::fs::remove_dir_all(&d).ok();
     }
+
+    /// A spinning disk dictates the full-hash phase: a small reader pool,
+    /// not the machine-wide parallel storm an SSD can take.
+    #[test]
+    fn a_rotational_root_gets_a_small_reader_pool() {
+        assert_eq!(
+            full_hash_workers(true),
+            Some(crate::rotational::ROTATIONAL_HASH_THREADS)
+        );
+        assert_eq!(full_hash_workers(false), None);
+    }
+
+    /// The read order on a spinning disk is the path order: files written
+    /// together sit together, the cheap stand-in for physical order (no
+    /// FIEMAP) — the same rule the index batches follow.
+    #[test]
+    fn rotational_reads_follow_path_order() {
+        let mk = |p: &str| Cand {
+            path: PathBuf::from(p),
+            size: 1,
+            modified: 0,
+            known: None,
+        };
+        let cands = vec![mk("b/2"), mk("a/1"), mk("c/3")];
+        let mut need = vec![0, 1, 2];
+        order_for_seeks(&mut need, &cands);
+        assert_eq!(need, vec![1, 0, 2]);
+    }
 }
