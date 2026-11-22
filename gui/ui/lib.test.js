@@ -422,3 +422,28 @@ test("no emoji left in UI strings (icons come from icons.js)", () => {
     }
   }
 });
+
+test("crumbs of a remote ssh:// scan stay remote and reach its root", () => {
+  assert.deepEqual(lib.crumbs("ssh://nas//storage/sub"), [
+    { label: "nas:/", target: "ssh://nas//" },
+    { label: "storage", target: "ssh://nas//storage" },
+    { label: "sub", target: "ssh://nas//storage/sub" },
+  ]);
+  assert.deepEqual(lib.crumbs("ssh://u@nas//"), [{ label: "u@nas:/", target: "ssh://u@nas//" }]);
+  // Up from a remote folder is its remote parent, inside the scan.
+  const root = "ssh://nas//storage";
+  assert.equal(lib.parentPath("ssh://nas//storage/sub"), root);
+  assert.ok(lib.isUnder(lib.parentPath("ssh://nas//storage/sub"), root));
+  assert.ok(!lib.isUnder(lib.parentPath(root), root));
+});
+
+test("each remote host is a drive of its own for scheduling", () => {
+  assert.equal(lib.driveKey("ssh://nas//storage"), "ssh://nas");
+  assert.equal(lib.driveKey("ssh://U@NAS//x"), "ssh://u@nas");
+  const jobs = [
+    { id: 1, state: "running", root: "/" },
+    { id: 2, state: "queued", root: "/home" },
+    { id: 3, state: "queued", root: "ssh://nas//storage" },
+  ];
+  assert.deepEqual(lib.jobsToStart(jobs, 2).map((j) => j.id), [3]);
+});
