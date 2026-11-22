@@ -387,7 +387,7 @@ async function loadDrives() {
   } catch (e) {
     status(`${t("drivesFailed")} ${errText(e)}`, true);
   }
-  drives = [...local, ...settings.remotes.map(lib.remoteDrive)];
+  drives = [...local, ...settings.remotes.map(remoteDrive)];
   renderDrives();
   if (!active()) renderMain();
 }
@@ -396,7 +396,7 @@ const kindLabel = (k) => t({ fixed: "kindFixed", removable: "kindRemovable", net
 // Row and group icons follow the media type (ssd chip, hdd platter,
 // remote host); a removable drive keeps its usb plug.
 const mediaIcon = (m) => ({ ssd: "ssd", hdd: "hdd", remote: "network" }[m] || "drive");
-const driveIcon = (d) => (d.media ? mediaIcon(lib.driveMedia(d)) : { removable: "usb", network: "network" }[d.kind] || "drive");
+const driveIcon = (d) => (d.media ? mediaIcon(driveMedia(d)) : { removable: "usb", network: "network" }[d.kind] || "drive");
 const driveName = (d) => (d.label && d.label !== baseName(d.path) ? `${d.path.replace(/\\$/, "")} ${d.label}` : d.path);
 
 function driveTip(d) {
@@ -423,7 +423,7 @@ function renderDrives() {
   const box = $("drives");
   if (settings.drive_view === "tree") {
     const out = [];
-    for (const g of lib.groupDrives(drives)) {
+    for (const g of groupDrives(drives)) {
       out.push(
         el("div", { class: "drive-group", role: "heading", "aria-level": "3" },
           icon(mediaIcon(g.key)),

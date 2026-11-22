@@ -490,3 +490,14 @@ test("settings keep the drives view and remembered remotes", () => {
   assert.equal(lib.mergeSettings({}).drive_view, "flat");
   assert.deepEqual(lib.mergeSettings({}).remotes, []);
 });
+
+// In the browser lib.js exports bare globals (Object.assign on the global
+// object) — there is no `lib` namespace. app.js must call the helpers
+// unqualified, like it already does for human()/mergeSettings().
+test("app.js uses the lib helpers as bare globals", () => {
+  const fs = require("fs");
+  const src = fs.readFileSync(__dirname + "/app.js", "utf8");
+  assert.equal(/\blib\.[a-zA-Z_$]+\(/.test(src), false, "app.js references lib.<name>( but lib is not a browser global");
+  for (const name of ["remoteDrive", "driveMedia", "groupDrives"])
+    assert.equal(typeof lib[name], "function", `${name} must be exported`);
+});
