@@ -121,7 +121,7 @@ impl Role {
 
 /// The persistent index: an open SQLite database.
 pub struct Index {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 /// What one [`index_scan`] did.
@@ -520,7 +520,36 @@ pub fn index_scan(
     opts: &Options,
     progress: &Progress,
 ) -> io::Result<ScanSummary> {
-    scan_observed(idx, root, opts, progress, &|_| {})
+    scan_with(idx, root, opts, progress, &Probe::REAL)
+}
+
+/// Everything the index asks the machine, in one place — the seam tests use
+/// to give two folders of one disk two volume identities, take a volume
+/// offline, or pretend a disk spins.
+pub(crate) struct Probe<'a> {
+    /// The volume holding a folder (see [`volume_uuid`]).
+    pub(crate) volume: &'a dyn Fn(&Path) -> io::Result<Volume>,
+    /// Whether a location (last known root, uuid) is reachable now.
+    pub(crate) online: &'a dyn Fn(&Path, &str) -> bool,
+    /// Whether a volume's root sits on a copy-on-write filesystem.
+    pub(crate) cow: &'a dyn Fn(&Path) -> bool,
+    /// Whether a volume's root sits on a spinning disk.
+    pub(crate) rotational: &'a dyn Fn(&Path) -> bool,
+    /// Told every file whose content is read.
+    pub(crate) on_read: &'a (dyn Fn(&Path) + Sync),
+}
+
+fn no_read(_: &Path) {}
+
+impl Probe<'static> {
+    /// The machine itself.
+    pub(crate) const REAL: Probe<'static> = Probe {
+        volume: &volume,
+        online: &is_online,
+        cow: &is_cow_fs,
+        rotational: &crate::rotational::is_rotational,
+        on_read: &no_read,
+    };
 }
 
 /// A file as `stat` sees it, in the index's terms.
@@ -554,12 +583,28 @@ fn stat_of(meta: &std::fs::Metadata) -> Stat {
 
 /// [`index_scan`] with `on_read` called for every file whose content is
 /// read — the seam that lets tests prove what is (not) re-read.
+#[cfg(test)]
 fn scan_observed(
     idx: &Index,
     root: &Path,
     opts: &Options,
     progress: &Progress,
     on_read: &(dyn Fn(&Path) + Sync),
+) -> io::Result<ScanSummary> {
+    let probe = Probe {
+        on_read,
+        ..Probe::REAL
+    };
+    scan_with(idx, root, opts, progress, &probe)
+}
+
+/// [`index_scan`] asking `probe` instead of the machine.
+pub(crate) fn scan_with(
+    idx: &Index,
+    root: &Path,
+    opts: &Options,
+    progress: &Progress,
+    probe: &Probe,
 ) -> io::Result<ScanSummary> {
     let root = std::fs::canonicalize(root)?;
     let root_meta = std::fs::metadata(&root)?;
@@ -570,7 +615,7 @@ fn scan_observed(
         ));
     }
     let root_dev = stat_of(&root_meta).dev;
-    let vol = volume(&root)?;
+    let vol = (probe.volume)(&root)?;
     let mount = vol
         .mount_point
         .to_str()
@@ -730,7 +775,7 @@ fn scan_observed(
     tx.commit().map_err(db_err)?;
 
     if !progress.cancelled() {
-        sum.sampled = sample_collisions(idx, progress, on_read)?;
+        sum.sampled = sample_collisions(idx, progress, probe)?;
     }
     Ok(sum)
 }
@@ -779,11 +824,7 @@ struct Pending {
 /// on every location that is online now. Each file is re-`stat`ed first and
 /// only read while it still matches its row; anything else waits for the
 /// next scan of its volume. Returns how many files were sampled.
-fn sample_collisions(
-    idx: &Index,
-    progress: &Progress,
-    on_read: &(dyn Fn(&Path) + Sync),
-) -> io::Result<u64> {
+fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Result<u64> {
     let mut pending = Vec::new();
     {
         let mut st = idx
@@ -815,7 +856,7 @@ fn sample_collisions(
             let root = PathBuf::from(root);
             if !*online
                 .entry(location_id)
-                .or_insert_with(|| is_online(&root, &uuid))
+                .or_insert_with(|| (probe.online)(&root, &uuid))
             {
                 continue; // an offline volume keeps its NULLs until it is back
             }
@@ -849,7 +890,7 @@ fn sample_collisions(
             {
                 return None;
             }
-            on_read(&p.abs);
+            (probe.on_read)(&p.abs);
             let sampled = sample_file(&p.abs, st.size)?;
             progress.files.fetch_add(1, Ordering::Relaxed);
             progress
@@ -1131,7 +1172,15 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
+        // Version 2 records whether a location's filesystem is copy-on-write.
+        let cow: Option<i64> = idx
+            .conn
+            .query_row("SELECT cow FROM locations LIMIT 1", [], |r| r.get(0))
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(cow, None, "no location yet");
         let mode: String = idx
             .conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))

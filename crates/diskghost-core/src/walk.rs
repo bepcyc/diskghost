@@ -30,6 +30,10 @@ pub(crate) struct Batch {
     /// on another filesystem than the root, on a remote one, or a remote
     /// cycle. Depth-limited folders are *not* here: theirs is a depth cut.
     pub(crate) bound: Vec<PathBuf>,
+    /// Further names of a file already counted (a hard link, or a followed
+    /// link to it): not charged again, but a consumer that needs every name
+    /// — the persistent index — still sees them.
+    pub(crate) aliases: Vec<PathBuf>,
     /// Entries neither counted nor followed: symlinks and junctions when links
     /// are not followed, sockets, devices. A delete still has to remove them.
     pub(crate) others: Vec<PathBuf>,
@@ -380,6 +384,7 @@ fn visit<'s, 'c: 's>(
         modified: Vec::new(),
         subdirs: Vec::new(),
         bound: Vec::new(),
+        aliases: Vec::new(),
         others: Vec::new(),
         skipped: 0,
     };

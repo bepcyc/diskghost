@@ -18,8 +18,10 @@
 
 mod dupes;
 pub mod index;
+mod index_report;
 #[cfg(windows)]
 mod mft;
+mod rotational;
 mod snapshot;
 mod tree;
 mod walk;
@@ -28,6 +30,11 @@ pub use dupes::{HashCache, CHECKPOINT_INTERVAL, MERGE_INTERVAL, TRASH_DIRS};
 pub use index::{
     index_scan, is_cow_fs, validate_host, volume_uuid, Index, LocationStatus, Role, ScanSummary,
 };
+pub use index_report::{
+    index_dupes, GroupCopy, HashStats, IndexDupesReport, IndexGroup, IndexReportOptions,
+    LocationSingles, ReportLocation, Suggest,
+};
+pub use rotational::is_rotational;
 
 pub use snapshot::{
     diff, format_timestamp, DiffReport, DirDelta, FileDelta, Snapshot, SnapshotError,

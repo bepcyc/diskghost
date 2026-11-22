@@ -1197,6 +1197,7 @@ mod tests {
             modified: vec![0; files.len()],
             subdirs: subdirs.iter().map(PathBuf::from).collect(),
             bound: Vec::new(),
+            aliases: Vec::new(),
             others: Vec::new(),
             skipped: 0,
         };
