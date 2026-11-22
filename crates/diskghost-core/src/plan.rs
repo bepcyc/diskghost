@@ -148,8 +148,10 @@ pub struct Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
-    /// `rename` into `<location root>/.diskghost-quarantine/` — same
-    /// volume, instant, undone by renaming back. Never an unlink.
+    /// `rename` into `<scan root>/.diskghost-quarantine/` (the longest
+    /// folder `index add` was given that holds the file, else the volume's
+    /// mountpoint) — same volume, instant, undone by renaming back. Never
+    /// an unlink.
     Quarantine,
 }
 

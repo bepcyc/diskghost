@@ -4,7 +4,9 @@
 //! # Safety
 //!
 //! The only change this module makes to a user's file is `rename` — into
-//! `<location root>/.diskghost-quarantine/` on the same volume, and back.
+//! `<scan root>/.diskghost-quarantine/` on the same volume, and back. The
+//! scan root is the longest folder `index add` was given that holds the
+//! file; only a file no scan root holds goes to its volume's mountpoint.
 //! It never unlinks, truncates or writes a user file, and never replaces
 //! one: every rename refuses an existing destination (`RENAME_NOREPLACE`).
 //! A rename that would cross devices fails; there is no copy fallback.
@@ -27,10 +29,11 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::dupes::full_hash_with;
-use crate::index::{stat_of, Index, Probe, Role, Stat};
+use crate::index::{scan_roots, stat_of, under, Index, Probe, Role, Stat};
 use crate::plan::{Action, ActionKind, Expect, Plan, PlanGroup, PLAN_VERSION};
 
-/// Name of the quarantine directory at each location's root.
+/// Name of the quarantine directory at each scan root (or, for a file no
+/// scan root holds, at its volume's mountpoint).
 pub const QUARANTINE_DIR: &str = ".diskghost-quarantine";
 
 /// What `apply` should do besides the checks it always makes.
@@ -444,19 +447,20 @@ impl Run<'_> {
             .idx
             .conn
             .query_row(
-                "SELECT root, host, role FROM locations WHERE uuid = ?1",
+                "SELECT root, host, role, id FROM locations WHERE uuid = ?1",
                 [&a.location_uuid],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| verdict(Status::Error, format!("index: {e}")))?;
-        let Some((root, host, stored)) = loc else {
+        let Some((root, host, stored, loc_id)) = loc else {
             return Err(verdict(
                 Status::Error,
                 format!("location {} is not in the index", a.location_uuid),
@@ -512,6 +516,19 @@ impl Run<'_> {
                 "its folder resolves outside the location (symlink)",
             ));
         }
+        // Its quarantine: inside the longest scan root holding the file —
+        // matched by whole folder names on the resolved path, so `a` never
+        // covers `ab/…` — else at the mountpoint. Never a fallback on
+        // error: an unwritable scan root is an error, not a reason to move
+        // the file elsewhere.
+        let held = cparent.strip_prefix(&croot).expect("checked above");
+        let scan_roots = scan_roots(&self.idx.conn, loc_id)
+            .map_err(|e| verdict(Status::Error, format!("index: {e}")))?;
+        let scan_root = scan_roots
+            .iter()
+            .filter(|r| held.starts_with(r.as_str()))
+            .max_by_key(|r| Path::new(r.as_str()).components().count())
+            .map_or_else(|| croot.clone(), |r| under(&croot, r));
         // Still the file of the plan?
         let st = self.stat_matches(&a.path, &a.expect)?;
         // Still the content of the group?
@@ -531,7 +548,7 @@ impl Run<'_> {
             self.paranoid(&st)?;
         }
         // Where it goes.
-        let dir = root.join(QUARANTINE_DIR).join(&g.hash[..16]);
+        let dir = scan_root.join(QUARANTINE_DIR).join(&g.hash[..16]);
         let base = a.path.file_name().expect("checked above");
         let mut name = base.to_os_string();
         name.push(format!(".{}", st.ino));

@@ -12,7 +12,7 @@
 //! disk fills one location, and each scan only answers for the subtree it
 //! walked.
 //!
-//! # Schema (version 2, `PRAGMA user_version`)
+//! # Schema (version 3, `PRAGMA user_version`)
 //!
 //! ```sql
 //! meta      (key TEXT PRIMARY KEY, value INTEGER NOT NULL)
@@ -33,7 +33,20 @@
 //!            seen INTEGER, -- scan generation that last saw the row
 //!            PRIMARY KEY (location_id, path)) WITHOUT ROWID
 //! INDEX files_size ON files(size); INDEX files_full ON files(full)
+//! scan_roots (location_id → locations(id) ON DELETE CASCADE,  -- v3
+//!            path TEXT,                   -- relative to locations.root;
+//!                                         -- '' = the mountpoint itself
+//!            UNIQUE (location_id, path))
 //! ```
+//!
+//! A **scan root** is a folder `index add` was given. One volume may have
+//! several. `apply` quarantines a file into the longest scan root holding
+//! it (the user's own scope), and only falls back to the mountpoint when
+//! none does — e.g. an index from before v3, which recorded no scan roots
+//! (re-run `index add` to record them). Like `files.path`, a scan root is
+//! stored relative to the mountpoint, so it survives a remount elsewhere.
+//! A scan root whose folder was removed later keeps its row: harmless, as
+//! it then covers no file; `forget` drops it with its location.
 //!
 //! # Safety
 //!
@@ -56,7 +69,7 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
@@ -94,6 +107,13 @@ CREATE INDEX files_full ON files(full) WHERE full IS NOT NULL;
 ",
     r"
 ALTER TABLE locations ADD COLUMN cow INTEGER CHECK (cow IS NULL OR cow IN (0, 1));
+",
+    r"
+CREATE TABLE scan_roots (
+    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    UNIQUE (location_id, path)
+);
 ",
 ];
 
@@ -251,7 +271,7 @@ impl Index {
             .conn
             .prepare(
                 "SELECT l.uuid, l.host, l.role, l.root, l.last_seen, \
-                        COUNT(f.path), COALESCE(SUM(f.size), 0) \
+                        COUNT(f.path), COALESCE(SUM(f.size), 0), l.id \
                  FROM locations l LEFT JOIN files f ON f.location_id = l.id \
                  GROUP BY l.id ORDER BY l.root, l.uuid",
             )
@@ -266,13 +286,18 @@ impl Index {
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (uuid, host, role, root, last_seen, files, bytes) = row.map_err(db_err)?;
+            let (uuid, host, role, root, last_seen, files, bytes, id) = row.map_err(db_err)?;
             let root = PathBuf::from(root);
+            let roots = scan_roots(&self.conn, id)?
+                .iter()
+                .map(|rel| under(&root, rel))
+                .collect();
             out.push(LocationStatus {
                 online: is_online(&root, &uuid),
                 uuid,
@@ -282,7 +307,7 @@ impl Index {
                 files: files.max(0) as u64,
                 bytes: bytes.max(0) as u64,
                 last_seen,
-                roots: Vec::new(),
+                roots,
             });
         }
         Ok(out)
@@ -315,6 +340,26 @@ impl Index {
             ));
         }
         Ok(())
+    }
+}
+
+/// The scan roots of location `id`, relative to its mountpoint ('' = the
+/// mountpoint itself), sorted.
+pub(crate) fn scan_roots(conn: &Connection, id: i64) -> io::Result<Vec<String>> {
+    let mut st = conn
+        .prepare_cached("SELECT path FROM scan_roots WHERE location_id = ?1 ORDER BY path")
+        .map_err(db_err)?;
+    let rows = st.query_map([id], |r| r.get(0)).map_err(db_err)?;
+    rows.collect::<Result<_, _>>().map_err(db_err)
+}
+
+/// `root` joined with a mountpoint-relative path; '' is `root` itself
+/// (`join("")` would add a trailing slash).
+pub(crate) fn under(root: &Path, rel: &str) -> PathBuf {
+    if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
     }
 }
 
@@ -681,6 +726,12 @@ pub(crate) fn scan_with(
             |r| r.get(0),
         )
         .map_err(db_err)?;
+    // The folder given, so `apply` can quarantine inside it.
+    tx.execute(
+        "INSERT OR IGNORE INTO scan_roots (location_id, path) VALUES (?1, ?2)",
+        params![loc, prefix],
+    )
+    .map_err(db_err)?;
     let gen: i64 = tx
         .query_row(
             "UPDATE meta SET value = value + 1 WHERE key = 'scan_generation' RETURNING value",

@@ -201,8 +201,9 @@ enum Command {
         output: PathBuf,
     },
     /// Carry out a plan: re-check every file (size, time, inode, full hash)
-    /// and move it into `.diskghost-quarantine/` at its volume's root — a
-    /// same-volume rename, never a delete. Journaled to
+    /// and move it into `.diskghost-quarantine/` inside the folder `index
+    /// add` was given that holds it (its volume's root only when none does)
+    /// — a same-volume rename, never a delete. Journaled to
     /// `<plan>.journal.jsonl`; a re-run resumes, `undo` reverses.
     Apply {
         /// The plan file.
@@ -1080,6 +1081,9 @@ fn print_index_status(st: &[LocationStatus]) {
                 format!("  (host {})", l.host)
             },
         );
+        for r in &l.roots {
+            println!("    scan root: {}", r.display());
+        }
     }
 }
 

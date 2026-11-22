@@ -539,7 +539,7 @@ fn a_path_no_scan_root_covers_falls_back_to_the_mount_root() {
     // Scan roots `a` and `ab`; then `ab` is dropped from the index (as an
     // index from before scan roots were recorded would lack it). `ab/f.bin`
     // is covered by no scan root — `a` is a string prefix, not a folder one.
-    let (e, plan_path, plan) = setup_roots("roots-fallback", &["ab/f.bin", "a/keep"], &["a", "ab"]);
+    let (e, plan_path, plan) = setup_roots("roots-fallback", &["ab/f.bin"], &["a", "ab"]);
     let n = e
         .idx
         .conn
