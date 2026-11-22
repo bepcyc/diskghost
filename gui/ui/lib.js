@@ -204,6 +204,7 @@
     custom: [], // [{ pattern, on }]
     window_size: "auto",
     language: "auto",
+    theme: "auto", // "auto" follows the OS; "dark" | "light" pin it
   };
 
   // Saved settings over the defaults: unknown keys are dropped, wrong types
@@ -231,6 +232,7 @@
     }
     if (["auto", "maximized", "1080p", "1440p", "4k"].includes(saved.window_size)) s.window_size = saved.window_size;
     if (["auto", "en", "de"].includes(saved.language)) s.language = saved.language;
+    if (["auto", "dark", "light"].includes(saved.theme)) s.theme = saved.theme;
     return s;
   }
 
@@ -416,7 +418,77 @@
     return p === r || p.startsWith(r + (win ? "\\" : "/"));
   }
 
+  // Why a view's numbers are lower bounds — every cause that applies, never a
+  // guess. `complete` and `boundary_cuts` describe the viewed folder's own
+  // subtree; `cancelled` the whole walk; the depth limit is what the scan was
+  // started with (`maxDepth`, null = unlimited). A cancelled walk can still
+  // have read the viewed folder in full: `partial` is then false and only
+  // `cancelledWalk` says that the rest of the scan is incomplete.
+  function partialCauses(view, maxDepth) {
+    const v = view || {};
+    const partial = v.complete === false;
+    const causes = [];
+    if (partial) {
+      if (v.cancelled) causes.push({ kind: "cancelled" });
+      if (v.boundary_cuts > 0) causes.push({ kind: "boundary", n: v.boundary_cuts });
+      if (maxDepth != null) causes.push({ kind: "depth", n: maxDepth });
+      if (!causes.length) causes.push({ kind: "unknown" });
+    }
+    return { partial, causes, cancelledWalk: Boolean(v.cancelled) };
+  }
+
+  // The honest outcome of a duplicate search. The engine returns no groups at
+  // all once it sees a cancel, so groups that did arrive are a complete
+  // result even if Cancel was pressed meanwhile; an empty answer after a
+  // cancel is "cancelled", never "no duplicates". Hashes learned before the
+  // stop stay in the cache (checkpointed while the search runs, saved after),
+  // but only from the sampling phase (1) on — a cancel while listing (0)
+  // learned nothing.
+  function dupesOutcome(cancelRequested, groups, lastPhase) {
+    const got = Array.isArray(groups) ? groups.length : 0;
+    if (got > 0 || !cancelRequested) return { state: "done", hashesKept: false };
+    return { state: "cancelled", hashesKept: (lastPhase || 0) >= 1 };
+  }
+
+  // Guards async results against arriving out of order: take a ticket before
+  // the request, apply the answer only if it is still the newest ticket.
+  function latestOnly() {
+    let seq = 0;
+    return { next: () => ++seq, current: (ticket) => ticket === seq };
+  }
+
+  // A typed number clamped into [min, max]; null for an empty or non-numeric
+  // field (the caller decides what null means).
+  function clampInt(raw, min, max) {
+    const v = parseInt(String(raw ?? "").trim(), 10);
+    return Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : null;
+  }
+
+  // What "reclaim" would do with `groups`: per group the copy kept (chosen in
+  // `keep` by hash, else a program's own copy, else the first) and the copies
+  // removed — never a program/game file unless `withProt`. Totals cover every
+  // group passed in, rendered or not, so a confirmation can name them all.
+  function reclaimPlan(groups, keep, withProt) {
+    const jobs = [];
+    let files = 0, bytes = 0, prot = false;
+    for (const g of groups || []) {
+      const flags = g.prot || g.files.map(isProtectedPath);
+      const chosen = keep && keep.get ? keep.get(g.hash) : null;
+      const pi = flags.indexOf(true);
+      const kept = chosen && g.files.includes(chosen) ? chosen : g.files[pi >= 0 ? pi : 0];
+      const remove = g.files.filter((f, i) => f !== kept && (withProt || !flags[i]));
+      if (!remove.length) continue;
+      const touchesProt = remove.some(isProtectedPath);
+      prot = prot || touchesProt;
+      files += remove.length;
+      bytes += g.size * remove.length;
+      jobs.push({ keep: kept, remove, size: g.size, prot: touchesProt });
+    }
+    return { jobs, files, bytes, groups: jobs.length, prot };
+  }
+
   return {
+    partialCauses, dupesOutcome, latestOnly, clampInt, reclaimPlan,
     human, humanDelta, unmeasured, sizeText, countText, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, mapItems, parentPath, isUnder, SETTINGS_VERSION,
