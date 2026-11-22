@@ -958,28 +958,71 @@ pub fn ensure_agent(
     probe: &HostInfo,
     bin: &AgentBinary,
 ) -> io::Result<Option<std::path::PathBuf>> {
-    let target = |os: &str, arch: &str| (os, arch) == AGENT_TARGET;
-    if !target(&probe.os, &probe.arch) || !target(&bin.os, &bin.arch) {
-        return Ok(None);
+    Ok(ensure_agent_why(exec, probe, bin).ok())
+}
+
+/// [`ensure_agent`], telling why the agent cannot be used (`Err`): the
+/// fallback to the shell tier is reported, never silent.
+pub fn ensure_agent_why(
+    exec: &dyn RemoteExec,
+    probe: &HostInfo,
+    bin: &AgentBinary,
+) -> Result<std::path::PathBuf, String> {
+    let (os, arch) = AGENT_TARGET;
+    if (bin.os.as_str(), bin.arch.as_str()) != AGENT_TARGET {
+        return Err(format!(
+            "this build ({} {}) is not an agent for {os} {arch}",
+            bin.os, bin.arch
+        ));
+    }
+    if (probe.os.as_str(), probe.arch.as_str()) != AGENT_TARGET {
+        let arch_told = if probe.arch.is_empty() {
+            "an unknown machine type"
+        } else {
+            probe.arch.as_str()
+        };
+        return Err(format!(
+            "the host runs {} on {arch_told}; agents exist for {os} {arch} only",
+            if probe.os.is_empty() {
+                "an unknown os"
+            } else {
+                probe.os.as_str()
+            }
+        ));
     }
     let name = bin.name();
+    let stderr = |o: &ExecOut| String::from_utf8_lossy(&o.stderr).trim().to_string();
     let found = match run(exec, &["sh", "-c", LOCATE_SCRIPT, "sh", &name]) {
         Ok(o) if o.code == 0 => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => return Ok(None),
+        Ok(o) => {
+            return Err(format!(
+                "could not look for it in ~/.cache/diskghost (exit {}): {}",
+                o.code,
+                stderr(&o)
+            ))
+        }
+        Err(e) => return Err(format!("could not look for it in ~/.cache/diskghost: {e}")),
     };
     let (have, path) = match found.split_once(' ') {
         Some(("have", p)) => (true, p.to_string()),
         Some(("need", p)) => (false, p.to_string()),
-        _ => return Ok(None),
+        _ => return Err(format!("unexpected answer looking for it: {found:?}")),
     };
     if !path.starts_with('/') || !path.ends_with(&format!("/.cache/diskghost/{name}")) {
-        return Ok(None);
+        return Err(format!("unexpected agent path {path:?}"));
     }
     if !have {
         let len = bin.bytes.len().to_string();
         match exec.exec_stdin(&["sh", "-c", UPLOAD_SCRIPT, "sh", &name, &len], &bin.bytes) {
             Ok(o) if o.code == 0 && String::from_utf8_lossy(&o.stdout).trim() == path => {}
-            _ => return Ok(None),
+            Ok(o) => {
+                return Err(format!(
+                    "upload to {path} failed (exit {}): {}",
+                    o.code,
+                    stderr(&o)
+                ))
+            }
+            Err(e) => return Err(format!("upload to {path} failed: {e}")),
         }
     }
     let agent = AgentExec {
@@ -990,9 +1033,13 @@ pub fn ensure_agent(
         Ok(h)
             if h.ver == bin.ver && h.arch == probe.arch && h.os.eq_ignore_ascii_case(&probe.os) =>
         {
-            Ok(Some(std::path::PathBuf::from(path)))
+            Ok(std::path::PathBuf::from(path))
         }
-        _ => Ok(None),
+        Ok(h) => Err(format!(
+            "{path} answered hello as {} {} {}, expected {} {} {}",
+            h.ver, h.os, h.arch, bin.ver, probe.os, probe.arch
+        )),
+        Err(e) => Err(format!("{path} did not answer hello: {e}")),
     }
 }
 

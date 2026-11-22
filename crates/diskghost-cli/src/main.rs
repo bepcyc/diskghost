@@ -1139,6 +1139,12 @@ fn ssh_url(p: &Path) -> Option<&str> {
 }
 
 fn print_index_add(path: &Path, s: &ScanSummary) {
+    if let Some(n) = &s.agent_note {
+        eprintln!(
+            "note: agent not used for {} — {n}; the host's shell tools were used",
+            path.display()
+        );
+    }
     println!(
         "{}  →  volume {} ({})",
         path.display(),

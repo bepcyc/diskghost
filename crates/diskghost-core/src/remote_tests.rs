@@ -1600,9 +1600,9 @@ fn an_unsupported_host_says_why_the_agent_was_not_used() {
         "{note}"
     );
     // No agent binary for this build at all: said too.
-    let s = e
-        .add_remote_via(URL, &x86(), AgentMode::Auto, None)
-        .unwrap();
+    let h = x86();
+    h.put("/storage/a.bin", &content(1), T0);
+    let s = e.add_remote_via(URL, &h, AgentMode::Auto, None).unwrap();
     assert!(s.agent_note.is_some_and(|n| n.contains("this build")));
     // The agent ran: nothing to explain.
     let e2 = Estate::new("agent-note-none");

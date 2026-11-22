@@ -770,7 +770,11 @@ pub fn index_remote(
 ) -> io::Result<ScanSummary> {
     let (host, _) = crate::remote::parse_ssh_url(url)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let bin = crate::remote::AgentBinary::current();
+    // The binary is read only when it may be uploaded.
+    let bin = match mode {
+        crate::remote::AgentMode::Auto => crate::remote::AgentBinary::current(),
+        crate::remote::AgentMode::Never => None,
+    };
     remote_scan_with(
         idx,
         url,
@@ -791,7 +795,7 @@ pub(crate) fn remote_scan_with(
     progress: &Progress,
 ) -> io::Result<ScanSummary> {
     use crate::remote::{
-        ensure_agent, enum_remote, hash_remote, parse_ssh_url, probe_host, resolve_root,
+        ensure_agent_why, enum_remote, hash_remote, parse_ssh_url, probe_host, resolve_root,
         shell_unavailable, AgentExec, AgentMode, HashAlgo,
     };
     let (host, path) =
@@ -806,9 +810,16 @@ pub(crate) fn remote_scan_with(
         }
     })?;
     // The top tier: our own agent on the host, when it runs there.
-    let agent_path = match (mode, bin) {
-        (AgentMode::Auto, Some(b)) => ensure_agent(x, &info, b)?,
-        _ => None,
+    let (agent_path, agent_note) = match (mode, bin) {
+        (AgentMode::Never, _) => (None, None),
+        (AgentMode::Auto, None) => (
+            None,
+            Some("this build cannot serve as an agent (only a Linux x86_64 build can)".into()),
+        ),
+        (AgentMode::Auto, Some(b)) => match ensure_agent_why(x, &info, b) {
+            Ok(p) => (Some(p), None),
+            Err(why) => (None, Some(why)),
+        },
     };
     // Which tier lists and hashes: the agent, or the host's own tools
     // (and without those nothing: the probe's "unusable" error).
@@ -877,6 +888,7 @@ pub(crate) fn remote_scan_with(
         skipped: listing.skipped,
         algo: Some(algo.as_str().to_string()),
         transport: Some(transport.to_string()),
+        agent_note,
         ..ScanSummary::default()
     };
 
