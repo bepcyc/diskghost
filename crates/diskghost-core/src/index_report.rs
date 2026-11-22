@@ -163,6 +163,78 @@ pub(crate) fn report_with(
     probe: &Probe,
 ) -> io::Result<IndexDupesReport> {
     let min = opts.min_size.max(1);
+    let c = compute_groups(idx, min, progress, probe)?;
+    let mut groups: Vec<IndexGroup> = c
+        .drafts
+        .iter()
+        .map(|g| render(&c.locs, &c.rows, &c.phys, g))
+        .collect();
+    groups.sort_by(|a, b| {
+        b.reclaimable_bytes
+            .cmp(&a.reclaimable_bytes)
+            .then(b.size.cmp(&a.size))
+            .then_with(|| a.hash.cmp(&b.hash))
+            .then_with(|| a.copies[0].path.cmp(&b.copies[0].path))
+    });
+
+    let singles = if opts.singles {
+        Some(singles(
+            idx,
+            min,
+            opts.singles_paths,
+            &c.locs,
+            &c.rows,
+            &c.phys,
+            &c.grouped,
+            &c.at,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(IndexDupesReport {
+        groups,
+        singles,
+        locations: c
+            .locs
+            .iter()
+            .map(|l| ReportLocation {
+                uuid: l.uuid.clone(),
+                root: l.root.clone(),
+                available: l.available,
+                rotational: l.rotational,
+                cow: l.cow,
+            })
+            .collect(),
+        stats: c.stats,
+        warnings: c.warnings,
+    })
+}
+
+/// The duplicate groups of the whole index, before any rendering: what the
+/// `dupes --index` report and `plan` are both built from.
+pub(crate) struct Groups {
+    pub(crate) locs: Vec<Loc>,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) phys: Vec<Phys>,
+    /// One per group, in size order.
+    pub(crate) drafts: Vec<Draft>,
+    /// Physical files that are in some group.
+    pub(crate) grouped: HashSet<usize>,
+    /// Location row id → index into `locs`.
+    pub(crate) at: HashMap<i64, usize>,
+    pub(crate) stats: HashStats,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// Complete the hashes the groups need (writing them back to the index) and
+/// form the groups of every file of at least `min` bytes.
+pub(crate) fn compute_groups(
+    idx: &Index,
+    min: u64,
+    progress: &Progress,
+    probe: &Probe,
+) -> io::Result<Groups> {
     let locs = load_locations(idx, probe)?;
     let at: HashMap<i64, usize> = locs.iter().enumerate().map(|(i, l)| (l.id, i)).collect();
     let mut rows = load_colliding(idx, min, &at)?;
@@ -231,9 +303,9 @@ pub(crate) fn report_with(
         return Err(cancelled());
     }
 
-    // 4. Groups, then what is in none of them.
+    // 4. Groups.
     let mut grouped: HashSet<usize> = HashSet::new();
-    let mut groups = Vec::new();
+    let mut drafts = Vec::new();
     for members in buckets.values() {
         let members: Vec<usize> = members
             .iter()
@@ -242,31 +314,9 @@ pub(crate) fn report_with(
             .collect();
         for g in group_bucket(&phys, &members) {
             grouped.extend(g.confirmed.iter().chain(&g.probable));
-            groups.push(render(&locs, &rows, &phys, &g));
+            drafts.push(g);
         }
     }
-    groups.sort_by(|a, b| {
-        b.reclaimable_bytes
-            .cmp(&a.reclaimable_bytes)
-            .then(b.size.cmp(&a.size))
-            .then_with(|| a.hash.cmp(&b.hash))
-            .then_with(|| a.copies[0].path.cmp(&b.copies[0].path))
-    });
-
-    let singles = if opts.singles {
-        Some(singles(
-            idx,
-            min,
-            opts.singles_paths,
-            &locs,
-            &rows,
-            &phys,
-            &grouped,
-            &at,
-        )?)
-    } else {
-        None
-    };
 
     let missing = stats.missing.load(Ordering::Relaxed);
     if missing > 0 {
@@ -279,19 +329,13 @@ pub(crate) fn report_with(
     if unreadable > 0 {
         warnings.push(format!("{unreadable} file(s) could not be read — left out"));
     }
-    Ok(IndexDupesReport {
-        groups,
-        singles,
-        locations: locs
-            .iter()
-            .map(|l| ReportLocation {
-                uuid: l.uuid.clone(),
-                root: l.root.clone(),
-                available: l.available,
-                rotational: l.rotational,
-                cow: l.cow,
-            })
-            .collect(),
+    Ok(Groups {
+        locs,
+        rows,
+        phys,
+        drafts,
+        grouped,
+        at,
         stats: HashStats {
             sampled: stats.sampled.load(Ordering::Relaxed),
             full_hashed: stats.full_hashed.load(Ordering::Relaxed),
@@ -318,20 +362,22 @@ struct Counters {
 }
 
 /// A location as this report sees it.
-struct Loc {
-    id: i64,
-    uuid: String,
-    root: PathBuf,
-    role: Role,
-    available: bool,
-    rotational: bool,
-    cow: bool,
+pub(crate) struct Loc {
+    pub(crate) id: i64,
+    pub(crate) uuid: String,
+    /// `local`, or a remote host (a later milestone).
+    pub(crate) host: String,
+    pub(crate) root: PathBuf,
+    pub(crate) role: Role,
+    pub(crate) available: bool,
+    pub(crate) rotational: bool,
+    pub(crate) cow: bool,
 }
 
 fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
     let mut st = idx
         .conn
-        .prepare("SELECT id, uuid, root, role, cow FROM locations ORDER BY root, uuid")
+        .prepare("SELECT id, uuid, root, role, cow, host FROM locations ORDER BY root, uuid")
         .map_err(db_err)?;
     let rows = st
         .query_map([], |r| {
@@ -341,12 +387,13 @@ fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<i64>>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, uuid, root, role, cow) = row.map_err(db_err)?;
+        let (id, uuid, root, role, cow, host) = row.map_err(db_err)?;
         let root = PathBuf::from(root);
         let available = (probe.online)(&root, &uuid);
         out.push(Loc {
@@ -362,6 +409,7 @@ fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
             },
             role: Role::parse(&role),
             uuid,
+            host,
             root,
         });
     }
@@ -369,19 +417,19 @@ fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
 }
 
 /// One index row of a size that occurs more than once.
-struct Row {
-    loc: usize,
-    path: String,
-    size: u64,
-    mtime_ns: u64,
-    dev: u64,
-    ino: u64,
-    sample: Option<[u8; 32]>,
-    full: Option<[u8; 32]>,
+pub(crate) struct Row {
+    pub(crate) loc: usize,
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) mtime_ns: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) sample: Option<[u8; 32]>,
+    pub(crate) full: Option<[u8; 32]>,
     /// On a reachable volume but gone or unreadable: left out.
-    excluded: bool,
+    pub(crate) excluded: bool,
     /// Differs from its stored row.
-    dirty: bool,
+    pub(crate) dirty: bool,
 }
 
 fn hash32(b: Option<Vec<u8>>) -> Option<[u8; 32]> {
@@ -528,19 +576,19 @@ fn persist(idx: &Index, locs: &[Loc], rows: &[Row]) -> io::Result<()> {
 }
 
 /// One physical file: every name of one inode on one filesystem.
-struct Phys {
+pub(crate) struct Phys {
     /// Row indices, the representative name first.
-    rows: Vec<usize>,
-    size: u64,
-    sample: Option<[u8; 32]>,
-    full: Option<[u8; 32]>,
-    available: bool,
-    excluded: bool,
+    pub(crate) rows: Vec<usize>,
+    pub(crate) size: u64,
+    pub(crate) sample: Option<[u8; 32]>,
+    pub(crate) full: Option<[u8; 32]>,
+    pub(crate) available: bool,
+    pub(crate) excluded: bool,
 }
 
 /// The filesystem part of a location key: a bind mount or subvolume
 /// (`UUID:/sub`) shares inodes with the whole filesystem (`UUID`).
-fn filesystem_of(uuid: &str) -> &str {
+pub(crate) fn filesystem_of(uuid: &str) -> &str {
     if uuid.starts_with("dev:") {
         uuid
     } else {
@@ -690,12 +738,12 @@ fn in_order<T: Send>(n: usize, items: &[HashItem], f: &(dyn Fn(&HashItem) -> T +
 }
 
 /// One group before rendering.
-struct Draft {
-    size: u64,
-    full: Option<[u8; 32]>,
-    sample: Option<[u8; 32]>,
-    confirmed: Vec<usize>,
-    probable: Vec<usize>,
+pub(crate) struct Draft {
+    pub(crate) size: u64,
+    pub(crate) full: Option<[u8; 32]>,
+    pub(crate) sample: Option<[u8; 32]>,
+    pub(crate) confirmed: Vec<usize>,
+    pub(crate) probable: Vec<usize>,
 }
 
 /// The groups among the physical files of one size: one per whole-file
@@ -757,7 +805,7 @@ fn group_bucket(phys: &[Phys], members: &[usize]) -> Vec<Draft> {
     out
 }
 
-fn role_rank(r: Role) -> u8 {
+pub(crate) fn role_rank(r: Role) -> u8 {
     match r {
         Role::Master => 0,
         Role::Normal => 1,
@@ -955,7 +1003,7 @@ pub(crate) fn hash_plan(items: Vec<HashItem>) -> Vec<HashBatch> {
 }
 
 /// The path of a row: location root joined with the stored relative path.
-fn abs(root: &Path, rel: &str) -> PathBuf {
+pub(crate) fn abs(root: &Path, rel: &str) -> PathBuf {
     if rel.is_empty() {
         root.to_path_buf()
     } else {
@@ -966,200 +1014,9 @@ fn abs(root: &Path, rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{scan_with, Volume};
-    use crate::Options;
+    use crate::testkit::*;
     use std::collections::BTreeSet;
-    use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
-
-    // ---- fixtures -------------------------------------------------------
-
-    /// A fresh directory owned by this test alone. Tests create and delete
-    /// files only inside it — never anywhere else (owner's hard safety rule).
-    fn tmpdir(label: &str) -> PathBuf {
-        let mut d = std::env::temp_dir();
-        d.push(format!("diskghost-report-{}-{label}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::canonicalize(&d).unwrap()
-    }
-
-    fn write(path: &Path, content: &[u8]) {
-        if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p).unwrap();
-        }
-        std::fs::write(path, content).unwrap();
-    }
-
-    /// Larger than two samples (2 × 16 KiB), so `index add` stores only the
-    /// sample and the whole-file hash is the report's job.
-    const BIG: usize = 40 * 1024;
-
-    fn content(tag: u8) -> Vec<u8> {
-        (0..BIG).map(|i| (i % 251) as u8 ^ tag).collect()
-    }
-
-    /// Same size and same two ends as `content(tag)`, different middle.
-    fn same_ends(tag: u8) -> Vec<u8> {
-        let mut c = content(tag);
-        c[BIG / 2] ^= 0xff;
-        c
-    }
-
-    /// A test estate: a database plus folders that each pretend to be a
-    /// volume of their own (`vol-<name>`), online while the folder exists.
-    struct Estate {
-        dir: PathBuf,
-        idx: Index,
-        cow: bool,
-        rotational: bool,
-        reads: Mutex<Vec<PathBuf>>,
-    }
-
-    impl Estate {
-        fn new(label: &str) -> Estate {
-            let dir = tmpdir(label);
-            let idx = Index::open(&dir.join("db/index.db")).unwrap();
-            Estate {
-                dir,
-                idx,
-                cow: false,
-                rotational: false,
-                reads: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn loc(&self, name: &str) -> PathBuf {
-            self.dir.join(name)
-        }
-
-        fn uuid(name: &str) -> String {
-            format!("vol-{name}")
-        }
-
-        fn with_probe<T>(&self, f: impl FnOnce(&Probe) -> T) -> T {
-            let base = self.dir.clone();
-            let volume = move |p: &Path| -> io::Result<Volume> {
-                let rel = p.strip_prefix(&base).map_err(io::Error::other)?;
-                let top = rel
-                    .components()
-                    .next()
-                    .ok_or_else(|| io::Error::other("not in a location"))?;
-                let name = top.as_os_str().to_str().unwrap().to_string();
-                Ok(Volume {
-                    key: Estate::uuid(&name),
-                    mount_point: base.join(&name),
-                })
-            };
-            // Like the real check: the folder is there *and* holds this
-            // very volume (another disk may be mounted at the same place).
-            let online = |root: &Path, uuid: &str| {
-                root.is_dir()
-                    && root
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| uuid == Estate::uuid(n))
-            };
-            let cow = self.cow;
-            let cow = move |_: &Path| cow;
-            let rot = self.rotational;
-            let rotational = move |_: &Path| rot;
-            let reads = &self.reads;
-            let on_read = move |p: &Path| reads.lock().unwrap().push(p.to_path_buf());
-            let probe = Probe {
-                volume: &volume,
-                online: &online,
-                cow: &cow,
-                rotational: &rotational,
-                on_read: &on_read,
-            };
-            f(&probe)
-        }
-
-        fn add(&self, name: &str) {
-            let root = self.loc(name);
-            std::fs::create_dir_all(&root).unwrap();
-            let s = self
-                .with_probe(|p| {
-                    scan_with(
-                        &self.idx,
-                        &root,
-                        &Options::default(),
-                        &Progress::default(),
-                        p,
-                    )
-                })
-                .unwrap();
-            assert!(s.complete, "{s:?}");
-        }
-
-        fn report(&self, opts: &IndexReportOptions) -> IndexDupesReport {
-            self.reads.lock().unwrap().clear();
-            self.with_probe(|p| report_with(&self.idx, opts, &Progress::default(), p))
-                .unwrap()
-        }
-
-        fn reads(&self) -> BTreeSet<PathBuf> {
-            self.reads.lock().unwrap().iter().cloned().collect()
-        }
-
-        /// Pretend a location's disk was unplugged: its last known root no
-        /// longer exists. Only the index row changes — no file is touched.
-        fn unplug(&self, name: &str) {
-            let gone = self.dir.join(format!("unplugged-{name}"));
-            assert!(!gone.exists());
-            let n = self
-                .idx
-                .conn
-                .execute(
-                    "UPDATE locations SET root = ?2 WHERE uuid = ?1",
-                    rusqlite::params![Estate::uuid(name), gone.to_str().unwrap()],
-                )
-                .unwrap();
-            assert_eq!(n, 1);
-        }
-
-        /// Another disk now sits where `name` was mounted: its last known
-        /// root is `other`'s folder (index rows only; no file is touched).
-        fn remount_over(&self, name: &str, other: &str) {
-            let n = self
-                .idx
-                .conn
-                .execute(
-                    "UPDATE locations SET root = ?2 WHERE uuid = ?1",
-                    rusqlite::params![Estate::uuid(name), self.loc(other).to_str().unwrap()],
-                )
-                .unwrap();
-            assert_eq!(n, 1);
-        }
-
-        /// (size, mtime_ns, sample, full) of the row of `name`/`rel`.
-        fn row(&self, name: &str, rel: &str) -> (i64, i64, Option<Vec<u8>>, Option<Vec<u8>>) {
-            self.idx
-                .conn
-                .query_row(
-                    "SELECT f.size, f.mtime_ns, f.sample, f.full FROM files f \
-                     JOIN locations l ON l.id = f.location_id \
-                     WHERE l.uuid = ?1 AND f.path = ?2",
-                    rusqlite::params![Estate::uuid(name), rel],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .unwrap()
-        }
-
-        fn opts() -> IndexReportOptions {
-            IndexReportOptions {
-                min_size: 1,
-                ..IndexReportOptions::default()
-            }
-        }
-    }
-
-    impl Drop for Estate {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
 
     fn group_of(r: &IndexDupesReport, size: u64) -> Vec<&IndexGroup> {
         r.groups.iter().filter(|g| g.size == size).collect()

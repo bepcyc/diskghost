@@ -16,16 +16,27 @@
 //! [`Options`] controls the walk: exclude globs, max depth, follow-symlinks.
 //! Everything is `serde`-serialisable so a CLI, a GUI or an agent can consume it.
 
+pub mod apply;
+#[cfg(test)]
+mod apply_tests;
 mod dupes;
 pub mod index;
 mod index_report;
 #[cfg(windows)]
 mod mft;
+pub mod plan;
+pub mod policy;
 mod rotational;
 mod snapshot;
+#[cfg(test)]
+mod testkit;
 mod tree;
 mod walk;
 
+pub use apply::{
+    apply, journal_path, load_plan, read_journal, undo, ApplyOptions, JournalEntry, Outcome,
+    RunReport, Status, QUARANTINE_DIR,
+};
 pub use dupes::{HashCache, CHECKPOINT_INTERVAL, MERGE_INTERVAL, TRASH_DIRS};
 pub use index::{
     index_scan, is_cow_fs, validate_host, volume_uuid, Index, LocationStatus, Role, ScanSummary,
@@ -34,6 +45,8 @@ pub use index_report::{
     index_dupes, GroupCopy, HashStats, IndexDupesReport, IndexGroup, IndexReportOptions,
     LocationSingles, ReportLocation, Suggest,
 };
+pub use plan::{make_plan, Plan, PLAN_VERSION};
+pub use policy::{Distinct, Policy};
 pub use rotational::is_rotational;
 
 pub use snapshot::{

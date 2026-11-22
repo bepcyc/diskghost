@@ -850,3 +850,167 @@ fn dupes_needs_a_path_or_the_index_and_index_mode_does_not_reclaim() {
     assert!(v["groups"].as_array().unwrap().is_empty());
     std::fs::remove_dir_all(&d).ok();
 }
+
+// ---- `diskghost plan` / `apply` / `undo` -----------------------------------
+// Plans come from the test's own --db. `apply` runs here only as --dry-run:
+// a real apply quarantines at the volume's root, which is outside the
+// scratch dir (the real moves are tested in the core crate on fake volumes).
+// `undo` runs for real on a journal whose paths are all in the scratch dir.
+
+fn plan_cmd(db: &std::path::Path, out: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(["plan", "--index", "--db"])
+        .arg(db)
+        .arg("-o")
+        .arg(out)
+        .args(args)
+        .output()
+        .expect("run diskghost")
+}
+
+fn read_json(p: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+}
+
+#[test]
+fn plan_writes_a_readable_versioned_plan() {
+    let (d, tree, db) = index_fixture("plan");
+    // Default policy: two copies on two devices — one device here, so the
+    // group is under-protected and nothing is to move.
+    let out_file = d.join("plan.json");
+    let out = plan_cmd(&db, &out_file, &[]);
+    assert!(out.status.success(), "{out:?}");
+    let p = read_json(&out_file);
+    assert_eq!(p["version"], 1);
+    assert!(p["created"].is_string());
+    assert_eq!(p["policy"]["min_copies"], 2);
+    assert_eq!(p["policy"]["distinct"], "physical_device");
+    let g = &p["groups"][0];
+    assert_eq!(g["under_protected"], true, "{p:#}");
+    assert!(g["actions"].as_array().unwrap().is_empty());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("under-protected"));
+
+    // One copy anywhere: the second copy goes.
+    let pol = d.join("policy.toml");
+    std::fs::write(&pol, "[policy]\nmin_copies = 1\ndistinct = \"none\"\n").unwrap();
+    let out = plan_cmd(&db, &out_file, &["--policy", pol.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    let p = read_json(&out_file);
+    let g = &p["groups"][0];
+    assert_eq!(g["under_protected"], false);
+    let acts = g["actions"].as_array().unwrap();
+    assert_eq!(acts.len(), 1, "{p:#}");
+    assert_eq!(acts[0]["type"], "quarantine");
+    assert_eq!(acts[0]["path"], tree.join("sub/b.bin").to_str().unwrap());
+    for k in ["size", "mtime_ns", "dev", "ino", "full"] {
+        assert!(acts[0]["expect"].get(k).is_some(), "expect.{k}");
+    }
+    // The plan never touches a file.
+    assert!(tree.join("sub/b.bin").exists());
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn plan_rejects_a_bad_policy_naming_the_field() {
+    let (d, _tree, db) = index_fixture("plan-bad-policy");
+    let pol = d.join("policy.toml");
+    std::fs::write(&pol, "[policy]\ndistinct = \"nope\"\n").unwrap();
+    let out_file = d.join("plan.json");
+    let out = plan_cmd(&db, &out_file, &["--policy", pol.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("distinct"), "{err}");
+    assert!(!out_file.exists(), "no plan from a bad policy");
+    // plan needs --index and an output file.
+    let out = Command::new(bin())
+        .args(["plan", "-o"])
+        .arg(&out_file)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = Command::new(bin())
+        .args(["plan", "--index", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn apply_dry_run_reports_and_touches_nothing() {
+    let (d, tree, db) = index_fixture("apply-dry");
+    let pol = d.join("policy.toml");
+    std::fs::write(&pol, "[policy]\nmin_copies = 1\ndistinct = \"none\"\n").unwrap();
+    let plan = d.join("plan.json");
+    assert!(plan_cmd(&db, &plan, &["--policy", pol.to_str().unwrap()])
+        .status
+        .success());
+    let out = Command::new(bin())
+        .args(["apply", "--json", "--dry-run", "--paranoid", "--db"])
+        .arg(&db)
+        .arg(&plan)
+        .output()
+        .unwrap();
+    let v = json_only(&out);
+    let o = &v["outcomes"][0];
+    assert_eq!(o["status"], "would_quarantine", "{v:#}");
+    assert!(o["to"]
+        .as_str()
+        .unwrap()
+        .contains("/.diskghost-quarantine/"));
+    assert!(tree.join("sub/b.bin").exists());
+    assert!(!d.join("plan.json.journal.jsonl").exists());
+    // Human output too.
+    let out = Command::new(bin())
+        .args(["apply", "--dry-run", "--db"])
+        .arg(&db)
+        .arg(&plan)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("would"));
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn undo_moves_journaled_files_back() {
+    let d = scratch("undo");
+    let d = std::fs::canonicalize(&d).unwrap();
+    let from = d.join("data/f.bin");
+    let to = d.join("q/f.bin.1");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::write(&to, b"payload").unwrap();
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&to).unwrap().ino()
+    };
+    let journal = d.join("plan.json.journal.jsonl");
+    let line = serde_json::json!({
+        "action_id": "x-1", "from": from, "to": to, "group": "00",
+        "status": "done", "ts": 1, "ino": ino
+    });
+    std::fs::write(&journal, format!("{line}\n")).unwrap();
+
+    let out = Command::new(bin())
+        .args(["undo", "--json", "--dry-run"])
+        .arg(&journal)
+        .output()
+        .unwrap();
+    let v = json_only(&out);
+    assert_eq!(v["outcomes"][0]["status"], "would_restore", "{v:#}");
+    assert!(to.exists() && !from.exists());
+
+    let out = Command::new(bin())
+        .arg("undo")
+        .arg(&journal)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read(&from).unwrap(), b"payload");
+    assert!(!to.exists());
+    let last = std::fs::read_to_string(&journal).unwrap();
+    let last: serde_json::Value = serde_json::from_str(last.lines().last().unwrap()).unwrap();
+    assert_eq!(last["status"], "undone");
+    std::fs::remove_dir_all(&d).ok();
+}

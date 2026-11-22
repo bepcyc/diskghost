@@ -49,7 +49,7 @@ use std::sync::atomic::Ordering;
 
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::dupes::{sample_file, Sampled};
 use crate::walk::{walk, MountEntry};
@@ -99,7 +99,7 @@ ALTER TABLE locations ADD COLUMN cow INTEGER CHECK (cow IS NULL OR cow IN (0, 1)
 
 /// Role of a location in later copy policies: which copy to keep
 /// (`master`), which copies are expendable (`scratch`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Normal,
@@ -108,7 +108,7 @@ pub enum Role {
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Role::Normal => "normal",
             Role::Master => "master",
