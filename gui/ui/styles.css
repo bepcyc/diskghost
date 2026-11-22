@@ -542,3 +542,5 @@ button.chip { cursor: pointer; }
 .chip .x:hover { color: var(--danger); }
 .addrow { display: flex; gap: 8px; }
 .addrow input { flex: 1; }
+
+.fd.bad { color: var(--danger); }

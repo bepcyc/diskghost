@@ -22,240 +22,25 @@ let activeId = null;
 let nextId = 1;
 
 // ---------------------------------- i18n ----------------------------------
-const I18N = {
-  en: {
-    pathLabel: "Folder path", placeholder: "Paste a folder path, drop folders anywhere, or use Browse…",
-    browse: "Browse…", scan: "Scan", dupes: "Find duplicates", settings: "Settings", refresh: "Refresh",
-    drives: "Drives", scanAll: "Scan all drives", scans: "Scans", clearDone: "Clear finished",
-    dropHint: "Drop folders anywhere — each one is queued as its own scan.",
-    dropHere: "Drop folders to scan them",
-    excludesNone: "No excludes", excludesOn: "excludes active",
-    free: "free", of: "of", used: "used",
-    kindFixed: "Local disk", kindRemovable: "Removable", kindNetwork: "Network drive", kindOther: "Volume",
-    stQueued: "Queued", stRunning: "Scanning", stSearching: "Searching duplicates", stDone: "Done",
-    stCancelled: "Cancelled — partial", stError: "Error", stLoading: "Loading",
-    queuedPos: "Waiting in queue — position", queuedWhy: "Scans running at the same time:",
-    removeFromQueue: "Remove from queue", cancel: "Cancel", close: "Close", retry: "Try again",
-    files: "files", bytes: "found", elapsed: "elapsed", rate: "files / s",
-    estimated: "of the drive's used space", noEstimate: "Size unknown until the walk ends",
-    queueInfo: (r, q, p) => `${r} running · ${q} queued · up to ${p} at once`,
-    welcomeTitle: "Where did my disk space go?",
-    welcomeText: "Drop one or more folders onto the window, pick a drive below, or use Browse. Every scan gets its own tab on the left — they run side by side or wait in the queue.",
-    up: "Up", back: "Back", rescan: "Rescan", dupesHere: "Find duplicates here",
-    backHint: "Previous folder (mouse back button, Alt+←)", upHint: "Parent folder (right-click the map, Backspace, Alt+↑)",
-    cancelling: "Cancelling…",
-    cancelledNotice: "This scan was cancelled — every number covers only the part that was walked.",
-    depthNotice: "Max depth: deeper folders were not read. ≥ marks a lower bound, “not measured” a folder that was not read at all — and only a complete scan can be compared.",
-    boundaryNotice: "Filesystem boundary: {n} folders on other filesystems (mounts, network or FUSE shares) were listed but not read. ≥ marks a lower bound, “not measured” a folder that was not read at all — and only a complete scan can be compared.",
-    notMeasured: "not measured",
-    kSize: "Size", kSizeOfUsed: "of the used space on", kSizeOfDisk: "of the disk",
-    kFiles: "Files", kAvg: "avg", kPerFile: "per file",
-    kFolders: "Folders", kDirect: "files directly in this folder",
-    kBiggestFolder: "Biggest folder", kBiggestFile: "Biggest file",
-    kFree: "Free on this drive", kUsedPct: "used",
-    kScan: "Scan", kSkipped: "unreadable, skipped", kNoSkip: "nothing skipped",
-    kSince: "Since",
-    map: "Map", mapSub: "Area = size. Click to open a folder, right-click to go up, hover for details.",
-    filesHere: "files directly in this folder", otherFolders: "smaller folders", filesSmaller: "files & smaller folders",
-    shareOfView: "of this folder", folderFiles: "Files",
-    types: "What it is made of", typesSub: "by file type, size on disk",
-    disk: "Drive", diskThis: "This folder", diskOther: "Everything else", diskFree: "Free",
-    tabFolders: "Folders", tabFiles: "Biggest files", tabTypes: "Extensions", tabSizes: "Size ranges", tabChanges: "Changes",
-    colName: "Name", colShare: "Share", colSize: "Size", colPct: "%", colFiles: "Files", colDelta: "Change",
-    colType: "Type", colExt: "Extension", colCategory: "Category", colCount: "Files",
-    filterFiles: "Filter by name or path…", allCategories: "All categories",
-    sizesCount: "Number of files per size range", sizesBytes: "Space taken per size range",
-    sizesHint: "Many tiny files waste space on block slack and slow down copies; a few huge ones are the quickest wins.",
-    since: "Compare with", showChanges: "Show changes", comparing: "Comparing…",
-    firstScan: "First scan of this folder — come back after the next scan to see what grew.",
-    changes: "Changes since", unchanged: "Nothing changed.", newBadge: "new",
-    grew: "Grew", shrank: "Shrank", newFolders: "New folders", removedFolders: "Removed folders",
-    newFiles: "New files", removedFiles: "Removed files", changedFiles: "Changed files", biggest: "biggest",
-    sinceLast: "Since last scan", firstScanShort: "first scan — compared from the next one on", clickDetails: "click for details",
-    newShort: "new", goneShort: "gone", changedShort: "changed",
-    oldSnapshotNoFiles: "That snapshot comes from an older version and only knows folders — file changes show up from the next comparison on.",
-    snapshots: "Saved snapshots", onDisk: "on disk", thisScan: "this scan", filesAndFolders: "files & folders",
-    foldersOnly: "folders only", compare: "Compare", deleteSnapshot: "Delete this snapshot?",
-    snapshotsHint: (n) => `Every complete scan is saved automatically (all folders and files, compressed); the newest ${n} per folder are kept — see Settings.`,
-    noDupes: "No duplicates found 🎉", noOwnDupes: "No duplicates among your own files 🎉 — program and game files are hidden.",
-    ownReclaim: "Your files — reclaimable", protHidden: "Program & game files (hidden)", protHiddenSub: "click to show",
-    dupHint: "Every group is byte-for-byte identical content (BLAKE3 over the whole file), whatever the names. Installed programs and games keep such copies on purpose — deleting one breaks them, so they are hidden and never removed while hidden.",
-    showProt: "Show program & game files", identical: "identical", protBadge: "program / game",
-    protWhy: "Part of an installed program or game (by folder or file type) — deleting it can break that program.",
-    protWarn: "This includes files of installed programs or games. They may stop working.",
-    tabGroups: "Groups", tabFolderSets: "Folder pairs", colFolders: "Folders sharing identical files",
-    folderFilter: "Only", sameFolder: "copies within this folder", nothingToReclaim: "Nothing to reclaim in the shown groups.", groups: "groups", reclaimable: "reclaimable",
-    filter: "Filter", sort: "Sort", dryRun: "Dry-run", reclaimShown: "Reclaim shown",
-    sortWasted: "wasted", sortSize: "size", sortCount: "count",
-    actTrash: "→ Recycle Bin", actDelete: "Delete", actHardlink: "Hard-link",
-    showing: "showing", keep: "keep", dupesIn: "Duplicates in",
-    del: "Delete", deleting: "Removing…", removedMsg: "removed", errors: "error(s)",
-    confirmTrash: "Move to the Recycle Bin?", confirmDelete: "Delete permanently?",
-    confirmDeleteWarn: "This cannot be undone.", ok: "OK",
-    reclaimConfirm: (a, n) => `${a}: ${n} file(s)?`, irreversible: "This cannot be undone.",
-    toTrashNote: "(moved to the Recycle Bin — the space is freed when it is emptied)",
-    enterPath: "Enter a folder path first.",
-    // categories
-    cat_video: "Video", cat_image: "Images", cat_audio: "Audio", cat_archive: "Archives",
-    cat_diskimage: "Disk images & VMs", cat_document: "Documents", cat_code: "Code & text data",
-    cat_program: "Programs & libraries", cat_gamedata: "Game data", cat_database: "Databases", cat_other: "Other",
-    noExt: "(no extension)",
-    // settings
-    setTitle: "Settings", setDone: "Done", setReset: "Reset to defaults",
-    setExcl: "Exclusions", setExclDesc: "Templates for well-known build output, caches and system files. Excluded folders are skipped entirely — no time spent walking them. Click a pattern to switch just that one off. Changes apply to new scans; use Rescan for an open one.",
-    setCustom: "Your own patterns", setCustomDesc: "A folder or file name (node_modules), a wildcard (*.iso) or a whole path pattern.",
-    setAdd: "Add", setBadGlob: "Not a valid pattern:", setDup: "Already in the list.",
-    setScan: "Scanning", setTop: "Items per list", setTopD: "Folders and files listed per view.",
-    setDepth: "Max depth", setDepthD: "Empty = unlimited.", setFollow: "Follow symlinks / junctions", setFollowD: "Off avoids loops and double counting.",
-    setParallel: "Parallel scans", setParallelD: "Scans running at the same time; more wait in the queue. 1 is best for a single HDD.",
-    setDupes: "Duplicates", setMinMb: "Ignore files smaller than (MB)",
-    setDelete: "Deleting", setTrash: "Send deleted items to the Recycle Bin", setTrashD: "Off deletes permanently.",
-    engineMft: "Ultra — NTFS MFT (administrator)",
-    engineMftD: "Reads the drive's file table (MFT) in one go instead of opening every folder, also for the duplicate search. Pays off most on the system drive C:, where Windows slows folder listing down (measured: 5× faster). On a SATA SSD with millions of files the table is larger than the folders and Fast can be quicker. Needs administrator rights and a local NTFS drive, otherwise Fast is used automatically. OneDrive folders are always read through Windows; links are not followed.",
-    mftHelperTitle: "One confirmation per session",
-    mftHelperText: "Reading the file table needs administrator rights. On the first Ultra scan Windows asks once; a hidden helper then reads the drives. This window itself never runs as administrator, so dragging folders in keeps working.",
-    dropBlocked: "Diskghost was started as administrator, and Windows does not let Explorer drop folders into such a window. Paste a path above, use Browse… or click a drive.",
-    placeholderAdmin: "Paste a folder path or use Browse…",
-    welcomeTextAdmin: "Paste a folder path above, pick a drive below or use Browse. (Started as administrator: Windows blocks dragging folders in — not needed for Ultra, which asks for the rights itself.) Every scan gets its own entry on the left.",
-    adminBadge: "Admin", mftFallback: "MFT not used",
-    phaseWalk: "Listing files", phaseWalkD: "Finding files of the same size…",
-    phaseSample: "Comparing start and end", phaseSampleD: "each file is opened once",
-    phaseHash: "Checking whole contents (BLAKE3)",
-    protSkipped: "Program & game files", protSkippedSub: "not searched — click to include them (searches again)",
-    setEngine: "Scan engine", engineFast: "Fast — SSD / NVMe (default)", engineGentle: "Gentle — HDD / in the background",
-    engineFastD: "Lists many folders at once (2 threads per CPU core). Fastest on SSDs; on a spinning disk the head jumps around and it can get slower.",
-    engineGentleD: "3 threads. Best for spinning disks and network drives, and keeps the PC responsive while it scans — slower on SSDs.",
-    setKeep: "Snapshots kept per folder", setKeepD: "Older ones are deleted automatically. About 8 bytes per file each.",
-    setLook: "Window & language", setWin: "Window size at start", setLang: "Language",
-    winAuto: "Auto (1440p if it fits, else maximized)", winMax: "Maximized", win1080: "1920 × 1080", win1440: "2560 × 1440", win4k: "3840 × 2160 (4K)",
-    langAuto: "System", langEn: "English", langDe: "Deutsch",
-    // presets
-    pre_vcs: "Version control", pre_node: "JavaScript / Node.js", pre_python: "Python", pre_rust: "Rust / Maven (target)",
-    pre_jvm: "Java / Kotlin / Gradle", pre_dotnet: ".NET / C#", pre_vendor: "Go / PHP vendor", pre_cpp: "C / C++ build output",
-    pre_dart: "Dart / Flutter", pre_ide: "IDE & editor folders", pre_caches: "Caches", pre_temp: "Temporary files",
-    pre_logs: "Log files", pre_winsys: "Windows system files", pre_macos: "macOS system files",
-  },
-  de: {
-    pathLabel: "Ordnerpfad", placeholder: "Ordnerpfad einfügen, Ordner irgendwo hinziehen oder Durchsuchen…",
-    browse: "Durchsuchen…", scan: "Scannen", dupes: "Duplikate finden", settings: "Einstellungen", refresh: "Aktualisieren",
-    drives: "Laufwerke", scanAll: "Alle Laufwerke scannen", scans: "Scans", clearDone: "Fertige entfernen",
-    dropHint: "Ordner irgendwo hinziehen — jeder wird als eigener Scan eingereiht.",
-    dropHere: "Ordner ablegen zum Scannen",
-    excludesNone: "Keine Ausschlüsse", excludesOn: "Ausschlüsse aktiv",
-    free: "frei", of: "von", used: "belegt",
-    kindFixed: "Lokale Festplatte", kindRemovable: "Wechseldatenträger", kindNetwork: "Netzlaufwerk", kindOther: "Volume",
-    stQueued: "Wartet", stRunning: "Scannt", stSearching: "Sucht Duplikate", stDone: "Fertig",
-    stCancelled: "Abgebrochen — unvollständig", stError: "Fehler", stLoading: "Lädt",
-    queuedPos: "Wartet in der Warteschlange — Position", queuedWhy: "Gleichzeitig laufende Scans:",
-    removeFromQueue: "Aus Warteschlange entfernen", cancel: "Abbrechen", close: "Schließen", retry: "Erneut versuchen",
-    files: "Dateien", bytes: "gefunden", elapsed: "vergangen", rate: "Dateien / s",
-    estimated: "des belegten Platzes auf dem Laufwerk", noEstimate: "Größe erst nach dem Scan bekannt",
-    queueInfo: (r, q, p) => `${r} laufen · ${q} warten · bis zu ${p} gleichzeitig`,
-    welcomeTitle: "Wo ist mein Speicherplatz hin?",
-    welcomeText: "Zieh einen oder mehrere Ordner aufs Fenster, wähle unten ein Laufwerk oder nutze Durchsuchen. Jeder Scan bekommt links einen eigenen Eintrag — sie laufen parallel oder warten in der Warteschlange.",
-    up: "Hoch", back: "Zurück", rescan: "Neu scannen", dupesHere: "Duplikate hier finden",
-    backHint: "Vorheriger Ordner (Maus-Zurück-Taste, Alt+←)", upHint: "Übergeordneter Ordner (Rechtsklick auf die Karte, Rücktaste, Alt+↑)",
-    cancelling: "Breche ab…",
-    cancelledNotice: "Dieser Scan wurde abgebrochen — alle Zahlen decken nur den gescannten Teil ab.",
-    depthNotice: "Max. Tiefe: Tiefere Ordner wurden nicht gelesen. ≥ markiert eine Untergrenze, „nicht gemessen“ einen Ordner, der gar nicht gelesen wurde — und vergleichen lässt sich nur ein vollständiger Scan.",
-    boundaryNotice: "Dateisystemgrenze: {n} Ordner auf anderen Dateisystemen (Einhängepunkte, Netzwerk- oder FUSE-Freigaben) wurden aufgelistet, aber nicht gelesen. ≥ markiert eine Untergrenze, „nicht gemessen“ einen Ordner, der gar nicht gelesen wurde — und vergleichen lässt sich nur ein vollständiger Scan.",
-    notMeasured: "nicht gemessen",
-    kSize: "Größe", kSizeOfUsed: "des belegten Platzes auf", kSizeOfDisk: "der Platte",
-    kFiles: "Dateien", kAvg: "Ø", kPerFile: "pro Datei",
-    kFolders: "Ordner", kDirect: "Dateien direkt in diesem Ordner",
-    kBiggestFolder: "Größter Ordner", kBiggestFile: "Größte Datei",
-    kFree: "Frei auf diesem Laufwerk", kUsedPct: "belegt",
-    kScan: "Scan", kSkipped: "nicht lesbar, übersprungen", kNoSkip: "nichts übersprungen",
-    kSince: "Seit",
-    map: "Karte", mapSub: "Fläche = Größe. Klick öffnet einen Ordner, Rechtsklick geht hoch, drüberfahren zeigt Details.",
-    filesHere: "Dateien direkt in diesem Ordner", otherFolders: "kleinere Ordner", filesSmaller: "Dateien & kleinere Ordner",
-    shareOfView: "dieses Ordners", folderFiles: "Dateien",
-    types: "Woraus es besteht", typesSub: "nach Dateityp, Größe auf der Platte",
-    disk: "Laufwerk", diskThis: "Dieser Ordner", diskOther: "Alles andere", diskFree: "Frei",
-    tabFolders: "Ordner", tabFiles: "Größte Dateien", tabTypes: "Endungen", tabSizes: "Größenbereiche", tabChanges: "Änderungen",
-    colName: "Name", colShare: "Anteil", colSize: "Größe", colPct: "%", colFiles: "Dateien", colDelta: "Änderung",
-    colType: "Typ", colExt: "Endung", colCategory: "Kategorie", colCount: "Dateien",
-    filterFiles: "Nach Name oder Pfad filtern…", allCategories: "Alle Kategorien",
-    sizesCount: "Anzahl Dateien pro Größenbereich", sizesBytes: "Belegter Platz pro Größenbereich",
-    sizesHint: "Viele winzige Dateien verschwenden Platz durch Block-Verschnitt und bremsen Kopien; wenige riesige sind der schnellste Gewinn.",
-    since: "Vergleichen mit", showChanges: "Änderungen zeigen", comparing: "Vergleiche…",
-    firstScan: "Erster Scan dieses Ordners — nach dem nächsten Scan siehst du hier, was gewachsen ist.",
-    changes: "Änderungen seit", unchanged: "Nichts geändert.", newBadge: "neu",
-    grew: "Gewachsen", shrank: "Geschrumpft", newFolders: "Neue Ordner", removedFolders: "Entfernte Ordner",
-    newFiles: "Neue Dateien", removedFiles: "Entfernte Dateien", changedFiles: "Geänderte Dateien", biggest: "die größten",
-    sinceLast: "Seit letztem Scan", firstScanShort: "erster Scan — Vergleich ab dem nächsten", clickDetails: "klicken für Details",
-    newShort: "neu", goneShort: "weg", changedShort: "geändert",
-    oldSnapshotNoFiles: "Dieser Snapshot stammt aus einer älteren Version und kennt nur Ordner — Dateiänderungen gibt es ab dem nächsten Vergleich.",
-    snapshots: "Gespeicherte Snapshots", onDisk: "auf der Platte", thisScan: "dieser Scan", filesAndFolders: "Dateien & Ordner",
-    foldersOnly: "nur Ordner", compare: "Vergleichen", deleteSnapshot: "Diesen Snapshot löschen?",
-    snapshotsHint: (n) => `Jeder vollständige Scan wird automatisch gespeichert (alle Ordner und Dateien, komprimiert); die neuesten ${n} pro Ordner bleiben — siehe Einstellungen.`,
-    noDupes: "Keine Duplikate gefunden 🎉", noOwnDupes: "Keine Duplikate unter deinen eigenen Dateien 🎉 — Programm- und Spieldateien sind ausgeblendet.",
-    ownReclaim: "Deine Dateien — freigebbar", protHidden: "Programm- & Spieldateien (ausgeblendet)", protHiddenSub: "klicken zum Anzeigen",
-    dupHint: "Jede Gruppe ist Byte für Byte identischer Inhalt (BLAKE3 über die ganze Datei), egal wie die Dateien heißen. Installierte Programme und Spiele haben solche Kopien absichtlich — Löschen macht sie kaputt, deshalb sind sie ausgeblendet und werden dann nie entfernt.",
-    showProt: "Programm- & Spieldateien zeigen", identical: "identisch", protBadge: "Programm / Spiel",
-    protWhy: "Gehört zu einem installierten Programm oder Spiel (nach Ordner oder Dateityp) — Löschen kann es beschädigen.",
-    protWarn: "Darunter sind Dateien installierter Programme oder Spiele. Sie könnten danach nicht mehr funktionieren.",
-    tabGroups: "Gruppen", tabFolderSets: "Ordner-Paare", colFolders: "Ordner mit identischen Dateien",
-    folderFilter: "Nur", sameFolder: "Kopien in diesem Ordner", nothingToReclaim: "In den angezeigten Gruppen gibt es nichts freizugeben.", groups: "Gruppen", reclaimable: "freigebbar",
-    filter: "Filter", sort: "Sortierung", dryRun: "Testlauf", reclaimShown: "Angezeigte freigeben",
-    sortWasted: "verschwendet", sortSize: "Größe", sortCount: "Anzahl",
-    actTrash: "→ Papierkorb", actDelete: "Löschen", actHardlink: "Hardlink",
-    showing: "zeige", keep: "behalten", dupesIn: "Duplikate in",
-    del: "Löschen", deleting: "Entferne…", removedMsg: "entfernt", errors: "Fehler",
-    confirmTrash: "In den Papierkorb verschieben?", confirmDelete: "Endgültig löschen?",
-    confirmDeleteWarn: "Das lässt sich nicht rückgängig machen.", ok: "OK",
-    reclaimConfirm: (a, n) => `${a}: ${n} Datei(en)?`, irreversible: "Das lässt sich nicht rückgängig machen.",
-    toTrashNote: "(in den Papierkorb verschoben — der Platz wird frei, sobald er geleert wird)",
-    enterPath: "Bitte zuerst einen Ordnerpfad eingeben.",
-    cat_video: "Video", cat_image: "Bilder", cat_audio: "Audio", cat_archive: "Archive",
-    cat_diskimage: "Disk-Images & VMs", cat_document: "Dokumente", cat_code: "Code & Textdaten",
-    cat_program: "Programme & Bibliotheken", cat_gamedata: "Spieldaten", cat_database: "Datenbanken", cat_other: "Sonstiges",
-    noExt: "(keine Endung)",
-    setTitle: "Einstellungen", setDone: "Fertig", setReset: "Auf Standard zurücksetzen",
-    setExcl: "Ausschlüsse", setExclDesc: "Vorlagen für bekannte Build-Ausgaben, Caches und Systemdateien. Ausgeschlossene Ordner werden komplett übersprungen — kein Zeitaufwand. Klick auf ein Muster schaltet nur dieses ab. Gilt für neue Scans; für einen offenen Scan „Neu scannen“.",
-    setCustom: "Eigene Muster", setCustomDesc: "Ein Ordner- oder Dateiname (node_modules), ein Platzhalter (*.iso) oder ein Pfadmuster.",
-    setAdd: "Hinzufügen", setBadGlob: "Kein gültiges Muster:", setDup: "Steht schon in der Liste.",
-    setScan: "Scannen", setTop: "Einträge pro Liste", setTopD: "Ordner und Dateien pro Ansicht.",
-    setDepth: "Max. Tiefe", setDepthD: "Leer = unbegrenzt.", setFollow: "Symlinks / Junctions folgen", setFollowD: "Aus vermeidet Schleifen und Doppelzählung.",
-    setParallel: "Parallele Scans", setParallelD: "Gleichzeitig laufende Scans; weitere warten. 1 ist am besten für eine einzelne HDD.",
-    setDupes: "Duplikate", setMinMb: "Dateien kleiner als (MB) ignorieren",
-    setDelete: "Löschen", setTrash: "Gelöschtes in den Papierkorb", setTrashD: "Aus löscht endgültig.",
-    engineMft: "Ultra — NTFS MFT (Administrator)",
-    engineMftD: "Liest die Dateitabelle (MFT) des Laufwerks am Stück, statt jeden Ordner zu öffnen, auch für die Duplikatsuche. Bringt am meisten auf dem Systemlaufwerk C:, wo Windows das Auflisten bremst (gemessen: 5× schneller). Auf einer SATA-SSD mit Millionen Dateien ist die Tabelle größer als die Ordner, dort kann „Schnell“ schneller sein. Braucht Administratorrechte und ein lokales NTFS-Laufwerk, sonst wird automatisch „Schnell“ benutzt. OneDrive-Ordner werden immer über Windows gelesen; Links werden nicht verfolgt.",
-    mftHelperTitle: "Eine Bestätigung pro Sitzung",
-    mftHelperText: "Das Lesen der Dateitabelle braucht Administratorrechte. Beim ersten Ultra-Scan fragt Windows einmal nach; danach liest ein unsichtbarer Helfer die Laufwerke. Dieses Fenster selbst läuft nie als Administrator, Ordner reinziehen funktioniert also weiter.",
-    dropBlocked: "Diskghost wurde als Administrator gestartet, und Windows lässt den Explorer keine Ordner in so ein Fenster ziehen. Pfad oben einfügen, Durchsuchen… nutzen oder ein Laufwerk anklicken.",
-    placeholderAdmin: "Ordnerpfad einfügen oder Durchsuchen…",
-    welcomeTextAdmin: "Ordnerpfad oben einfügen, unten ein Laufwerk wählen oder Durchsuchen nutzen. (Als Administrator gestartet: Windows blockiert das Reinziehen von Ordnern — für Ultra unnötig, das fragt selbst nach den Rechten.) Jeder Scan bekommt links einen eigenen Eintrag.",
-    adminBadge: "Admin", mftFallback: "MFT nicht benutzt",
-    phaseWalk: "Dateien auflisten", phaseWalkD: "Suche Dateien gleicher Größe…",
-    phaseSample: "Anfang und Ende vergleichen", phaseSampleD: "jede Datei wird einmal geöffnet",
-    phaseHash: "Ganze Inhalte prüfen (BLAKE3)",
-    protSkipped: "Programm- & Spieldateien", protSkippedSub: "nicht durchsucht — klicken zum Einbeziehen (sucht neu)",
-    setEngine: "Scan-Engine", engineFast: "Schnell — SSD / NVMe (Standard)", engineGentle: "Schonend — HDD / im Hintergrund",
-    engineFastD: "Liest viele Ordner gleichzeitig (2 Threads pro CPU-Kern). Am schnellsten auf SSDs; auf einer HDD springt der Lesekopf hin und her und es kann langsamer werden.",
-    engineGentleD: "3 Threads. Am besten für HDDs und Netzlaufwerke, und der PC bleibt beim Scannen flüssig — auf SSDs langsamer.",
-    setKeep: "Snapshots pro Ordner behalten", setKeepD: "Ältere werden automatisch gelöscht. Etwa 8 Byte pro Datei je Snapshot.",
-    setLook: "Fenster & Sprache", setWin: "Fenstergröße beim Start", setLang: "Sprache",
-    winAuto: "Auto (1440p wenn es passt, sonst maximiert)", winMax: "Maximiert", win1080: "1920 × 1080", win1440: "2560 × 1440", win4k: "3840 × 2160 (4K)",
-    langAuto: "System", langEn: "English", langDe: "Deutsch",
-    pre_vcs: "Versionskontrolle", pre_node: "JavaScript / Node.js", pre_python: "Python", pre_rust: "Rust / Maven (target)",
-    pre_jvm: "Java / Kotlin / Gradle", pre_dotnet: ".NET / C#", pre_vendor: "Go / PHP vendor", pre_cpp: "C / C++ Build-Ausgabe",
-    pre_dart: "Dart / Flutter", pre_ide: "IDE- & Editor-Ordner", pre_caches: "Caches", pre_temp: "Temporäre Dateien",
-    pre_logs: "Log-Dateien", pre_winsys: "Windows-Systemdateien", pre_macos: "macOS-Systemdateien",
-  },
-};
+// Strings live in i18n.js (global I18N).
 const lang = () => {
   if (settings.language !== "auto") return settings.language;
   return (navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en";
 };
 const t = (k) => I18N[lang()][k] ?? I18N.en[k] ?? k;
-// Why a scan is incomplete: cancelled, folders on other filesystems
-// (boundary cuts), or the depth limit — each gets its own notice.
-const partialNotice = (v) =>
-  v.cancelled ? t("cancelledNotice")
-    : v.boundary_cuts > 0 ? t("boundaryNotice").replace("{n}", num(v.boundary_cuts))
-    : t("depthNotice");
+// Why the numbers on screen are lower bounds: every cause that applies
+// (cancel, folders on other filesystems, the depth limit the scan ran with),
+// or an explicit "not reported" — never a guessed cause.
+function partialNotice(v, j) {
+  const pc = partialCauses(v, j?.opts?.max_depth ?? null);
+  if (!pc.partial) return pc.cancelledWalk ? t("cancelledWalkNotice") : "";
+  const why = pc.causes.map((c) =>
+    c.kind === "cancelled" ? t("causeCancelled")
+      : c.kind === "boundary" ? t("causeBoundary").replace("{n}", num(c.n))
+      : c.kind === "depth" ? t("causeDepth").replace("{n}", num(c.n))
+      : t("causeUnknown"));
+  return `${why.join(" ")} ${t("lowerBoundNote")}`;
+}
 const num = (n) => Number(n || 0).toLocaleString(lang() === "de" ? "de-DE" : "en-US");
 
 // Started as administrator: Explorer cannot drop into this window, so the
@@ -285,6 +70,14 @@ function el(tag, attrs, ...kids) {
       else if (k === "style") Object.assign(n.style, v);
       else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
       else n.setAttribute(k, v === true ? "" : v);
+    }
+    // A non-button element acting as a button answers Enter and Space too.
+    if (attrs.role === "button" && tag !== "button" && typeof attrs.onclick === "function") {
+      n.addEventListener("keydown", (e) => {
+        if (e.target !== n || (e.key !== "Enter" && e.key !== " ")) return;
+        e.preventDefault();
+        attrs.onclick(e);
+      });
     }
   }
   for (const kid of kids.flat()) {
@@ -383,8 +176,10 @@ function numberInput(value, min, max, onchange, placeholder) {
   return el("input", {
     type: "number", min, max, value: value ?? "", placeholder,
     onchange: (e) => {
-      const v = parseInt(e.target.value, 10);
-      onchange(Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : null);
+      const v = clampInt(e.target.value, min, max);
+      // Show what is actually saved, not what was typed.
+      e.target.value = v ?? "";
+      onchange(v);
     },
   });
 }
@@ -447,10 +242,13 @@ function renderSettings() {
   const add = async () => {
     const pats = addInput.value.split(",").map((s) => s.trim()).filter(Boolean);
     if (!pats.length) return;
-    const bad = await invoke("check_globs", { patterns: pats }).catch(() => []);
-    if (bad.length) { addMsg.textContent = `${t("setBadGlob")} ${bad.join(", ")}`; addMsg.style.color = "var(--danger)"; return; }
+    let bad;
+    try { bad = await invoke("check_globs", { patterns: pats }); } catch (e) {
+      addMsg.textContent = `${t("globCheckFailed")} ${errText(e)}`; addMsg.classList.add("bad"); return;
+    }
+    if (bad.length) { addMsg.textContent = `${t("setBadGlob")} ${bad.join(", ")}`; addMsg.classList.add("bad"); return; }
     const fresh = pats.filter((p) => !settings.custom.some((c) => c.pattern === p));
-    if (!fresh.length) { addMsg.textContent = t("setDup"); return; }
+    if (!fresh.length) { addMsg.textContent = t("setDup"); addMsg.classList.remove("bad"); return; }
     settings.custom.push(...fresh.map((pattern) => ({ pattern, on: true })));
     set({}, true);
     $("settings-dlg").querySelector(".addrow input")?.focus();
@@ -561,6 +359,8 @@ function enqueue(kind, path, { select = true, includeProt = false } = {}) {
     JSON.stringify(j.opts) === JSON.stringify(opts));
   if (same) {
     if (select) selectJob(same.id);
+    // Asking again for a scan that was cancelled means: scan it for real.
+    if (same.state === "cancelled") rescan(same);
     return same;
   }
   const j = {
@@ -595,7 +395,13 @@ async function runJob(j) {
   j.state = "running";
   j.files = 0;
   j.bytes = 0;
+  j.phase = 0;
+  j.lastPhase = 0;
+  j.totalFiles = 0;
+  j.totalBytes = 0;
   j.cancelRequested = false;
+  j.cancelAt = 0;
+  j.run = (j.run || 0) + 1; // results of an earlier run of this job are stale
   j.startedAt = performance.now();
   j.scanUnix = Math.floor(Date.now() / 1000);
   j.error = null;
@@ -627,11 +433,19 @@ async function runJob(j) {
       j.keep = new Map();
       j.tagged = false;
       j.dupSet = null;
-      j.state = j.cancelRequested ? "cancelled" : "done";
+      const out = dupesOutcome(j.cancelRequested, j.groups, j.lastPhase);
+      j.state = out.state;
+      j.hashesKept = out.hashesKept;
     }
   } catch (e) {
     j.state = "error";
     j.error = errText(e);
+  }
+  // Closed while it ran: the backend stored the tree only now — free it.
+  if (j.closed) {
+    if (j.kind === "scan") invoke("forget_tree", { job: j.id }).catch(() => {});
+    pump();
+    return;
   }
   if (byId(j.id)) renderFor(j);
   pump();
@@ -642,18 +456,23 @@ async function cancelJob(j) {
   if (j.state === "queued") return closeJob(j);
   if (j.state === "running") {
     j.cancelRequested = true;
+    j.cancelAt = performance.now();
     renderFor(j);
     try { await invoke("cancel", { job: j.id }); } catch (_) { /* finished meanwhile */ }
   }
 }
 
 function closeJob(j) {
-  if (j.state === "running") invoke("cancel", { job: j.id }).catch(() => {});
   const i = jobs.indexOf(j);
   if (i < 0) return;
   jobs.splice(i, 1);
-  // Free the tree's memory.
-  if (j.kind === "scan") invoke("forget_tree", { job: j.id }).catch(() => {});
+  j.closed = true;
+  if (j.state === "running") {
+    // The tree is stored when scan_dir returns; runJob frees it then.
+    invoke("cancel", { job: j.id }).catch(() => {});
+  } else if (j.kind === "scan") {
+    invoke("forget_tree", { job: j.id }).catch(() => {}); // free the tree's memory
+  }
   if (activeId === j.id) activeId = (jobs[i] || jobs[i - 1])?.id ?? null;
   pump();
   renderAll();
@@ -685,9 +504,13 @@ function rescan(j) {
 // its tree in memory (a fraction of a second). Never walks the disk.
 async function navigate(j, path, { keepTab = false, record = true, force = false } = {}) {
   if (!force && j.view && path === j.path) return;
-  if (record && j.path !== path) j.back.push(j.path);
+  const pushed = record && j.path !== path;
+  if (pushed) j.back.push(j.path);
+  j.navGuard = j.navGuard || latestOnly();
+  const ticket = j.navGuard.next();
   if (!keepTab && j.tab === "changes") j.tab = "folders";
   const show = (v) => {
+    if (!j.navGuard.current(ticket)) return; // a newer navigation won
     j.view = v;
     j.path = String(v.root);
     j.diff = null;
@@ -705,8 +528,9 @@ async function navigate(j, path, { keepTab = false, record = true, force = false
     j.cache.set(String(v.root), v);
     show(v);
   } catch (e) {
+    if (!j.navGuard.current(ticket)) return;
     j.loading = false;
-    if (record) j.back.pop();
+    if (pushed) j.back.pop();
     status(errText(e), true);
     if (byId(j.id)) renderFor(j);
   }
@@ -754,6 +578,7 @@ function jobSub(j) {
     return `${what} · ${num(j.files)} ${t("files")} · ${human(j.bytes)}`;
   }
   if (j.state === "error") return `${t("stError")}: ${j.error}`;
+  if (j.kind === "dupes" && j.state === "cancelled") return t("stCancelled");
   if (j.kind === "dupes" && j.groups) {
     // Counted like the view: only the user's own files are reclaimable.
     tagGroups(j);
@@ -800,8 +625,7 @@ function jobRow(j) {
   };
   r.row = el("div", {
     role: "button", tabindex: "0",
-    onclick: () => selectJob(id),
-    onkeydown: (e) => { if (e.key === "Enter") selectJob(id); },
+    onclick: () => selectJob(id), // el() adds Enter/Space for role=button
   }, r.icon, r.name, r.close, r.sub, r.meter);
   jobRows.set(id, r);
   return r;
@@ -888,7 +712,8 @@ function progressInfo(j) {
   if (j.kind !== "dupes") {
     const est = estimate(j);
     return {
-      title: `${t("stRunning")}${j.opts?.mft ? " · NTFS MFT" : ""}`,
+      // Only "requested": the helper may still fall back to the walk.
+      title: `${t("stRunning")}${j.opts?.mft ? ` · ${t("mftRequested")}` : ""}`,
       frac: est,
       detail: est == null ? t("noEstimate") : `≈ ${pct(est, 1)} ${t("estimated")}`,
     };
@@ -934,7 +759,7 @@ function updateProgressView(j) {
   set("pv-files", num(j.files));
   set("pv-time", fmtMs(secs * 1000));
   set("pv-rate", secs > 0.5 ? num(Math.round(j.files / secs)) : "–");
-  set("pv-est", p.detail);
+  set("pv-est", j.cancelRequested ? t("cancelWaiting").replace("{s}", fmtMs(performance.now() - j.cancelAt)) : p.detail);
   const meter = $("pv-meter");
   if (meter) {
     meter.classList.toggle("indeterminate", p.frac == null);
@@ -983,8 +808,8 @@ function scanView(j) {
     el("button", { type: "button", class: "small", onclick: () => enqueue("dupes", j.path) }, `👯 ${t("dupesHere")}`),
     el("button", { type: "button", class: "small", onclick: () => rescan(j) }, `↻ ${t("rescan")}`));
   view.append(el("div", { class: "full", style: { display: "flex", flexDirection: "column", gap: "12px" } },
-    head, (v.cancelled || v.complete === false)
-      ? el("div", { class: "notice", text: `⚠ ${partialNotice(v)}` }) : null));
+    head, partialNotice(v, j)
+      ? el("div", { class: "notice", text: `⚠ ${partialNotice(v, j)}` }) : null));
 
   view.append(kpiRow(j, v));
 
@@ -1067,6 +892,7 @@ function sinceLastCard(j) {
 
 // Compare a finished scan with the newest earlier snapshot of its root.
 async function autoCompare(j) {
+  const run = j.run;
   j.auto = { state: "loading" };
   renderFor(j);
   try {
@@ -1079,8 +905,10 @@ async function autoCompare(j) {
       j.auto = { state: "done", diff };
     }
   } catch (e) {
+    if (j.run !== run) return;
     j.auto = { state: "error", error: errText(e) };
   }
+  if (j.run !== run) return; // the job was rescanned meanwhile
   if (byId(j.id)) renderFor(j);
 }
 
@@ -1096,7 +924,14 @@ async function openCompare(j) {
   }
   renderMain();
   if (!j.history) {
-    try { j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || []; } catch (_) { j.history = []; }
+    try {
+      j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || [];
+      j.historyError = null;
+    } catch (e) {
+      j.history = [];
+      j.historyError = errText(e);
+      return renderMain();
+    }
   }
   const older = j.history.filter((s) => s.taken_at < j.scanUnix);
   if (older.length) await showChanges(j, j.sinceAt ?? older[0].taken_at);
@@ -1415,16 +1250,20 @@ function sizesTab(v, body) {
 // Every complete scan is stored as a snapshot of its root (every folder and
 // file, compressed). Compare the folder on screen against an earlier one.
 async function changesTab(j, v, body, tools) {
-  if (j.partial) return body.append(el("div", { class: "muted", text: partialNotice(v) }));
+  if (j.partial) return body.append(el("div", { class: "muted", text: partialNotice(j.cache.get(j.root) || v, j) }));
   if (!j.history) {
     try {
       j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || [];
-    } catch (_) {
+      j.historyError = null;
+    } catch (e) {
       j.history = [];
+      j.historyError = errText(e);
     }
     if (active() === j && j.tab === "changes") renderMain();
     return;
   }
+  // A failed read is not "no history": say what failed.
+  if (j.historyError) return body.append(el("div", { class: "error", text: `${t("historyFailed")} ${j.historyError}` }));
   // Snapshots older than this scan; the newest one is usually the scan itself.
   const older = j.history.filter((s) => s.taken_at < j.scanUnix);
   if (older.length) {
@@ -1434,6 +1273,7 @@ async function changesTab(j, v, body, tools) {
     tools.append(el("label", { class: "inlabel" }, `${t("since")} `, sel),
       el("button", { type: "button", class: "small primary", onclick: () => showChanges(j, parseInt(sel.value, 10)) }, t("showChanges")));
   }
+  if (j.diffError) body.append(el("div", { class: "error", text: `${t("diffFailed")} ${j.diffError}` }));
   if (j.diff) renderChanges(j.diff, body, j);
   else if (!older.length) body.append(el("div", { class: "muted", text: t("firstScan") }));
   snapshotList(j, body);
@@ -1441,13 +1281,23 @@ async function changesTab(j, v, body, tools) {
 
 async function showChanges(j, takenAt) {
   j.sinceAt = takenAt;
+  j.diffGuard = j.diffGuard || latestOnly();
+  const ticket = j.diffGuard.next();
+  const path = j.path;
   status(t("comparing"));
+  let diff = null, error = null;
   try {
-    j.diff = await invoke("diff_since", { job: j.id, path: j.path, takenAt, top: j.top });
+    diff = await invoke("diff_since", { job: j.id, path, takenAt, top: j.top });
     status("");
   } catch (e) {
-    status(errText(e), true);
+    error = errText(e);
+    status(error, true);
   }
+  // Only the newest comparison for the folder still on screen counts; a
+  // failure clears the old diff instead of leaving it under the new date.
+  if (!j.diffGuard.current(ticket) || j.path !== path) return;
+  j.diff = diff;
+  j.diffError = error;
   if (active() === j) renderMain();
 }
 
@@ -1589,7 +1439,10 @@ function dupesView(j) {
     el("div", { class: "crumbs" }, el("span", { class: "crumb cur", text: `👯 ${t("dupesIn")} ${j.root}` })),
     el("span", { class: "grow" }),
     el("button", { type: "button", class: "small", onclick: () => rescan(j) }, `↻ ${t("rescan")}`)));
-  if (j.state === "cancelled") wrap.append(el("div", { class: "notice", text: `⚠ ${t("stCancelled")}` }));
+  if (j.state === "cancelled") {
+    wrap.append(el("div", { class: "notice", text: `⚠ ${t("dupesCancelled")} ${t(j.hashesKept ? "dupesHashesKept" : "dupesNothingKept")}` }));
+    return wrap;
+  }
   if (!groups.length) {
     wrap.append(el("div", { class: "card" }, el("div", { class: "ok", style: { fontSize: "18px" }, text: t("noDupes") })));
     return wrap;
@@ -1708,18 +1561,17 @@ function keptPath(j, g) {
 async function reclaimShown(j, dryRun) {
   const action = j.dupAction || "trash";
   // While program and game files are hidden, none of them is ever removed.
-  const reclaimJobs = computeShown(j)
-    .map((g) => {
-      const keep = keptPath(j, g);
-      const remove = g.files.filter((f, i) => f !== keep && (j.dupShowProt || !g.prot[i]));
-      return { keep, remove, size: g.size, prot: remove.some(isProtectedPath) };
-    })
-    .filter((x) => x.remove.length > 0);
+  const shown = computeShown(j);
+  const plan = reclaimPlan(shown, j.keep, j.dupShowProt);
+  const reclaimJobs = plan.jobs;
   if (!reclaimJobs.length) return status(t("nothingToReclaim"));
-  const count = reclaimJobs.reduce((a, x) => a + x.remove.length, 0);
-  const touchesProt = reclaimJobs.some((x) => x.prot);
+  const count = plan.files;
+  const touchesProt = plan.prot;
+  const hidden = Math.max(0, shown.length - 1000);
   const label = { trash: t("actTrash"), delete: t("actDelete"), hardlink: t("actHardlink") }[action];
   const warn = [
+    { text: `${num(plan.groups)} ${t("groups")} · ${human(plan.bytes)}` },
+    hidden ? { text: t("reclaimHiddenNote")(num(hidden)), cls: "error" } : null,
     action === "trash" ? null : { text: t("irreversible"), cls: "error" },
     touchesProt ? { text: t("protWarn"), cls: "error" } : null,
   ].filter(Boolean);
@@ -1778,6 +1630,7 @@ try {
     if (!j || j.state !== "running") return;
     j.files = e.payload.files;
     j.phase = e.payload.phase;
+    j.lastPhase = Math.max(j.lastPhase || 0, e.payload.phase || 0);
     j.totalFiles = e.payload.total_files;
     j.totalBytes = e.payload.total_bytes;
     j.bytes = e.payload.bytes;
