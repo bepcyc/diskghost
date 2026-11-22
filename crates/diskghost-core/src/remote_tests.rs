@@ -1798,3 +1798,184 @@ fn an_agent_scan_cut_short_drops_no_rows() {
     assert_eq!((s.seen, s.vanished), (1, 0));
     assert_eq!(all_rows(&e.idx, &s.uuid).len(), 3, "nothing dropped");
 }
+
+// ---- ssh:// scans (GUI / `diskghost scan`): a tree, no index ----------
+
+fn tree_listing(url: &str, h: &dyn RemoteExec) -> io::Result<RemoteListing> {
+    remote_listing_with(url, h, AgentMode::Never, None, &Progress::default())
+}
+
+#[test]
+fn a_remote_folder_becomes_a_tree_rooted_at_its_ssh_url() {
+    let h = FakeHost::linux();
+    h.put("/storage/a.bin", &[0; 10], T0);
+    h.put("/storage/sub/b.bin", &[0; 100], T0);
+    h.put("/storage/sub/deep/c.bin", &[0; 1000], T0);
+    // Sorts between `sub` and `sub/…` byte-wise: folders must still come
+    // out whole.
+    h.put("/storage/sub-x.txt", &[0; 7], T0);
+    h.put("/storage/sub.d/e.bin", &[0; 3], T0);
+    h.put("/storage/z.bin", &[0; 5], T0);
+    let l = tree_listing(URL, &h).unwrap();
+    assert_eq!(l.root, "/storage");
+    assert_eq!(l.host, "adroid");
+    assert_eq!(l.url(), "ssh://adroid//storage");
+    assert!(l.listing.complete && !l.cancelled);
+    let t = l.tree();
+    let root = PathBuf::from("ssh://adroid//storage");
+    assert_eq!(t.root(), root.as_path());
+    assert!(t.complete());
+    let r = t.root_report(10);
+    assert_eq!(r.total_size, 10 + 100 + 1000 + 7 + 3 + 5);
+    assert_eq!(r.total_files, 6);
+    assert_eq!(r.total_dirs, 3, "sub, sub/deep, sub.d");
+    let sub = t.report(&root.join("sub"), 10).unwrap();
+    assert_eq!((sub.total_size, sub.total_files), (1100, 2));
+    let deep = t.report(&root.join("sub").join("deep"), 10).unwrap();
+    assert_eq!(deep.total_size, 1000);
+    let kids: Vec<PathBuf> = t
+        .children(&root, 10)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.path)
+        .collect();
+    assert!(kids.contains(&root.join("sub")) && kids.contains(&root.join("sub.d")));
+    // The URL root round-trips: a rescan of it lists the same folder.
+    assert_eq!(parse_ssh_url(&l.url()).unwrap().1, "/storage");
+}
+
+#[test]
+fn hard_links_on_the_remote_count_once_in_the_tree() {
+    let h = FakeHost::linux();
+    h.put_ino("/storage/a.bin", &[0; 50], T0, 77);
+    h.put_ino("/storage/backup/a.bin", &[0; 50], T0, 77);
+    h.put_ino("/storage/b.bin", &[0; 9], T0, 78);
+    let t = tree_listing(URL, &h).unwrap().tree();
+    let r = t.root_report(10);
+    assert_eq!((r.total_size, r.total_files), (59, 2));
+}
+
+#[test]
+fn an_incomplete_remote_listing_gives_a_partial_tree_never_a_complete_one() {
+    let h = FakeHost::linux();
+    h.put("/storage/a.bin", &[0; 10], T0);
+    h.find_code.store(1, AtomicOrdering::SeqCst);
+    let l = tree_listing(URL, &h).unwrap();
+    assert!(!l.listing.complete);
+    let t = l.tree();
+    assert!(!t.complete(), "a partial listing must never be snapshotted");
+    assert!(!t.cancelled(), "partial, not cancelled");
+}
+
+#[test]
+fn a_cancelled_remote_scan_lists_nothing_and_is_marked_cancelled() {
+    let h = FakeHost::linux();
+    h.put("/storage/a.bin", &[0; 10], T0);
+    let p = Progress::default();
+    p.cancel();
+    let l = remote_listing_with(URL, &h, AgentMode::Never, None, &p).unwrap();
+    assert!(l.cancelled);
+    assert_eq!(h.count(|c| kind(c) == "find"), 0, "{:?}", kinds(&h));
+    let t = l.tree();
+    assert!(t.cancelled() && !t.complete());
+}
+
+#[test]
+fn a_remote_scan_only_probes_resolves_and_lists() {
+    let h = FakeHost::linux();
+    h.put("/storage/a.bin", &[0; 10], T0);
+    h.put("/storage/b.bin", &[0; 10], T0);
+    let l = tree_listing(URL, &h).unwrap();
+    assert_eq!(kinds(&h), ["probe", "resolve", "find"]);
+    assert_eq!(l.transport, "shell");
+    assert_eq!(l.agent_note, None);
+    // Neither tier reports free space: unknown, never made up.
+    assert_eq!(l.disk, None);
+}
+
+#[test]
+fn a_remote_scan_says_why_the_agent_was_not_used() {
+    let h = FakeHost::linux().with_arch("aarch64");
+    h.put("/storage/a.bin", &[0; 10], T0);
+    let l = remote_listing_with(
+        URL,
+        &h,
+        AgentMode::Auto,
+        Some(&test_bin()),
+        &Progress::default(),
+    )
+    .unwrap();
+    assert_eq!(l.transport, "shell");
+    let note = l.agent_note.unwrap();
+    assert!(note.contains("aarch64"), "{note}");
+    assert_eq!(h.count(|c| kind(c) == "upload"), 0);
+}
+
+#[test]
+fn remote_scan_errors_carry_the_hosts_own_message() {
+    // Not there.
+    let h = FakeHost::linux();
+    let err = tree_listing("ssh://adroid//nope", &h).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert!(err.to_string().contains("not found"), "{err}");
+    // Unreachable.
+    let h = FakeHost::linux();
+    h.down.store(true, AtomicOrdering::SeqCst);
+    let err = tree_listing(URL, &h).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+    assert!(err.to_string().contains("unreachable"), "{err}");
+    // SFTP-only.
+    let h = x86();
+    h.no_shell.store(true, AtomicOrdering::SeqCst);
+    let err = remote_listing_with(
+        URL,
+        &h,
+        AgentMode::Auto,
+        Some(&test_bin()),
+        &Progress::default(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("read over the network"), "{err}");
+    // Not an ssh URL / a bad host.
+    let h = FakeHost::linux();
+    assert_eq!(
+        tree_listing("ssh://-oProxyCommand=x/", &h)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(h.calls().is_empty());
+}
+
+#[test]
+fn the_agent_tier_and_the_shell_tier_build_the_same_tree() {
+    if !local_target_ok() {
+        return;
+    }
+    let e = Estate::new("tree-agent-parity");
+    let root = e.loc("r");
+    write(&root.join("a.bin"), &content(1));
+    write(&root.join("sub dir/it's b.bin"), &content(2));
+    write(&root.join("sub dir/deeper/c.bin"), b"c");
+    let url = format!("ssh://localhost/{}", root.to_str().unwrap());
+    let shell = tree_listing(&url, &LocalExec).unwrap();
+    let a = LocalAgent::new();
+    let agent = remote_listing_with(
+        &url,
+        &a,
+        AgentMode::Auto,
+        Some(&test_bin()),
+        &Progress::default(),
+    )
+    .unwrap();
+    assert_eq!((shell.transport, agent.transport), ("shell", "agent"));
+    let (ts, ta) = (shell.tree(), agent.tree());
+    let (rs, ra) = (ts.root_report(10), ta.root_report(10));
+    assert_eq!(
+        (rs.total_size, rs.total_files, rs.total_dirs),
+        (ra.total_size, ra.total_files, ra.total_dirs)
+    );
+    assert_eq!(rs.total_files, 3);
+    assert_eq!(rs.total_dirs, 2);
+    assert!(ts.complete() && ta.complete());
+}

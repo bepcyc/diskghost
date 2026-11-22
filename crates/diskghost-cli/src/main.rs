@@ -116,6 +116,11 @@ enum Command {
         /// appeared or vanished since then. Not with --max-depth.
         #[arg(long, value_name = "FILE", conflicts_with = "max_depth")]
         since: Option<PathBuf>,
+        /// A remote folder (`ssh://host/path`) is listed on the host: `auto`
+        /// runs this program there when it can (see `index add --agent`),
+        /// `never` uses the host's shell tools.
+        #[arg(long, value_enum, default_value = "auto")]
+        agent: AgentArg,
     },
     /// Compare two snapshots saved with `scan --save`.
     Diff {
@@ -411,6 +416,7 @@ fn main() -> ExitCode {
             walk,
             save,
             since,
+            agent: _,
         } => {
             if !path.is_dir() {
                 eprintln!("error: not a directory: {}", path.display());

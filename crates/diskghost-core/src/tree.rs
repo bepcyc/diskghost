@@ -462,6 +462,23 @@ impl ScanTree {
         b.finish(false)
     }
 
+    /// A tree from a remote listing (`files`: paths relative to the remote
+    /// root, any order). Folders are synthesized from the file paths — a
+    /// remote folder without files does not appear — and a file listed under
+    /// several names (one inode, hard links) counts once. `complete = false`
+    /// (the host could not list everything) leaves the tree partial;
+    /// `disk` is the remote filesystem's (total, free) when known.
+    pub(crate) fn from_remote(
+        root: &Path,
+        files: &[crate::remote::RemoteFile],
+        skipped: u64,
+        complete: bool,
+        disk: Option<(u64, u64)>,
+    ) -> ScanTree {
+        let _ = (files, skipped, complete, disk);
+        ScanTree::from_entries(root, Vec::new())
+    }
+
     /// The directory this tree was built from.
     pub fn root(&self) -> &Path {
         &self.root

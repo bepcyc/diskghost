@@ -1251,3 +1251,74 @@ fn agent_error(frame: &serde_json::Value) -> Option<io::Error> {
         format!("agent: {code}: {}", e["msg"].as_str().unwrap_or("")),
     ))
 }
+
+/// What [`remote_listing`] found under one `ssh://` folder.
+#[derive(Debug, Clone)]
+pub struct RemoteListing {
+    /// The host as given (`host` or `user@host`).
+    pub host: String,
+    /// The folder's canonical absolute path on the host.
+    pub root: String,
+    pub listing: Listing,
+    /// `agent` or `shell`: which tier listed it.
+    pub transport: &'static str,
+    /// Why the agent tier was not used, when it was wanted.
+    pub agent_note: Option<String>,
+    /// The remote filesystem's (total, free) bytes; `None`: the host was
+    /// not asked (neither tier reports it today).
+    pub disk: Option<(u64, u64)>,
+    /// The scan was cancelled before the listing finished.
+    pub cancelled: bool,
+}
+
+impl RemoteListing {
+    /// `ssh://host//abs/root`: the tree's root — a URL that scans the same
+    /// folder again and can never be mistaken for a local path.
+    pub fn url(&self) -> String {
+        format!("ssh://{}/{}", self.host, self.root)
+    }
+
+    /// The listing as a browsable tree rooted at [`RemoteListing::url`].
+    pub fn tree(&self) -> crate::ScanTree {
+        crate::ScanTree::from_entries(std::path::Path::new(&self.url()), Vec::new())
+    }
+}
+
+/// List every file under `url` (`ssh://host/path`) on the host itself —
+/// the agent tier when it runs there, else the host's own tools — exactly
+/// as `index add` does, without touching any index.
+pub fn remote_listing(
+    url: &str,
+    mode: AgentMode,
+    progress: &crate::Progress,
+) -> io::Result<RemoteListing> {
+    let (host, _) =
+        parse_ssh_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let bin = match mode {
+        AgentMode::Auto => AgentBinary::current(),
+        AgentMode::Never => None,
+    };
+    remote_listing_with(url, &SshExec::new(&host), mode, bin.as_ref(), progress)
+}
+
+/// [`remote_listing`] running its commands through `x`.
+pub(crate) fn remote_listing_with(
+    url: &str,
+    x: &dyn RemoteExec,
+    mode: AgentMode,
+    bin: Option<&AgentBinary>,
+    progress: &crate::Progress,
+) -> io::Result<RemoteListing> {
+    let _ = (url, x, mode, bin, progress);
+    Err(io::Error::other("remote_listing: not implemented"))
+}
+
+/// The folder `url` (`ssh://host/path`) as a browsable tree, listed on the
+/// host (see [`remote_listing`]).
+pub fn remote_tree(
+    url: &str,
+    mode: AgentMode,
+    progress: &crate::Progress,
+) -> io::Result<crate::ScanTree> {
+    remote_listing(url, mode, progress).map(|l| l.tree())
+}

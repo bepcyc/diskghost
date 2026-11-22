@@ -293,6 +293,44 @@ pub(crate) fn parse_mountinfo_entry(line: &str) -> Option<MountEntry> {
     })
 }
 
+/// One real local filesystem, as the drive list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalMount {
+    /// The device as `stat` reports it.
+    pub dev: u64,
+    /// Where the filesystem's own root is mounted.
+    pub mount_point: PathBuf,
+    /// Filesystem type as the kernel names it (`ext4`, `xfs`, `fuseblk`, …).
+    pub fstype: String,
+    /// What was mounted (`/dev/sda1`, a ZFS dataset, …).
+    pub source: String,
+}
+
+/// Filesystem types that hold data on local storage. An explicit allowlist:
+/// anything else (`tmpfs`, `proc`, `overlay`, `squashfs`, `autofs`, …) is
+/// never a drive.
+const REAL_FS: &[&str] = &[
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "reiserfs", "jfs", "nilfs2", "bcachefs", "zfs",
+    "ufs", "ffs", "hfs", "hfsplus", "apfs", "ntfs", "ntfs3", "fuseblk", "exfat", "vfat", "msdos",
+    "udf", "iso9660", "ocfs2", "gfs2",
+];
+
+/// The real local filesystems of a `/proc/self/mountinfo` text, each once
+/// (first mountpoint of a device wins), in mount-table order.
+pub(crate) fn local_mounts_from(info: &str) -> Vec<LocalMount> {
+    let _ = (info, REAL_FS);
+    Vec::new()
+}
+
+/// Every real local filesystem mounted on this machine (Linux: from
+/// `/proc/self/mountinfo`; empty where that table cannot be read).
+#[cfg(unix)]
+pub fn local_mounts() -> Vec<LocalMount> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|info| local_mounts_from(&info))
+        .unwrap_or_default()
+}
+
 /// Decode the kernel's `\ooo` octal escapes in a mountinfo field.
 #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 fn unescape_mountinfo(field: &str) -> String {
@@ -918,5 +956,101 @@ mod tests {
             .find(|l| l.split_whitespace().nth(4) == Some("/proc"))
             .expect("/proc not in mountinfo");
         assert_eq!(parse_mountinfo_line(line), Some((proc_dev, "proc")));
+    }
+
+    /// A mount table with every kind of entry the drive list meets: only
+    /// real local filesystem roots survive, each device once.
+    const MOUNTINFO: &str = "\
+22 1 0:21 / /proc rw,nosuid shared:5 - proc proc rw
+23 1 0:22 / /sys rw,nosuid shared:6 - sysfs sysfs rw
+29 1 0:26 / / rw,relatime shared:1 - btrfs /dev/nvme1n1p2 rw,ssd,subvol=/
+30 29 0:26 /@snapshots /.snapshots rw,relatime shared:2 - btrfs /dev/nvme1n1p2 rw,subvol=/@snapshots
+31 29 0:27 / /run rw,nosuid shared:7 - tmpfs tmpfs rw,mode=755
+100 29 259:10 / /d/models2 rw,relatime shared:40 - ext4 /dev/nvme0n1p10 rw
+101 29 259:4 / /mnt/fast rw,relatime shared:41 - xfs /dev/nvme1n1p4 rw
+102 29 259:7 / /home rw,relatime shared:42 - xfs /dev/nvme0n1p9 rw
+103 29 259:10 /nix-build /nix/var/nix/big-builds rw,relatime shared:43 - ext4 /dev/nvme0n1p10 rw
+104 29 259:10 / /srv/models rw,relatime shared:44 - ext4 /dev/nvme0n1p10 rw
+105 31 0:60 / /run/user/1000/gvfs rw,nosuid shared:50 - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000
+106 31 0:61 / /run/user/1000/doc rw,nosuid shared:51 - fuse.portal portal rw,user_id=1000
+107 100 0:70 / /d/models2/docker/overlay2/abc/merged rw shared:60 - overlay overlay rw,lowerdir=/x
+108 29 7:3 / /snap/core22/1380 ro,nodev shared:61 - squashfs /dev/loop3 ro
+109 29 0:80 / /net/nas rw shared:62 - nfs4 nas:/export rw,vers=4.2
+110 29 8:1 / /media/u/win rw shared:63 - fuseblk /dev/sda1 rw,user_id=0
+111 29 0:81 / /srv/pool rw shared:64 - fuse.mergerfs pool rw
+112 29 8:2 / /media/u/X9\040Pro rw shared:65 - exfat /dev/sda2 rw
+113 29 259:6 / /boot/efi rw shared:66 - vfat /dev/nvme1n1p6 rw
+114 29 0:82 / /home/u/remote rw shared:67 - fuse.sshfs u@host:/ rw
+115 29 0:83 / /mnt/share rw shared:68 - cifs //nas/share rw
+116 29 0:84 / /proc/sys/fs/binfmt_misc rw shared:69 - autofs systemd-1 rw
+";
+
+    #[test]
+    fn local_mounts_keep_real_local_filesystem_roots_once_each() {
+        let m = local_mounts_from(MOUNTINFO);
+        let got: Vec<(&str, &str)> = m
+            .iter()
+            .map(|m| (m.mount_point.to_str().unwrap(), m.fstype.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("/", "btrfs"),
+                ("/d/models2", "ext4"),
+                ("/mnt/fast", "xfs"),
+                ("/home", "xfs"),
+                ("/media/u/win", "fuseblk"),
+                ("/srv/pool", "fuse.mergerfs"),
+                ("/media/u/X9 Pro", "exfat"),
+                ("/boot/efi", "vfat"),
+            ]
+        );
+        let models = &m[1];
+        assert_eq!(models.dev, makedev(259, 10));
+        assert_eq!(models.source, "/dev/nvme0n1p10");
+    }
+
+    #[test]
+    fn local_mounts_never_list_pseudo_remote_or_sliced_filesystems() {
+        let m = local_mounts_from(MOUNTINFO);
+        let points: Vec<&Path> = m.iter().map(|m| m.mount_point.as_path()).collect();
+        for gone in [
+            "/proc",
+            "/sys",
+            "/run",
+            "/.snapshots",
+            "/nix/var/nix/big-builds",
+            "/srv/models",
+            "/run/user/1000/gvfs",
+            "/run/user/1000/doc",
+            "/d/models2/docker/overlay2/abc/merged",
+            "/snap/core22/1380",
+            "/net/nas",
+            "/home/u/remote",
+            "/mnt/share",
+            "/proc/sys/fs/binfmt_misc",
+        ] {
+            assert!(
+                !points.contains(&Path::new(gone)),
+                "{gone} listed as a drive"
+            );
+        }
+        // Garbage lines are ignored, not a panic.
+        assert!(local_mounts_from("garbage\n\n1 2 x\n").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_mounts_of_this_machine_hold_no_pseudo_filesystem() {
+        let m = local_mounts();
+        let mut devs = HashSet::new();
+        for e in &m {
+            assert!(
+                REAL_FS.contains(&e.fstype.as_str()) || e.fstype.starts_with("fuse."),
+                "{e:?}"
+            );
+            assert!(!is_remote_fs(&e.fstype), "{e:?}");
+            assert!(devs.insert(e.dev), "device listed twice: {e:?}");
+        }
     }
 }

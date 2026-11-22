@@ -1317,3 +1317,40 @@ fn index_add_ssh_uploads_the_agent_into_the_remote_cache_once_and_uses_it() {
     assert_eq!(std::fs::read(remote.join("a.bin")).unwrap(), same);
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn scan_of_an_ssh_url_lists_the_remote_folder_over_a_stand_in_ssh() {
+    let d = scratch("scan-ssh");
+    fake_ssh(&d);
+    let remote = std::fs::canonicalize(&d).unwrap().join("remote");
+    std::fs::create_dir_all(remote.join("sub")).unwrap();
+    std::fs::write(remote.join("a.bin"), vec![1u8; 3000]).unwrap();
+    std::fs::write(remote.join("sub/b.bin"), vec![2u8; 500]).unwrap();
+    let url = format!("ssh://fakehost/{}", remote.display());
+
+    let out = remote_cmd(&d, &["scan", "--json", "--agent", "never", &url]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["total_size"], 3500);
+    assert_eq!(v["total_files"], 2);
+    assert_eq!(v["root"], format!("ssh://fakehost/{}", remote.display()));
+    assert_eq!(v["transport"], "shell");
+    assert_eq!(v["complete"], true);
+
+    // Human output names the remote root.
+    let out = remote_cmd(&d, &["scan", "--agent", "never", &url]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ssh://fakehost/"));
+
+    // Unreachable: the ssh message, not "not a directory".
+    std::fs::write(d.join("host-down"), b"").unwrap();
+    let out = remote_cmd(&d, &["scan", "--agent", "never", &url]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unreachable"), "{err}");
+    assert!(!err.contains("not a directory"), "{err}");
+}

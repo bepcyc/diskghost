@@ -56,11 +56,15 @@ pub use plan::{make_plan, Plan, PLAN_VERSION};
 pub use policy::{Distinct, Policy};
 pub use rotational::is_rotational;
 
+pub use remote::{remote_listing, remote_tree, RemoteListing};
 pub use snapshot::{
     diff, format_timestamp, DiffReport, DirDelta, FileDelta, Snapshot, SnapshotError,
     DIFF_FILE_LIMIT, SNAPSHOT_FORMAT,
 };
 pub use tree::ScanTree;
+#[cfg(unix)]
+pub use walk::local_mounts;
+pub use walk::LocalMount;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
