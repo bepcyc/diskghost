@@ -245,9 +245,77 @@ fn parse_mountinfo_line(line: &str) -> Option<(u64, &str)> {
     Some((makedev(major.parse().ok()?, minor.parse().ok()?), fstype))
 }
 
+/// One line of `/proc/self/mountinfo` with every field the persistent index
+/// needs to name a volume: `id parent major:minor root mountpoint options
+/// [optional tags] - fstype source super-options`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountEntry {
+    /// The device as `stat` reports it ([`makedev`] of `major:minor`).
+    pub(crate) dev: u64,
+    pub(crate) major: u64,
+    pub(crate) minor: u64,
+    /// The directory of the filesystem shown at the mountpoint: `/` for a
+    /// plain mount, the subdirectory of a bind mount or btrfs subvolume.
+    pub(crate) root: String,
+    /// Where it is mounted (octal escapes such as `\040` decoded).
+    pub(crate) mount_point: PathBuf,
+    pub(crate) fstype: String,
+    /// What was mounted: a device path such as `/dev/sda1`, or a pseudo
+    /// source (`tmpfs`, `overlay`, a ZFS dataset name, …).
+    pub(crate) source: String,
+}
+
+/// Parse one `/proc/self/mountinfo` line in full. The kernel escapes space,
+/// tab, newline and backslash in paths as `\ooo` octal; those are decoded.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+pub(crate) fn parse_mountinfo_entry(line: &str) -> Option<MountEntry> {
+    let (head, tail) = line.split_once(" - ")?;
+    let mut head = head.split_whitespace();
+    let (major, minor) = head.nth(2)?.split_once(':')?;
+    let (major, minor) = (major.parse().ok()?, minor.parse().ok()?);
+    let root = unescape_mountinfo(head.next()?);
+    let mount_point = PathBuf::from(unescape_mountinfo(head.next()?));
+    let mut tail = tail.split_whitespace();
+    let fstype = unescape_mountinfo(tail.next()?);
+    let source = unescape_mountinfo(tail.next()?);
+    Some(MountEntry {
+        dev: makedev(major, minor),
+        major,
+        minor,
+        root,
+        mount_point,
+        fstype,
+        source,
+    })
+}
+
+/// Decode the kernel's `\ooo` octal escapes in a mountinfo field.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn unescape_mountinfo(field: &str) -> String {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..=i + 3].iter().all(|c| (b'0'..=b'7').contains(c));
+        if octal {
+            let v = b[i + 1..=i + 3]
+                .iter()
+                .fold(0u32, |acc, c| acc * 8 + u32::from(c - b'0'));
+            out.push(u8::try_from(v).unwrap_or(b'?'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// glibc's `makedev`: the `st_dev` value of device `major:minor`.
 #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
-fn makedev(major: u64, minor: u64) -> u64 {
+pub(crate) fn makedev(major: u64, minor: u64) -> u64 {
     ((major & 0xffff_f000) << 32)
         | ((major & 0x0000_0fff) << 8)
         | ((minor & 0xffff_ff00) << 12)

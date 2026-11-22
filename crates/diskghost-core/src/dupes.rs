@@ -381,36 +381,50 @@ fn file_id(_file: &std::fs::File) -> Option<(u64, u64)> {
 /// Open the file once: identity plus the hash of both ends (the whole file
 /// when it is small enough).
 fn sample(c: &Cand) -> Option<Known> {
-    let mut f = std::fs::File::open(&c.path).ok()?;
-    let id = file_id(&f).unwrap_or((u64::MAX, 0));
-    let mut h = blake3::Hasher::new();
-    let mut buf = vec![0u8; SAMPLE as usize];
-    let whole = c.size <= 2 * SAMPLE;
-    if whole {
-        let n = std::io::copy(&mut f, &mut h).ok()?;
-        if n != c.size {
-            return None; // changed under us
-        }
-    } else {
-        f.read_exact(&mut buf).ok()?;
-        h.update(&buf);
-        f.seek(SeekFrom::Start(c.size - SAMPLE)).ok()?;
-        f.read_exact(&mut buf).ok()?;
-        h.update(&buf);
-    }
-    let sample = *h.finalize().as_bytes();
+    let (id, sample, full) = sample_file(&c.path, c.size)?;
     Some(Known {
         size: c.size,
         modified: c.modified,
         id,
         sample,
-        full: whole.then_some(sample),
+        full,
     })
+}
+
+/// What one read of a file's two ends yields: its identity, the BLAKE3 of
+/// the first and last [`SAMPLE`] bytes, and — when the file is at most two
+/// samples long, so that read covered all of it — the BLAKE3 of the whole
+/// file. `None` when the file cannot be read or its length is no longer
+/// `size` (it changed under us). Shared by the duplicate search and the
+/// persistent index, so both compute the very same sample.
+pub(crate) fn sample_file(
+    path: &Path,
+    size: u64,
+) -> Option<((u64, u64), [u8; 32], Option<[u8; 32]>)> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let id = file_id(&f).unwrap_or((u64::MAX, 0));
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; SAMPLE as usize];
+    let whole = size <= 2 * SAMPLE;
+    if whole {
+        let n = std::io::copy(&mut f, &mut h).ok()?;
+        if n != size {
+            return None; // changed under us
+        }
+    } else {
+        f.read_exact(&mut buf).ok()?;
+        h.update(&buf);
+        f.seek(SeekFrom::Start(size - SAMPLE)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        h.update(&buf);
+    }
+    let sample = *h.finalize().as_bytes();
+    Some((id, sample, whole.then_some(sample)))
 }
 
 /// BLAKE3 of the whole file: memory-mapped (several threads for big files),
 /// streamed where mapping is not possible.
-fn full_hash(path: &Path, size: u64) -> Option<[u8; 32]> {
+pub(crate) fn full_hash(path: &Path, size: u64) -> Option<[u8; 32]> {
     let mut h = blake3::Hasher::new();
     let mapped = if size >= PARALLEL_HASH_MIN {
         h.update_mmap_rayon(path)

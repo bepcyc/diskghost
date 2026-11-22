@@ -17,6 +17,7 @@
 //! Everything is `serde`-serialisable so a CLI, a GUI or an agent can consume it.
 
 mod dupes;
+pub mod index;
 #[cfg(windows)]
 mod mft;
 mod snapshot;
@@ -24,6 +25,9 @@ mod tree;
 mod walk;
 
 pub use dupes::{HashCache, CHECKPOINT_INTERVAL, MERGE_INTERVAL, TRASH_DIRS};
+pub use index::{
+    index_scan, is_cow_fs, validate_host, volume_uuid, Index, LocationStatus, Role, ScanSummary,
+};
 
 pub use snapshot::{
     diff, format_timestamp, DiffReport, DirDelta, FileDelta, Snapshot, SnapshotError,

@@ -579,3 +579,111 @@ fn max_depth_is_refused_where_it_would_mislead() {
     assert!(!snap.exists(), "no snapshot of a partial scan");
     std::fs::remove_dir_all(&d).ok();
 }
+
+// ---- `diskghost index` ---------------------------------------------------
+// Every test points --db into its own scratch dir: nothing touches the real
+// ~/.local/share, and files are created/deleted only inside that scratch dir.
+
+fn index_cmd(db: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .arg("index")
+        .arg("--db")
+        .arg(db)
+        .args(args)
+        .output()
+        .expect("run diskghost")
+}
+
+#[test]
+fn index_add_then_status_json() {
+    let d = scratch("index-add");
+    let tree = d.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("a"), b"same").unwrap();
+    std::fs::write(tree.join("sub/b"), b"same").unwrap();
+    std::fs::write(tree.join("c"), b"unique!").unwrap();
+    let db = d.join("db/index.db");
+
+    let out = index_cmd(
+        &db,
+        &["--json", "add", "--role", "master", tree.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let added: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let s = &added[0];
+    assert_eq!(s["new"], 3);
+    assert_eq!(s["sampled"], 2);
+    let uuid = s["uuid"].as_str().unwrap().to_string();
+
+    let out = index_cmd(&db, &["status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let loc = st
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["uuid"] == uuid.as_str())
+        .expect("scanned location listed");
+    assert_eq!(loc["online"], true);
+    assert_eq!(loc["role"], "master");
+    assert_eq!(loc["files"], 3);
+    assert_eq!(loc["bytes"], 15);
+
+    // Human output names the location too.
+    let out = index_cmd(&db, &["status"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&uuid));
+
+    // forget removes it from the index (and only from the index).
+    let out = index_cmd(&db, &["forget", &uuid]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(tree.join("a").exists(), "forget never touches files");
+    let out = index_cmd(&db, &["--json", "status"]);
+    let st: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(st.as_array().unwrap().is_empty());
+
+    // Forgetting an unknown uuid fails.
+    let out = index_cmd(&db, &["forget", &uuid]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn index_add_rejects_remote_hosts() {
+    let d = scratch("index-remote");
+    let db = d.join("index.db");
+    let out = index_cmd(&db, &["add", "--host", "nas.lan", d.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("remote locations not yet supported"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = index_cmd(&db, &["add", "--host", "localhost", d.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn index_add_rejects_a_missing_path() {
+    let d = scratch("index-missing");
+    let out = index_cmd(
+        &d.join("index.db"),
+        &["add", d.join("nope").to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+}
