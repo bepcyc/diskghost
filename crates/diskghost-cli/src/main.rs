@@ -358,6 +358,13 @@ struct WalkArgs {
     /// mounts (network shares, FUSE folders, drives mounted inside the tree).
     #[arg(short = 'x', long = "one-file-system")]
     one_file_system: bool,
+    /// Descend into remote and FUSE filesystems met below the root (NFS, SMB,
+    /// sshfs, GNOME gvfs, rclone…). Off by default because a remote tree
+    /// cannot be bounded — gvfs serves a fresh inode for every path, so a
+    /// remote `/sys` loops forever. A remote path chosen as the scan root is
+    /// still scanned; for that prefer `ssh://host//path`.
+    #[arg(long)]
+    remote: bool,
 }
 
 impl WalkArgs {
@@ -369,7 +376,7 @@ impl WalkArgs {
             threads: self.threads,
             mft: self.mft,
             same_file_system: self.one_file_system,
-            skip_remote: false,
+            skip_remote: !self.remote,
         }
     }
 }
@@ -1516,4 +1523,32 @@ fn print_reclaim(r: &ReclaimReport) {
         print!(", {} error(s)", r.errors.len());
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A remote/FUSE mount below the scan root is never walked by default:
+    /// gvfs serves fresh inodes per path, so an unbounded `scan /` loops on a
+    /// remote `/sys` forever (observed: an hour inside sftp:host=adroid).
+    /// `--remote` opts out deliberately.
+    #[test]
+    fn walks_stay_off_remote_filesystems_below_the_root() {
+        let base = WalkArgs {
+            exclude: vec![],
+            max_depth: None,
+            follow_symlinks: false,
+            threads: None,
+            mft: false,
+            one_file_system: false,
+            remote: false,
+        };
+        assert!(base.to_options().skip_remote);
+        let crossed = WalkArgs {
+            remote: true,
+            ..base
+        };
+        assert!(!crossed.to_options().skip_remote);
+    }
 }
