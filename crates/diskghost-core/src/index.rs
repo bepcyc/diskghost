@@ -615,6 +615,8 @@ fn scan_observed(
         ..opts.clone()
     };
     let mut failed: Option<rusqlite::Error> = None;
+    // Folders listed but not entered: other filesystems below the root.
+    let mut bound: Vec<String> = Vec::new();
     {
         let mut get = tx
             .prepare_cached(
@@ -689,6 +691,17 @@ fn scan_observed(
         let mut unreadable = 0u64;
         let _ = walk(&root, &walk_opts, progress, |b| {
             unreadable += b.skipped;
+            for dir in &b.bound {
+                match dir
+                    .strip_prefix(&vol.mount_point)
+                    .ok()
+                    .and_then(Path::to_str)
+                {
+                    Some(rel) => bound.push(rel.to_string()),
+                    // Cannot be protected by name: keep every row instead.
+                    None => unreadable += 1,
+                }
+            }
             if failed.is_some() {
                 return;
             }
@@ -708,16 +721,11 @@ fn scan_observed(
     }
 
     // Vanished: rows under the walked subtree this walk did not see. Only
-    // after a complete walk — a folder that could not be read is not gone.
-    // Prefix match by `substr`, not LIKE: `_` and `%` occur in file names.
+    // after a complete walk — a folder that could not be read is not gone —
+    // and never under a mount the walk listed without entering (a nested
+    // btrfs subvolume shares this location but is not walked from here).
     if sum.complete {
-        sum.vanished = tx
-            .execute(
-                "DELETE FROM files WHERE location_id = ?1 AND seen <> ?2 AND \
-                 (?3 = '' OR path = ?3 OR substr(path, 1, length(?3) + 1) = ?3 || '/')",
-                params![loc, gen, prefix],
-            )
-            .map_err(db_err)? as u64;
+        sum.vanished = drop_vanished(&tx, loc, gen, &prefix, &bound).map_err(db_err)? as u64;
     }
     tx.commit().map_err(db_err)?;
 
@@ -731,13 +739,29 @@ fn scan_observed(
 /// did not see, except under `bound` (relative paths the walk listed but did
 /// not enter). Index rows only.
 fn drop_vanished(
-    _conn: &Connection,
-    _loc: i64,
-    _gen: i64,
-    _prefix: &str,
-    _bound: &[String],
+    conn: &Connection,
+    loc: i64,
+    gen: i64,
+    prefix: &str,
+    bound: &[String],
 ) -> rusqlite::Result<usize> {
-    unimplemented!("M1 bound fix")
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS bound (p TEXT PRIMARY KEY); DELETE FROM temp.bound;",
+    )?;
+    {
+        let mut add = conn.prepare_cached("INSERT OR IGNORE INTO temp.bound (p) VALUES (?1)")?;
+        for b in bound {
+            add.execute([b])?;
+        }
+    }
+    // Prefix match by `substr`, not LIKE: `_` and `%` occur in file names.
+    conn.execute(
+        "DELETE FROM files WHERE location_id = ?1 AND seen <> ?2 \
+         AND (?3 = '' OR path = ?3 OR substr(path, 1, length(?3) + 1) = ?3 || '/') \
+         AND NOT EXISTS (SELECT 1 FROM temp.bound b WHERE files.path = b.p \
+                         OR substr(files.path, 1, length(b.p) + 1) = b.p || '/')",
+        params![loc, gen, prefix],
+    )
 }
 
 /// A row whose content has to be sampled.
