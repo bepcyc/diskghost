@@ -310,3 +310,115 @@ test("dropReclaimed removes handled copies and finished groups", () => {
   assert.equal(groups[0].files.length, 3); // the input is not modified
   assert.deepEqual(lib.dropReclaimed(groups, []).length, 3);
 });
+
+test("partial views name every real cause and never default to the depth limit", () => {
+  const whole = lib.partialCauses({ complete: true }, null);
+  assert.equal(whole.partial, false);
+  assert.deepEqual(whole.causes, []);
+  // Cut by a filesystem boundary only: no depth limit was set, so none is named.
+  const cut = lib.partialCauses({ complete: false, boundary_cuts: 3 }, null);
+  assert.equal(cut.partial, true);
+  assert.deepEqual(cut.causes, [{ kind: "boundary", n: 3 }]);
+  // Boundary cuts and a depth limit at once: both are reported.
+  const both = lib.partialCauses({ complete: false, boundary_cuts: 2 }, 4);
+  assert.deepEqual(both.causes.map((c) => c.kind), ["boundary", "depth"]);
+  // Incomplete but nothing the UI knows explains it: say so, do not invent.
+  assert.deepEqual(lib.partialCauses({ complete: false }, null).causes, [{ kind: "unknown" }]);
+  // A cancelled walk whose viewed folder was read in full is not partial here.
+  const cw = lib.partialCauses({ complete: true, cancelled: true }, null);
+  assert.equal(cw.partial, false);
+  assert.equal(cw.cancelledWalk, true);
+  assert.deepEqual(lib.partialCauses({ complete: false, cancelled: true }, null).causes, [{ kind: "cancelled" }]);
+});
+
+test("a cancelled duplicate search is never reported as 'no duplicates'", () => {
+  // Engine returns [] on cancel: with Cancel pressed that is a cancelled search.
+  assert.deepEqual(lib.dupesOutcome(true, [], 2), { state: "cancelled", hashesKept: true });
+  // Cancelled while still listing files: nothing was hashed, nothing kept.
+  assert.deepEqual(lib.dupesOutcome(true, [], 0), { state: "cancelled", hashesKept: false });
+  // Groups arrived: the engine finished before it saw the cancel — complete.
+  assert.equal(lib.dupesOutcome(true, [{ hash: "a" }], 2).state, "done");
+  // No cancel and no groups: genuinely no duplicates.
+  assert.equal(lib.dupesOutcome(false, [], 2).state, "done");
+});
+
+test("latestOnly drops answers that arrive after a newer request", () => {
+  const g = lib.latestOnly();
+  const first = g.next();
+  const second = g.next();
+  assert.equal(g.current(first), false);
+  assert.equal(g.current(second), true);
+});
+
+test("clampInt clamps typed numbers and maps junk to null", () => {
+  assert.equal(lib.clampInt("5000", 1, 1000), 1000);
+  assert.equal(lib.clampInt("0", 1, 8), 1);
+  assert.equal(lib.clampInt(" 12 ", 1, 100), 12);
+  assert.equal(lib.clampInt("", 1, 100), null);
+  assert.equal(lib.clampInt("abc", 1, 100), null);
+  assert.equal(lib.clampInt(null, 1, 100), null);
+});
+
+test("reclaimPlan counts every passed group and never removes protected copies while hidden", () => {
+  const groups = [
+    { hash: "a", size: 10, files: ["/u/a1.jpg", "/u/a2.jpg", "/u/a3.jpg"] },
+    { hash: "b", size: 100, files: ["/u/b.dll.bak", "/Program Files/x/b.jpg"] },
+    { hash: "c", size: 7, files: ["/u/c1.txt", "/u/c2.txt"] },
+  ];
+  const keep = new Map([["c", "/u/c2.txt"]]);
+  const p = lib.reclaimPlan(groups, keep, false);
+  assert.equal(p.groups, 3);
+  // a: keep first, remove 2; b: keep the program's copy, remove the user's; c: keep chosen.
+  assert.deepEqual(p.jobs.map((j) => j.keep), ["/u/a1.jpg", "/Program Files/x/b.jpg", "/u/c2.txt"]);
+  assert.equal(p.files, 4);
+  assert.equal(p.bytes, 10 * 2 + 100 + 7);
+  assert.equal(p.prot, false);
+  // A chosen copy that is no longer in the group falls back to the default.
+  const stale = lib.reclaimPlan([groups[2]], new Map([["c", "/gone"]]), false);
+  assert.equal(stale.jobs[0].keep, "/u/c1.txt");
+  // Only protected copies to remove and protection on: nothing to do.
+  const prot = lib.reclaimPlan([{ hash: "p", size: 5, files: ["/steamapps/a.pak", "/steamapps/b.pak"] }], new Map(), false);
+  assert.equal(prot.groups, 0);
+  const protOn = lib.reclaimPlan([{ hash: "p", size: 5, files: ["/steamapps/a.pak", "/steamapps/b.pak"] }], new Map(), true);
+  assert.equal(protOn.files, 1);
+  assert.equal(protOn.prot, true);
+});
+
+test("theme setting survives a round trip and rejects junk", () => {
+  assert.equal(lib.mergeSettings(null).theme, "auto");
+  assert.equal(lib.mergeSettings({ theme: "light" }).theme, "light");
+  assert.equal(lib.mergeSettings({ theme: "neon" }).theme, "auto");
+});
+
+test("English and German carry the same UI strings", () => {
+  const I18N = require("./i18n.js");
+  const en = Object.keys(I18N.en).sort();
+  const de = Object.keys(I18N.de).sort();
+  assert.deepEqual(de.filter((k) => !en.includes(k)), [], "keys only in de");
+  assert.deepEqual(en.filter((k) => !de.includes(k)), [], "keys only in en");
+});
+
+test("every string key app.js asks for exists", () => {
+  const I18N = require("./i18n.js");
+  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "app.js"), "utf8");
+  // t("key") / tf("key", …) and string keys picked by a ternary inside t(…)
+  const keys = new Set([
+    ...[...src.matchAll(/\btf?\(\s*"([A-Za-z_]+)"/g)].map((m) => m[1]),
+    ...[...src.matchAll(/\bt\([^()]*\?\s*"([A-Za-z_]+)"\s*:\s*"([A-Za-z_]+)"\)/g)].flatMap((m) => [m[1], m[2]]),
+  ]);
+  const missing = [...keys].filter((k) => !(k in I18N.en));
+  assert.deepEqual(missing, []);
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "index.html"), "utf8");
+  const htmlKeys = [...html.matchAll(/data-i18n(?:-ph|-title|-label)?="([A-Za-z_]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(htmlKeys.filter((k) => !(k in I18N.en)), []);
+});
+
+test("no emoji left in UI strings (icons come from icons.js)", () => {
+  const I18N = require("./i18n.js");
+  const emoji = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+  for (const lang of ["en", "de"]) {
+    for (const [k, v] of Object.entries(I18N[lang])) {
+      if (typeof v === "string") assert.ok(!emoji.test(v), `${lang}.${k} has an emoji: ${v}`);
+    }
+  }
+});
