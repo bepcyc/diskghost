@@ -1050,7 +1050,15 @@ mod tests {
                     mount_point: base.join(&name),
                 })
             };
-            let online = |root: &Path, _uuid: &str| root.is_dir();
+            // Like the real check: the folder is there *and* holds this
+            // very volume (another disk may be mounted at the same place).
+            let online = |root: &Path, uuid: &str| {
+                root.is_dir()
+                    && root
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| uuid == Estate::uuid(n))
+            };
             let cow = self.cow;
             let cow = move |_: &Path| cow;
             let rot = self.rotational;
@@ -1105,6 +1113,20 @@ mod tests {
                 .execute(
                     "UPDATE locations SET root = ?2 WHERE uuid = ?1",
                     rusqlite::params![Estate::uuid(name), gone.to_str().unwrap()],
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+
+        /// Another disk now sits where `name` was mounted: its last known
+        /// root is `other`'s folder (index rows only; no file is touched).
+        fn remount_over(&self, name: &str, other: &str) {
+            let n = self
+                .idx
+                .conn
+                .execute(
+                    "UPDATE locations SET root = ?2 WHERE uuid = ?1",
+                    rusqlite::params![Estate::uuid(name), self.loc(other).to_str().unwrap()],
                 )
                 .unwrap();
             assert_eq!(n, 1);
@@ -1364,6 +1386,47 @@ mod tests {
         assert_eq!(g.hash, Some(blake3::hash(&content(8)).to_hex().to_string()));
         // Possibly backed up: not a single.
         assert!(r.singles.unwrap().iter().all(|s| s.files == 0));
+    }
+
+    #[test]
+    fn an_offline_volume_at_the_same_mountpoint_never_takes_the_online_hash() {
+        // Two backup disks take turns at one mountpoint: B's rows keep
+        // their paths while A sits at B's old place. A's file must be
+        // hashed for itself only — never written onto B's row.
+        let e = Estate::new("same-root");
+        write(&e.loc("A").join("same.bin"), &content(11));
+        write(&e.loc("B").join("same.bin"), &content(12));
+        e.add("A");
+        e.add("B");
+        e.remount_over("B", "A");
+        // B was indexed by an older run that never sampled it.
+        e.idx
+            .conn
+            .execute(
+                "UPDATE files SET sample = NULL, full = NULL WHERE location_id = \
+                 (SELECT id FROM locations WHERE uuid = 'vol-B')",
+                [],
+            )
+            .unwrap();
+
+        let r = e.report(&Estate::opts());
+        assert_eq!(e.reads(), BTreeSet::from([e.loc("A").join("same.bin")]));
+        let (_, _, sample, full) = e.row("B", "same.bin");
+        assert_eq!(
+            (sample, full),
+            (None, None),
+            "the offline row is never written"
+        );
+        let want = blake3::hash(&content(11)).as_bytes().to_vec();
+        assert_eq!(e.row("A", "same.bin").3.as_deref(), Some(&want[..]));
+        let g = &r.groups[0];
+        assert_eq!((g.unique_copies, g.probable_copies), (1, 1), "{g:#?}");
+        let b = g
+            .copies
+            .iter()
+            .find(|c| c.location_uuid == "vol-B")
+            .unwrap();
+        assert!(b.probable && !b.available && b.suggest.is_none());
     }
 
     // ---- changed files --------------------------------------------------
