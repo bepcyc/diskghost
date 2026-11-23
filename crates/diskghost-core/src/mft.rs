@@ -282,8 +282,10 @@ fn parse(index: u64, rec: &[u8]) -> Option<Rec> {
                 units.clear();
                 units.extend(
                     v.get(0x42..0x42 + 2 * len)?
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]])),
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_le_bytes(*c)),
                 );
                 let name = OsString::from_wide(&units);
                 if space == 2 {

@@ -2,6 +2,7 @@
 //! frames in, frames out, on a fixture folder inside the test's own temp
 //! directory only.
 
+#[cfg(unix)]
 use std::path::Path;
 
 use serde_json::{json, Value};

@@ -1401,8 +1401,10 @@ fn local_target_ok() -> bool {
     (info.os.as_str(), info.arch.as_str()) == crate::remote::AGENT_TARGET
 }
 
+#[cfg(unix)]
 type Row = (String, i64, i64, i64, Option<Vec<u8>>, String);
 
+#[cfg(unix)]
 fn all_rows(idx: &crate::index::Index, uuid: &str) -> Vec<Row> {
     let mut st = idx
         .conn
@@ -1519,6 +1521,7 @@ fn the_agent_tier_and_the_shell_tier_index_the_same_rows() {
     assert_eq!((again.unchanged, again.hashed), (5, Some(0)));
 }
 
+#[cfg(unix)]
 fn transport_of_idx(idx: &crate::index::Index, uuid: &str) -> String {
     idx.conn
         .query_row(
