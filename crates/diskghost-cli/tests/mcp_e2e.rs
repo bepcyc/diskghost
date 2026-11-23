@@ -16,6 +16,8 @@
 //!   DISKGHOST_E2E_BIN=target/release/diskghost DISKGHOST_MCP_E2E_SSH=<your-ssh-host> \
 //!   cargo test -p diskghost-cli --test mcp_e2e -- --nocapture
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};
