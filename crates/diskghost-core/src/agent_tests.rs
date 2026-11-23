@@ -113,7 +113,7 @@ fn the_agent_source_has_no_write_or_delete_call() {
 /// Unix-only cases: the fixture needs unix links, inode metadata and
 /// permission modes, so the whole group sits behind one `cfg` instead of a
 /// gate per test#[cfg(target_os = "linux")] // fixture writes a non-UTF-8 name; APFS refuses it
-    mod unix {
+mod unix {
     use super::*;
     use std::path::Path;
 

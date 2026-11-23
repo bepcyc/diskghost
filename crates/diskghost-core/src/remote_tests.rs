@@ -384,7 +384,7 @@ impl RemoteExec for LocalExec {
 }
 
 #[test]
-#[cfg(target_os = "linux")]  // real find/stat output is GNU-flavoured; BSD differs
+#[cfg(target_os = "linux")] // real find/stat output is GNU-flavoured; BSD differs
 fn the_real_commands_list_and_hash_a_local_folder_identically() {
     use std::os::unix::fs::MetadataExt;
     let e = Estate::new("remote-local-exec");
