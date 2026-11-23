@@ -14,8 +14,8 @@ use crate::remote::*;
 use crate::testkit::*;
 use crate::Progress;
 
-const URL: &str = "ssh://adroid//storage";
-const UUID: &str = "ssh://adroid/a1b2c3d4";
+const URL: &str = "ssh://dg-test//storage";
+const UUID: &str = "ssh://dg-test/a1b2c3d4";
 const T0: u64 = 1_700_000_000_123_456_789;
 
 fn caps(x: &FakeHost) -> Capabilities {
@@ -31,9 +31,9 @@ fn argv_is_shell_quoted_into_one_remote_command() {
     assert_eq!(shell_quote("$(rm -rf /) `x` *"), "'$(rm -rf /) `x` *'");
     assert_eq!(shell_quote(""), "''");
     let x = SshExec {
-        host: "adroid".into(),
+        host: "dg-test".into(),
         ssh: "ssh".into(),
-        extra: SshExec::new("adroid").extra,
+        extra: SshExec::new("dg-test").extra,
     };
     assert_eq!(
         x.extra,
@@ -47,7 +47,7 @@ fn argv_is_shell_quoted_into_one_remote_command() {
             "-o",
             "ConnectTimeout=10",
             "--",
-            "adroid",
+            "dg-test",
             r"'find' '/a b' '-printf' '%p\0'",
         ]
         .map(String::from)
@@ -58,17 +58,17 @@ fn argv_is_shell_quoted_into_one_remote_command() {
 fn ssh_urls_split_into_host_and_path() {
     let ok = |u: &str| parse_ssh_url(u).unwrap();
     assert_eq!(
-        ok("ssh://adroid//storage"),
-        ("adroid".into(), "/storage".into())
+        ok("ssh://dg-test//storage"),
+        ("dg-test".into(), "/storage".into())
     );
     assert_eq!(
         ok("ssh://u@nas.lan/data/x"),
         ("u@nas.lan".into(), "data/x".into())
     );
-    assert_eq!(ok("ssh://adroid"), ("adroid".into(), ".".into()));
-    assert_eq!(ok("ssh://adroid/"), ("adroid".into(), ".".into()));
+    assert_eq!(ok("ssh://dg-test"), ("dg-test".into(), ".".into()));
+    assert_eq!(ok("ssh://dg-test/"), ("dg-test".into(), ".".into()));
     for bad in [
-        "adroid:/x",
+        "dg-test:/x",
         "ssh:///x",
         "ssh://-oProxyCommand=evil/x",
         "ssh://a b/x",
@@ -80,11 +80,11 @@ fn ssh_urls_split_into_host_and_path() {
 
 #[test]
 fn remote_hosts_are_validated_and_plain_names_still_refused() {
-    assert!(validate_remote_host("adroid").is_ok());
+    assert!(validate_remote_host("dg-test").is_ok());
     assert!(validate_remote_host("u@nas.lan").is_ok());
     assert!(validate_remote_host("-oProxyCommand=x").is_err());
     assert!(validate_remote_host("").is_err());
-    assert!(crate::index::validate_host("ssh://adroid").is_ok());
+    assert!(crate::index::validate_host("ssh://dg-test").is_ok());
     assert!(crate::index::validate_host("ssh://-x").is_err());
     assert!(crate::index::validate_host("nas.lan").is_err());
 }
@@ -557,7 +557,7 @@ fn index_add_ssh_records_a_remote_location_and_hashes_collisions_there() {
     let (host, root, cow) = loc_row(&e, UUID);
     assert_eq!(
         (host.as_str(), root.as_str(), cow),
-        ("ssh://adroid", "/", Some(0))
+        ("ssh://dg-test", "/", Some(0))
     );
     assert_eq!(scan_roots_of(&e, UUID), ["storage"]);
     let rows = remote_rows(&e, UUID);
@@ -635,9 +635,9 @@ fn status_probes_remote_hosts_online_and_offline() {
     e.add_remote(URL, &h).unwrap();
     let st = e.with_probe(|p| e.idx.status_with(p)).unwrap();
     assert_eq!(st.len(), 1);
-    assert_eq!((st[0].host.as_str(), st[0].online), ("ssh://adroid", true));
+    assert_eq!((st[0].host.as_str(), st[0].online), ("ssh://dg-test", true));
     assert_eq!(st[0].files, 1);
-    e.hosts_down.lock().unwrap().insert("ssh://adroid".into());
+    e.hosts_down.lock().unwrap().insert("ssh://dg-test".into());
     let st = e.with_probe(|p| e.idx.status_with(p)).unwrap();
     assert!(!st[0].online, "unreachable host → offline, no panic");
     assert_eq!(st[0].files, 1, "rows kept");
@@ -710,7 +710,7 @@ fn a_remote_row_never_takes_a_hash_from_a_local_file_at_the_same_path() {
     e.add("A");
     let h = FakeHost::linux().with_tools(&["md5sum", "find", "stat"]);
     h.put(&format!("{}/f.bin", shadow.display()), &content(1), T0);
-    let url = format!("ssh://adroid/{}", shadow.display());
+    let url = format!("ssh://dg-test/{}", shadow.display());
     let s = e.add_remote(&url, &h).unwrap();
     let rows = remote_rows(&e, &s.uuid);
     let md5 = FakeHost::digest("md5sum", &content(1));
@@ -732,13 +732,13 @@ fn a_remote_row_never_takes_a_hash_from_a_local_file_at_the_same_path() {
 #[test]
 fn a_remote_location_is_its_own_device_per_filesystem() {
     use crate::index_report::filesystem_of;
-    assert_eq!(filesystem_of("ssh://adroid/a1b2"), "ssh://adroid/a1b2");
-    assert_eq!(filesystem_of("ssh://adroid/dev66"), "ssh://adroid/dev66");
+    assert_eq!(filesystem_of("ssh://dg-test/a1b2"), "ssh://dg-test/a1b2");
+    assert_eq!(filesystem_of("ssh://dg-test/dev66"), "ssh://dg-test/dev66");
     assert_eq!(
-        filesystem_of("ssh://adroid:/storage"),
-        "ssh://adroid:/storage"
+        filesystem_of("ssh://dg-test:/storage"),
+        "ssh://dg-test:/storage"
     );
-    assert_eq!(filesystem_of("ssh://adroid:/a:b"), "ssh://adroid:/a:b");
+    assert_eq!(filesystem_of("ssh://dg-test:/a:b"), "ssh://dg-test:/a:b");
     assert_ne!(filesystem_of("ssh://a/1"), filesystem_of("ssh://b/1"));
 }
 
@@ -770,14 +770,14 @@ fn two_folders_of_one_remote_filesystem_share_one_location_like_a_volume() {
     let h = FakeHost::linux().with_mount(Some("/storage"));
     h.put("/storage/a/x", &content(1), T0);
     h.put("/storage/b/y", &content(1), T0);
-    let sa = e.add_remote("ssh://adroid//storage/a", &h).unwrap();
-    let sb = e.add_remote("ssh://adroid//storage/b", &h).unwrap();
-    let uuid = "ssh://adroid/a1b2c3d4";
+    let sa = e.add_remote("ssh://dg-test//storage/a", &h).unwrap();
+    let sb = e.add_remote("ssh://dg-test//storage/b", &h).unwrap();
+    let uuid = "ssh://dg-test/a1b2c3d4";
     assert_eq!((sa.uuid.as_str(), sb.uuid.as_str()), (uuid, uuid));
     assert_eq!(sb.root, PathBuf::from("/storage"));
     assert_eq!(location_count(&e), 1);
     let (host, root, _) = loc_row(&e, uuid);
-    assert_eq!((host.as_str(), root.as_str()), ("ssh://adroid", "/storage"));
+    assert_eq!((host.as_str(), root.as_str()), ("ssh://dg-test", "/storage"));
     assert_eq!(scan_roots_of(&e, uuid), ["a", "b"]);
     let rows = remote_rows(&e, uuid);
     let paths: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
@@ -793,7 +793,7 @@ fn two_folders_of_one_remote_filesystem_share_one_location_like_a_volume() {
     assert!(rows.iter().all(|r| r.2.is_some()));
     // A rescan of folder a after its file was removed drops only that row.
     h.remove("/storage/a/x");
-    let s = e.add_remote("ssh://adroid//storage/a", &h).unwrap();
+    let s = e.add_remote("ssh://dg-test//storage/a", &h).unwrap();
     assert!(s.complete);
     assert_eq!((s.seen, s.vanished), (0, 1));
     let rows = remote_rows(&e, uuid);
@@ -808,9 +808,9 @@ fn a_gnu_host_uuid_is_exactly_host_and_filesystem_id() {
     let h = FakeHost::linux().with_mount(Some("/storage"));
     h.put("/storage/f.bin", b"f", T0);
     let s = e.add_remote(URL, &h).unwrap();
-    assert_eq!(s.uuid, "ssh://adroid/a1b2c3d4");
-    assert_eq!(scan_roots_of(&e, "ssh://adroid/a1b2c3d4"), [""]);
-    assert_eq!(remote_rows(&e, "ssh://adroid/a1b2c3d4")[0].0, "f.bin");
+    assert_eq!(s.uuid, "ssh://dg-test/a1b2c3d4");
+    assert_eq!(scan_roots_of(&e, "ssh://dg-test/a1b2c3d4"), [""]);
+    assert_eq!(remote_rows(&e, "ssh://dg-test/a1b2c3d4")[0].0, "f.bin");
 }
 
 #[test]
@@ -827,11 +827,11 @@ fn without_a_usable_filesystem_id_the_uuid_is_host_and_folder() {
         let e = Estate::new(&format!("remote-uuid-root-{i}"));
         h.put("/storage/sub/f.bin", b"f", T0);
         let s = e.add_remote(URL, h).unwrap();
-        assert_eq!(s.uuid, "ssh://adroid:/storage", "host {i}");
-        let (_, root, _) = loc_row(&e, "ssh://adroid:/storage");
+        assert_eq!(s.uuid, "ssh://dg-test:/storage", "host {i}");
+        let (_, root, _) = loc_row(&e, "ssh://dg-test:/storage");
         assert_eq!(root, "/storage", "host {i}");
-        assert_eq!(scan_roots_of(&e, "ssh://adroid:/storage"), [""], "host {i}");
-        assert_eq!(remote_rows(&e, "ssh://adroid:/storage")[0].0, "sub/f.bin");
+        assert_eq!(scan_roots_of(&e, "ssh://dg-test:/storage"), [""], "host {i}");
+        assert_eq!(remote_rows(&e, "ssh://dg-test:/storage")[0].0, "sub/f.bin");
     }
 }
 
@@ -929,7 +929,7 @@ fn a_remote_md5_group_is_planned_but_every_action_is_skipped() {
     h.put("/storage/b.bin", &content(1), T0);
     e.add_remote(URL, &h).unwrap();
     e.idx
-        .configure(UUID, Some(Role::Normal), "ssh://adroid")
+        .configure(UUID, Some(Role::Normal), "ssh://dg-test")
         .unwrap();
     let plan = e
         .with_probe(|p| plan_with(&e.idx, &policy(1), &Progress::default(), p))
@@ -1211,7 +1211,7 @@ fn an_sftp_only_host_says_files_would_be_read_over_the_network() {
         .add_remote_via(URL, &h, AgentMode::Auto, Some(&test_bin()))
         .unwrap_err();
     let m = err.to_string();
-    assert!(m.contains("remote shell unavailable on adroid"), "{m}");
+    assert!(m.contains("remote shell unavailable on dg-test"), "{m}");
     assert!(m.contains("read over the network"), "{m}");
     assert!(m.contains("upload an agent or enable shell"), "{m}");
     assert_eq!(location_count(&e), 0);
@@ -1818,11 +1818,11 @@ fn a_remote_folder_becomes_a_tree_rooted_at_its_ssh_url() {
     h.put("/storage/z.bin", &[0; 5], T0);
     let l = tree_listing(URL, &h).unwrap();
     assert_eq!(l.root, "/storage");
-    assert_eq!(l.host, "adroid");
-    assert_eq!(l.url(), "ssh://adroid//storage");
+    assert_eq!(l.host, "dg-test");
+    assert_eq!(l.url(), "ssh://dg-test//storage");
     assert!(l.listing.complete && !l.cancelled);
     let t = l.tree();
-    let root = PathBuf::from("ssh://adroid//storage");
+    let root = PathBuf::from("ssh://dg-test//storage");
     assert_eq!(t.root(), root.as_path());
     assert!(t.complete());
     let r = t.root_report(10);
@@ -1915,7 +1915,7 @@ fn a_remote_scan_says_why_the_agent_was_not_used() {
 fn remote_scan_errors_carry_the_hosts_own_message() {
     // Not there.
     let h = FakeHost::linux();
-    let err = tree_listing("ssh://adroid//nope", &h).unwrap_err();
+    let err = tree_listing("ssh://dg-test//nope", &h).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
     assert!(err.to_string().contains("not found"), "{err}");
     // Unreachable.

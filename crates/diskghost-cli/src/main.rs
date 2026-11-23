@@ -1554,7 +1554,7 @@ mod tests {
 
     /// A remote/FUSE mount below the scan root is never walked by default:
     /// gvfs serves fresh inodes per path, so an unbounded `scan /` loops on a
-    /// remote `/sys` forever (observed: an hour inside sftp:host=adroid).
+    /// remote `/sys` forever (observed: an hour inside sftp:host=example).
     /// `--remote` opts out deliberately.
     #[test]
     fn walks_stay_off_remote_filesystems_below_the_root() {
