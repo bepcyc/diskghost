@@ -440,9 +440,10 @@ head -c 5000 /dev/zero | tr '\0' '\033' > "$1/y/unique.bin""#,
         let cache_after = r.cache_listing();
         println!("--- remote ~/.cache/diskghost AFTER:\n{cache_after}");
         let before = cache_before.unwrap();
+        // The directory's own line changes with its mtime; only entries count.
         let new: Vec<&str> = cache_after
             .lines()
-            .filter(|l| !before.contains(l))
+            .filter(|l| !l.ends_with(" .") && !before.contains(l))
             .collect();
         println!("--- new in ~/.cache/diskghost: {new:?}");
         assert!(
