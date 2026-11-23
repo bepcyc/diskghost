@@ -6,7 +6,9 @@
 use std::io;
 use std::path::PathBuf;
 
-use crate::apply::{apply_with, read_journal, ApplyOptions, Status};
+#[cfg(unix)]
+use crate::apply::read_journal;
+use crate::apply::{apply_with, ApplyOptions, Status};
 use crate::index::Role;
 use crate::plan::plan_with;
 use crate::policy::{Distinct, Policy};
