@@ -1022,14 +1022,14 @@ mod tests {
 29 1 0:26 / / rw,relatime shared:1 - btrfs /dev/nvme1n1p2 rw,ssd,subvol=/
 30 29 0:26 /@snapshots /.snapshots rw,relatime shared:2 - btrfs /dev/nvme1n1p2 rw,subvol=/@snapshots
 31 29 0:27 / /run rw,nosuid shared:7 - tmpfs tmpfs rw,mode=755
-100 29 259:10 / /d/models2 rw,relatime shared:40 - ext4 /dev/nvme0n1p10 rw
+100 29 259:10 / /d/store2 rw,relatime shared:40 - ext4 /dev/nvme0n1p10 rw
 101 29 259:4 / /mnt/fast rw,relatime shared:41 - xfs /dev/nvme1n1p4 rw
 102 29 259:7 / /home rw,relatime shared:42 - xfs /dev/nvme0n1p9 rw
 103 29 259:10 /nix-build /nix/var/nix/big-builds rw,relatime shared:43 - ext4 /dev/nvme0n1p10 rw
 104 29 259:10 / /srv/models rw,relatime shared:44 - ext4 /dev/nvme0n1p10 rw
 105 31 0:60 / /run/user/1000/gvfs rw,nosuid shared:50 - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000
 106 31 0:61 / /run/user/1000/doc rw,nosuid shared:51 - fuse.portal portal rw,user_id=1000
-107 100 0:70 / /d/models2/docker/overlay2/abc/merged rw shared:60 - overlay overlay rw,lowerdir=/x
+107 100 0:70 / /d/store2/docker/overlay2/abc/merged rw shared:60 - overlay overlay rw,lowerdir=/x
 108 29 7:3 / /snap/core22/1380 ro,nodev shared:61 - squashfs /dev/loop3 ro
 109 29 0:80 / /net/nas rw shared:62 - nfs4 nas:/export rw,vers=4.2
 110 29 8:1 / /media/u/win rw shared:63 - fuseblk /dev/sda1 rw,user_id=0
@@ -1052,7 +1052,7 @@ mod tests {
             got,
             [
                 ("/", "btrfs"),
-                ("/d/models2", "ext4"),
+                ("/d/store2", "ext4"),
                 ("/mnt/fast", "xfs"),
                 ("/home", "xfs"),
                 ("/media/u/win", "fuseblk"),
@@ -1079,7 +1079,7 @@ mod tests {
             "/srv/models",
             "/run/user/1000/gvfs",
             "/run/user/1000/doc",
-            "/d/models2/docker/overlay2/abc/merged",
+            "/d/store2/docker/overlay2/abc/merged",
             "/snap/core22/1380",
             "/net/nas",
             "/home/u/remote",

@@ -46,7 +46,7 @@ class FifoCase(unittest.TestCase):
                 out.write(json.dumps(resp) + "\n")
 
         threading.Thread(target=fake_daemon, daemon=True).start()
-        path = "/media/bepcyc/X9 Pro1"
+        path = "/media/user/My Disk 1"
         r = client.call(
             "tools/call",
             {"name": "add_location", "arguments": {"path": path}},

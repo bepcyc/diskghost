@@ -1,7 +1,7 @@
 #!/bin/bash
 # Polls list_jobs every ${1:-300}s, appends state-transition lines to
 # transitions.log in $DG_MCP_RUN_DIR. Fields are TAB-separated so a
-# target like "/media/bepcyc/X9 Pro1" never corrupts a record
+# target like "/media/user/My Disk 1" never corrupts a record
 # (diskghost-src#1378: space-separated fields split the path mid-word).
 set -u
 RUN_DIR="${DG_MCP_RUN_DIR:-$HOME/.local/state/dg-mcp/run}"

@@ -39,36 +39,36 @@ DG_MCP_RUN_DIR=$RUN_DIR ./monitor.sh 300 &   # transition log, TAB-safe
   `out.jsonl` would be indexed by the scan it runs. If it must live on a
   scanned volume, add the run dir to that location's `exclude`.
 - Fields between driver components are TAB- or JSON-delimited, never
-  space-separated — mount names contain spaces (`X9 Pro1`).
+  space-separated — mount names contain spaces (`My Disk 1`).
 - The FIFO write is non-blocking: a dead daemon errors in milliseconds
   instead of hanging the caller inside `open()`.
 
 ## Mounting SMB-only sources headless (diskghost-src#1377)
 
 `ssh://host//path` is the preferred remote transport; when a source has
-no sshd and only an old SMB server (e.g. NVIDIA Shield's "Transfer files
-over local network", SMB1-only), do NOT reach for gvfs — it is bound to
-the desktop session, dies on logout/reboot, and the product's own docs
-warn it can serve a fresh inode per path. The headless equivalent is a
-kernel cifs mount:
+no sshd and only an old SMB server (e.g. a set-top box's built-in file
+sharing, SMB1-only), do NOT reach for gvfs — it is bound to the desktop
+session, dies on logout/reboot, and the product's own docs warn it can
+serve a fresh inode per path. The headless equivalent is a kernel cifs
+mount:
 
 ```bash
 # once, as root — credentials live in a root-owned file, never in cmdline
-sudo install -m600 /dev/null /etc/diskghost-shield.creds
-sudo tee -a /etc/diskghost-shield.creds <<'EOF'
-user=bepcyc
-password=<the password shown on the Shield screen>
+sudo install -m600 /dev/null /etc/diskghost-smb.creds
+sudo tee -a /etc/diskghost-smb.creds <<'EOF'
+user=<smb-user>
+password=<smb-password>
 EOF
-sudo mkdir -p /mnt/shield-sync
+sudo mkdir -p /mnt/<share-name>
 # fstab line for permanence:
-echo '//192.168.1.3/sync /mnt/shield-sync cifs vers=1.0,credentials=/etc/diskghost-shield.creds,ro,noauto,x-systemd.automount,x-systemd.idle-timeout=300,uid=1000 0 0' | sudo tee -a /etc/fstab
-sudo mount /mnt/shield-sync
+echo '//<smb-host>/<share> /mnt/<share-name> cifs vers=1.0,credentials=/etc/diskghost-smb.creds,ro,noauto,x-systemd.automount,x-systemd.idle-timeout=300,uid=1000 0 0' | sudo tee -a /etc/fstab
+sudo mount /mnt/<share-name>
 ```
 
-Then `add_location /mnt/shield-sync` — a stable path with a stable
+Then `add_location /mnt/<share-name>` — a stable path with a stable
 device id, so the location uuid survives remounts and rescans are
-incremental. Without root, an on-device sshd (Sshd4a etc.) is the only
-session-free alternative; gvfs is a session workaround, not a transport.
+incremental. Without root, an on-device sshd is the only session-free
+alternative; gvfs is a session workaround, not a transport.
 
 ## Tests
 

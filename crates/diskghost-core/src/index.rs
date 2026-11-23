@@ -1503,8 +1503,8 @@ mod tests {
 35 2 0:30 / / rw,relatime shared:1 - btrfs /dev/nvme1n1p2 rw,ssd,subvolid=5,subvol=/
 36 35 0:44 /@home /home rw,relatime shared:2 - btrfs /dev/nvme1n1p2 rw,subvolid=257,subvol=/@home
 31 35 0:27 / /run rw,nosuid,nodev - tmpfs tmpfs rw,size=13179404k
-2309 35 8:2 / /media/u/X9\\040Pro1 rw,nosuid,nodev,relatime shared:1706 - exfat /dev/sda2 rw
-2702 35 8:3 / /media/u/dev_portable rw,relatime shared:1858 - ext4 /dev/sda3 rw
+2309 35 8:2 / /media/u/Big\\040Disk\\0401 rw,nosuid,nodev,relatime shared:1706 - exfat /dev/sda2 rw
+2702 35 8:3 / /media/u/usb_stick rw,relatime shared:1858 - ext4 /dev/sda3 rw
 2703 35 8:3 /data /srv/data rw,relatime - ext4 /dev/sda3 rw
 2840 35 0:85 / /var/lib/docker/merged rw,relatime - overlay overlay rw,lowerdir=/x
 ";
@@ -1519,7 +1519,7 @@ mod tests {
     fn by_uuid(source: &str) -> Option<String> {
         match source {
             "/dev/nvme1n1p2" => Some("1111-root".into()),
-            "/dev/sda2" => Some("2222-X9".into()),
+            "/dev/sda2" => Some("2222-BIG".into()),
             "/dev/sda3" => Some("3333-portable".into()),
             _ => None,
         }
@@ -1529,7 +1529,7 @@ mod tests {
     fn mountinfo_entry_decodes_octal_escapes() {
         let m = mounts();
         let x9 = m.iter().find(|e| e.source == "/dev/sda2").unwrap();
-        assert_eq!(x9.mount_point, PathBuf::from("/media/u/X9 Pro1"));
+        assert_eq!(x9.mount_point, PathBuf::from("/media/u/Big Disk 1"));
         assert_eq!((x9.major, x9.minor), (8, 2));
         assert_eq!(x9.fstype, "exfat");
         assert_eq!(x9.root, "/");
@@ -1541,18 +1541,18 @@ mod tests {
         let v = resolve_volume(
             &mounts(),
             dev,
-            Path::new("/media/u/X9 Pro1/photos/a.jpg"),
+            Path::new("/media/u/Big Disk 1/photos/a.jpg"),
             &by_uuid,
         )
         .unwrap();
-        assert_eq!(v.key, "2222-X9");
-        assert_eq!(v.mount_point, PathBuf::from("/media/u/X9 Pro1"));
+        assert_eq!(v.key, "2222-BIG");
+        assert_eq!(v.mount_point, PathBuf::from("/media/u/Big Disk 1"));
     }
 
     #[test]
     fn bind_mount_or_subvolume_keeps_its_filesystem_root_in_the_key() {
         // Same filesystem, different visible subtree: the files under /srv/data
-        // are not the files under /media/u/dev_portable, so the key differs.
+        // are not the files under /media/u/usb_stick, so the key differs.
         let dev = crate::walk::makedev(8, 3);
         let v = resolve_volume(&mounts(), dev, Path::new("/srv/data/x"), &by_uuid).unwrap();
         assert_eq!(v.key, "3333-portable:/data");
@@ -1609,7 +1609,7 @@ mod tests {
             resolve_volume(
                 &mounts(),
                 crate::walk::makedev(9, 9),
-                Path::new("/media/u/dev_portable/x"),
+                Path::new("/media/u/usb_stick/x"),
                 &by_uuid
             ),
             None

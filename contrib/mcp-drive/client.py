@@ -9,7 +9,7 @@ Defects fixed vs the ad-hoc original (diskghost-src#1378):
   timeout never applied. Opening with O_NONBLOCK fails fast (ENXIO)
   instead of hanging the caller.
 - Every path travels inside JSON, never through shell words, so a
-  target like `/media/bepcyc/X9 Pro1` round-trips byte-for-byte.
+  target like `/media/user/My Disk 1` round-trips byte-for-byte.
 - IN/OUT are module constants a test can repoint; nothing here touches
   a scan target unless RUN_DIR is pointed at one (see README).
 """

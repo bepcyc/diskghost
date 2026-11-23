@@ -15,3 +15,5 @@ Thumbs.db
 *.log
 gui/src-tauri/gen/
 .claude/
+__pycache__/
+*.pyc

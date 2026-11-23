@@ -451,8 +451,8 @@ test("each remote host is a drive of its own for scheduling", () => {
 test("drive rows group by media for the tree view", () => {
   const ds = [
     { path: "/", media: "ssd", kind: "fixed" },
-    { path: "/media/farm", media: "hdd", kind: "removable" },
-    { path: "/media/x9", media: "ssd", kind: "removable" },
+    { path: "/media/pool", media: "hdd", kind: "removable" },
+    { path: "/media/big", media: "ssd", kind: "removable" },
     { path: "ssh://nas//data", media: "remote", kind: "network" },
   ];
   assert.deepEqual(

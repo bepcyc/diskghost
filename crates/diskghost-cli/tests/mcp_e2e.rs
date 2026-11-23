@@ -13,7 +13,7 @@
 //! agent upload in the remote `~/.cache/diskghost/`, listed at the end.
 //!
 //! Run (release binary, so the agent that gets uploaded is the real size):
-//!   DISKGHOST_E2E_BIN=target/release/diskghost DISKGHOST_MCP_E2E_SSH=AIAssistant \
+//!   DISKGHOST_E2E_BIN=target/release/diskghost DISKGHOST_MCP_E2E_SSH=<your-ssh-host> \
 //!   cargo test -p diskghost-cli --test mcp_e2e -- --nocapture
 
 mod common;

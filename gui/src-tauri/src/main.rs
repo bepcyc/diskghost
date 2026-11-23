@@ -897,7 +897,7 @@ fn drives() -> Vec<Drive> {
 
 #[cfg(not(windows))]
 fn drives() -> Vec<Drive> {
-    // Every real local filesystem, wherever it is mounted (`/d/models2`,
+    // Every real local filesystem, wherever it is mounted (`/d/store2`,
     // `/home`, …). Where the mount table cannot be read (macOS), the
     // folders volumes are usually mounted in.
     let mounts = diskghost_core::local_mounts();
@@ -1427,7 +1427,7 @@ mod tests {
             &[
                 mount(1, "/", "btrfs"),
                 mount(5, "/mnt/fast", "xfs"),
-                mount(2, "/d/models2", "ext4"),
+                mount(2, "/d/store2", "ext4"),
                 mount(3, "/run/media/u/stick", "exfat"),
                 mount(4, "/media/u/games", "ntfs3"),
                 mount(6, "/home", "xfs"),
@@ -1436,7 +1436,7 @@ mod tests {
         );
         let want: Vec<(PathBuf, String, &str, &str)> = [
             ("/", "btrfs", "fixed", "ssd"),
-            ("/d/models2", "ext4", "other", "ssd"),
+            ("/d/store2", "ext4", "other", "ssd"),
             ("/home", "xfs", "other", "ssd"),
             ("/media/u/games", "ntfs3", "removable", "ssd"),
             ("/mnt/fast", "xfs", "other", "ssd"),
@@ -1468,7 +1468,7 @@ mod tests {
         // btrfs installs mount a subvolume (`/@`) at `/`: its mountinfo root
         // is not `/`, so `local_mounts` drops it — `/` must stay listed.
         let ssd = |_: &Path| false;
-        let got = drive_list(&[mount(2, "/d/models2", "ext4")], &ssd);
+        let got = drive_list(&[mount(2, "/d/store2", "ext4")], &ssd);
         assert_eq!(got[0], (PathBuf::from("/"), String::new(), "fixed", "ssd"));
         assert_eq!(got.len(), 2);
         assert_eq!(
