@@ -16,7 +16,7 @@
 //!   DISKGHOST_E2E_BIN=target/release/diskghost DISKGHOST_MCP_E2E_SSH=<your-ssh-host> \
 //!   cargo test -p diskghost-cli --test mcp_e2e -- --nocapture
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")] // local drives come from /proc/self/mountinfo — Linux-only
 
 mod common;
 

@@ -703,6 +703,7 @@ fn mixed_algorithms_never_group_and_are_reported_unverifiable() {
     assert_eq!(u.copies.len(), 4);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_remote_row_never_takes_a_hash_from_a_local_file_at_the_same_path() {
     // The remote root is a path that also exists here, holding other bytes.
