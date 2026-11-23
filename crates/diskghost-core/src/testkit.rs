@@ -185,6 +185,7 @@ impl Estate {
 
     /// Pretend a location's disk was unplugged: its last known root no
     /// longer exists. Only the index row changes — no file is touched.
+    #[cfg(unix)]
     pub(crate) fn unplug(&self, name: &str) {
         let gone = self.dir.join(format!("unplugged-{name}"));
         assert!(!gone.exists());
@@ -201,6 +202,7 @@ impl Estate {
 
     /// Another disk now sits where `name` was mounted: its last known
     /// root is `other`'s folder (index rows only; no file is touched).
+    #[cfg(unix)]
     pub(crate) fn remount_over(&self, name: &str, other: &str) {
         let n = self
             .idx
@@ -214,6 +216,7 @@ impl Estate {
     }
 
     /// (size, mtime_ns, sample, full) of the row of `name`/`rel`.
+    #[cfg(unix)]
     pub(crate) fn row(
         &self,
         name: &str,
