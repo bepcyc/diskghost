@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::agent::{serve, PROTOCOL};
+#[cfg(unix)]
 use crate::testkit::*;
 
 /// Feed `lines` (raw request lines) to the agent; every stdout line parsed.

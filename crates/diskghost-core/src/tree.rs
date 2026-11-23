@@ -261,7 +261,7 @@ impl Builder {
             if opts.max_depth.is_some_and(|m| child_depth > m) {
                 continue;
             }
-            let descend = opts.max_depth.map_or(true, |m| child_depth < m);
+            let descend = opts.max_depth.is_none_or(|m| child_depth < m);
             self.tree.nodes[id].listed = true;
             let (mut size, mut count) = (0u64, 0u64);
             for e in table.children(dir) {

@@ -706,7 +706,7 @@ pub(crate) fn walk(
             sink(b);
             continue;
         }
-        let descend = opts.max_depth.map_or(true, |m| child_depth < m);
+        let descend = opts.max_depth.is_none_or(|m| child_depth < m);
         for e in table.children(dir) {
             let p = path.join(e.name);
             if !glob.is_empty() && is_excluded(&glob, root, &p) {

@@ -72,10 +72,12 @@ fn ino(p: &Path) -> u64 {
     std::fs::metadata(p).unwrap().ino()
 }
 
-#[cfg(windows)]
-fn ino(p: &Path) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    std::fs::metadata(p).unwrap().file_index().unwrap_or(0)
+#[cfg(not(unix))]
+fn ino(_p: &Path) -> u64 {
+    // Mirrors `stat_of`'s non-unix fallback in index.rs: no inode key on
+    // Windows, so the ino-shaped quarantine name degenerates to `.0` there
+    // exactly the way production apply computes it.
+    0
 }
 
 fn qdir(e: &Estate, name: &str) -> PathBuf {
