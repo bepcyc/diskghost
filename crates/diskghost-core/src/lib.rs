@@ -20,7 +20,7 @@ pub mod agent;
 #[cfg(test)]
 mod agent_tests;
 pub mod apply;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod apply_tests;
 mod dupes;
 pub mod index;
