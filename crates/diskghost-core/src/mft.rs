@@ -699,6 +699,7 @@ pub(crate) fn walk(
             aliases: Vec::new(),
             others: Vec::new(),
             skipped: 0,
+            skips: Vec::new(),
         };
         let child_depth = depth + 1;
         if opts.max_depth.is_some_and(|m| child_depth > m) {

@@ -1213,7 +1213,12 @@ pub(crate) fn scan_with(
                 {
                     Some(rel) => bound.push(rel.to_string()),
                     // Cannot be protected by name: keep every row instead.
-                    None => unreadable += 1,
+                    None => {
+                        unreadable += 1;
+                        if sum.skipped_paths.len() < 32 {
+                            sum.skipped_paths.push(dir.to_string_lossy().into_owned());
+                        }
+                    }
                 }
             }
             if failed.is_some() {
@@ -1903,9 +1908,13 @@ mod tests {
         write(&t.join("a"), b"a");
         write(&t.join("locked").join("inside"), b"x");
         std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o0)).unwrap();
+        let readable = std::fs::read_dir(t.join("locked")).is_ok(); // running as root
         let idx = open_db(&d);
         let (s, _) = scan(&idx, &t);
         std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return;
+        }
         assert!(!s.complete);
         assert!(s.skipped > 0);
         assert!(
