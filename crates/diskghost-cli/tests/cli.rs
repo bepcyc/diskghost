@@ -595,6 +595,7 @@ fn index_cmd(db: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+#[cfg(unix)]
 fn index_add_then_status_json() {
     let d = scratch("index-add");
     let tree = d.join("tree");
@@ -668,6 +669,7 @@ fn index_add_then_status_json() {
 }
 
 #[test]
+#[cfg(unix)]
 fn index_add_rejects_remote_hosts() {
     let d = scratch("index-remote");
     let db = d.join("index.db");
@@ -703,6 +705,7 @@ fn index_add_rejects_a_missing_path() {
 
 /// a.bin, sub/b.bin: one content; c.bin: a hard link to a.bin; unique.bin:
 /// same size, other content; small.txt: a unique size.
+#[cfg(unix)]
 fn index_fixture(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let d = scratch(label);
     let tree = d.join("tree");
@@ -735,6 +738,7 @@ fn dupes_index(db: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+#[cfg(unix)]
 fn dupes_index_json_reports_physical_copies_and_singles() {
     let (d, tree, db) = index_fixture("dupes-index");
     let out = dupes_index(&db, &["--json", "--singles"]);
@@ -780,6 +784,7 @@ fn dupes_index_json_reports_physical_copies_and_singles() {
 }
 
 #[test]
+#[cfg(unix)]
 fn dupes_index_singles_paths_go_to_a_file_or_into_the_output() {
     let (d, tree, db) = index_fixture("dupes-index-paths");
     let list = d.join("singles.txt");
@@ -808,6 +813,7 @@ fn dupes_index_singles_paths_go_to_a_file_or_into_the_output() {
 }
 
 #[test]
+#[cfg(unix)]
 fn dupes_index_offline_copies_count_and_are_never_suggested() {
     let (d, _tree, db) = index_fixture("dupes-index-offline");
     // Hash everything while online, then "unplug": point the location's
@@ -865,6 +871,7 @@ fn dupes_needs_a_path_or_the_index_and_index_mode_does_not_reclaim() {
 // scratch dir (the real moves are tested in the core crate on fake volumes).
 // `undo` runs for real on a journal whose paths are all in the scratch dir.
 
+#[cfg(unix)]
 fn plan_cmd(db: &std::path::Path, out: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
         .args(["plan", "--index", "--db"])
@@ -876,11 +883,13 @@ fn plan_cmd(db: &std::path::Path, out: &std::path::Path, args: &[&str]) -> std::
         .expect("run diskghost")
 }
 
+#[cfg(unix)]
 fn read_json(p: &std::path::Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
 }
 
 #[test]
+#[cfg(unix)]
 fn plan_writes_a_readable_versioned_plan() {
     let (d, tree, db) = index_fixture("plan");
     // Default policy: two copies on two devices — one device here, so the
@@ -919,6 +928,7 @@ fn plan_writes_a_readable_versioned_plan() {
 }
 
 #[test]
+#[cfg(unix)]
 fn plan_rejects_a_bad_policy_naming_the_field() {
     let (d, _tree, db) = index_fixture("plan-bad-policy");
     let pol = d.join("policy.toml");
@@ -946,6 +956,7 @@ fn plan_rejects_a_bad_policy_naming_the_field() {
 }
 
 #[test]
+#[cfg(unix)]
 fn apply_dry_run_reports_and_touches_nothing() {
     let (d, tree, db) = index_fixture("apply-dry");
     let pol = d.join("policy.toml");
