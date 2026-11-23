@@ -45,8 +45,8 @@ pub use apply::{
 };
 pub use dupes::{HashCache, CHECKPOINT_INTERVAL, MERGE_INTERVAL, TRASH_DIRS};
 pub use index::{
-    index_remote, index_scan, is_cow_fs, validate_host, volume_uuid, Index, LocationStatus, Role,
-    ScanSummary,
+    index_remote, index_scan, is_busy, is_cow_fs, validate_host, volume_uuid, Index,
+    LocationStatus, Role, ScanSummary,
 };
 pub use index_report::{
     index_dupes, GroupCopy, HashStats, IndexDupesReport, IndexGroup, IndexReportOptions,

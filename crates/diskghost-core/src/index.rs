@@ -264,6 +264,26 @@ pub(crate) fn db_err(e: rusqlite::Error) -> io::Error {
     io::Error::other(e)
 }
 
+/// How long a statement waits for a lock another process holds.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `e` is the index being locked by another writer (SQLite BUSY or
+/// LOCKED) — as opposed to any other failure.
+pub fn is_busy(e: &io::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<rusqlite::Error>())
+        .is_some_and(|re| {
+            matches!(
+                re,
+                rusqlite::Error::SqliteFailure(f, _)
+                    if matches!(
+                        f.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            )
+        })
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -279,16 +299,21 @@ pub(crate) fn to_sql(v: u64) -> i64 {
 impl Index {
     /// Open the index at `path`, creating it (and migrating an older one).
     pub fn open(path: &Path) -> io::Result<Index> {
+        Index::open_with_busy_timeout(path, BUSY_TIMEOUT)
+    }
+
+    /// [`Index::open`] waiting `busy` (instead of 10 s) for a lock another
+    /// process holds before giving up with an error [`is_busy`] recognises.
+    pub fn open_with_busy_timeout(path: &Path, busy: std::time::Duration) -> io::Result<Index> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path).map_err(db_err)?;
-        Index::init(conn)
+        Index::init(conn, busy)
     }
 
-    fn init(mut conn: Connection) -> io::Result<Index> {
-        conn.busy_timeout(std::time::Duration::from_secs(10))
-            .map_err(db_err)?;
+    fn init(mut conn: Connection, busy: std::time::Duration) -> io::Result<Index> {
+        conn.busy_timeout(busy).map_err(db_err)?;
         // `journal_mode` answers with the mode it set: read, don't execute.
         let _: String = conn
             .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
@@ -330,6 +355,27 @@ impl Index {
     /// reachable *now*. Read-only: an offline location keeps all its rows.
     pub fn status(&self) -> io::Result<Vec<LocationStatus>> {
         self.status_with(&Probe::REAL)
+    }
+
+    /// [`Index::status`] without asking any remote host: `online` is `false`
+    /// for every `ssh://` location because it was *not checked* (an ssh
+    /// round trip, up to the connect timeout per unreachable host). Local
+    /// locations are probed as usual.
+    pub fn status_without_remote_probe(&self) -> io::Result<Vec<LocationStatus>> {
+        self.status_with(&Probe {
+            remote_online: &|_, _| false,
+            ..Probe::REAL
+        })
+    }
+
+    /// Whether this process could take the index's write lock right now:
+    /// takes it and releases it again at once, changing nothing. Fails with
+    /// an [`is_busy`] error when another process holds it for longer than
+    /// the busy timeout.
+    pub fn probe_write_lock(&self) -> io::Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .map_err(db_err)
     }
 
     /// [`Index::status`] asking `probe` whether a location is reachable.
@@ -394,6 +440,24 @@ impl Index {
             .execute("DELETE FROM locations WHERE uuid = ?1", [uuid])
             .map_err(db_err)?;
         Ok(n > 0)
+    }
+
+    /// Set only a location's role (host and rows untouched).
+    pub fn set_role(&self, uuid: &str, role: Role) -> io::Result<()> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE locations SET role = ?2 WHERE uuid = ?1",
+                params![uuid, role.as_str()],
+            )
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no location {uuid} in the index"),
+            ));
+        }
+        Ok(())
     }
 
     /// Set a location's host (stored verbatim) and, when given, its role.

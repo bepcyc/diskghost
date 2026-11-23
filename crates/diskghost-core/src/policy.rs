@@ -136,58 +136,75 @@ impl Policy {
     /// Parse a policy file's text. Errors name the offending field.
     pub fn parse(text: &str) -> Result<Policy, String> {
         let raw: RawFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        let (min_copies, distinct) = match raw.policy {
+            Some(sec) => (sec.min_copies, sec.distinct),
+            None => (None, None),
+        };
+        let rules: Vec<(String, String)> = raw
+            .location
+            .into_iter()
+            .map(|l| (l.matches, l.role))
+            .collect();
+        Policy::from_rules(min_copies, distinct.as_deref(), &rules)
+    }
+
+    /// Build a policy from its parts, validated exactly as a policy file is:
+    /// `min_copies` at least 1, `distinct` `physical_device` or `none`,
+    /// `(match, role)` rules with a non-empty absolute path, `host:/path` or
+    /// uuid. `None` keeps the default.
+    pub fn from_rules(
+        min_copies: Option<i64>,
+        distinct: Option<&str>,
+        rules: &[(String, String)],
+    ) -> Result<Policy, String> {
         let mut p = Policy::default();
-        if let Some(sec) = raw.policy {
-            if let Some(n) = sec.min_copies {
-                if n < 1 {
-                    return Err(format!(
-                        "policy.min_copies must be at least 1 (got {n}); a plan \
-                         never removes the last copy"
-                    ));
-                }
-                p.min_copies = n as u64;
-            }
-            if let Some(d) = sec.distinct {
-                p.distinct = match d.as_str() {
-                    "physical_device" => Distinct::PhysicalDevice,
-                    "none" => Distinct::None,
-                    other => {
-                        return Err(format!(
-                            "policy.distinct: unknown value {other:?} \
-                             (expected \"physical_device\" or \"none\")"
-                        ))
-                    }
-                };
-            }
-        }
-        for (i, l) in raw.location.into_iter().enumerate() {
-            let n = i + 1;
-            if l.matches.trim().is_empty() {
-                return Err(format!("location #{n}: match is empty"));
-            }
-            if l.matches.contains(':') || l.matches.starts_with('/') {
-                // a uuid with a colon, or a path: fine
-            } else if l.matches.contains('/') {
+        if let Some(n) = min_copies {
+            if n < 1 {
                 return Err(format!(
-                    "location #{n}: match {:?} is a relative path; use an absolute \
-                     path, host:/path, or a volume uuid",
-                    l.matches
+                    "policy.min_copies must be at least 1 (got {n}); a plan \
+                     never removes the last copy"
                 ));
             }
-            let role = match l.role.as_str() {
+            p.min_copies = n as u64;
+        }
+        if let Some(d) = distinct {
+            p.distinct = match d {
+                "physical_device" => Distinct::PhysicalDevice,
+                "none" => Distinct::None,
+                other => {
+                    return Err(format!(
+                        "policy.distinct: unknown value {other:?} \
+                         (expected \"physical_device\" or \"none\")"
+                    ))
+                }
+            };
+        }
+        for (i, (matches, role)) in rules.iter().enumerate() {
+            let n = i + 1;
+            if matches.trim().is_empty() {
+                return Err(format!("location #{n}: match is empty"));
+            }
+            if matches.contains(':') || matches.starts_with('/') {
+                // a uuid with a colon, or a path: fine
+            } else if matches.contains('/') {
+                return Err(format!(
+                    "location #{n}: match {matches:?} is a relative path; use an absolute \
+                     path, host:/path, or a volume uuid",
+                ));
+            }
+            let role = match role.as_str() {
                 "master" => Role::Master,
                 "normal" => Role::Normal,
                 "scratch" => Role::Scratch,
                 other => {
                     return Err(format!(
-                        "location #{n} ({}): unknown role {other:?} \
-                         (expected master, normal or scratch)",
-                        l.matches
+                        "location #{n} ({matches}): unknown role {other:?} \
+                         (expected master, normal or scratch)"
                     ))
                 }
             };
             p.locations.push(LocationRule {
-                matches: l.matches,
+                matches: matches.clone(),
                 role,
             });
         }
