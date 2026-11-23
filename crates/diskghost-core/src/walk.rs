@@ -481,7 +481,7 @@ fn visit<'s, 'c: 's>(
     // Entries of this directory sit at `depth + 1`; descend only while the
     // next level is still within `max_depth` (the root is depth 0).
     let child_depth = depth + 1;
-    let descend = ctx.max_depth.map_or(true, |m| child_depth < m);
+    let descend = ctx.max_depth.is_none_or(|m| child_depth < m);
     let mut bytes = 0u64;
     for entry in entries {
         if ctx.progress.cancelled() {

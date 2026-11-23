@@ -365,8 +365,10 @@ fn hashing_uses_the_first_tool_of_the_chain() {
 
 /// Runs the remote commands on this machine — the real `find`, `stat`,
 /// `sh` and hash tools — so their syntax and output are tested too.
+#[cfg(unix)]
 struct LocalExec;
 
+#[cfg(unix)]
 impl RemoteExec for LocalExec {
     fn exec(&self, argv: &[&str]) -> io::Result<ExecOut> {
         let out = std::process::Command::new(argv[0])
@@ -382,6 +384,7 @@ impl RemoteExec for LocalExec {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_real_commands_list_and_hash_a_local_folder_identically() {
     use std::os::unix::fs::MetadataExt;
     let e = Estate::new("remote-local-exec");
@@ -991,6 +994,7 @@ fn every_remote_command_of_a_whole_run_is_read_only() {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_real_fallback_commands_list_a_local_folder_without_printf() {
     use std::os::unix::fs::MetadataExt;
     let e = Estate::new("remote-local-fallback");
@@ -1316,6 +1320,7 @@ fn a_v4_index_migrates_to_v5_keeping_its_rows_as_shell_locations() {
 /// "already uploaded": `locate` answers `have`, and running it serves the
 /// request frames in-process with [`crate::agent::serve`]. Records every
 /// argv and every frame; refuses any upload.
+#[cfg(unix)]
 struct LocalAgent {
     calls: std::sync::Mutex<Vec<Vec<String>>>,
     frames: std::sync::Mutex<Vec<serde_json::Value>>,
@@ -1325,8 +1330,10 @@ struct LocalAgent {
 }
 
 /// Where the "uploaded" agent sits (never created: `LocalAgent` serves it).
+#[cfg(unix)]
 const LOCAL_AGENT_DIR: &str = "/nonexistent/.cache/diskghost";
 
+#[cfg(unix)]
 impl LocalAgent {
     fn new() -> LocalAgent {
         LocalAgent {
@@ -1337,6 +1344,7 @@ impl LocalAgent {
     }
 }
 
+#[cfg(unix)]
 impl RemoteExec for LocalAgent {
     fn exec(&self, argv: &[&str]) -> io::Result<ExecOut> {
         self.calls
@@ -1387,6 +1395,7 @@ impl RemoteExec for LocalAgent {
     }
 }
 
+#[cfg(unix)]
 fn local_target_ok() -> bool {
     let (info, _) = probe_host(&LocalExec).unwrap();
     (info.os.as_str(), info.arch.as_str()) == crate::remote::AGENT_TARGET
@@ -1418,6 +1427,7 @@ fn all_rows(idx: &crate::index::Index, uuid: &str) -> Vec<Row> {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_agent_tier_resolves_the_same_location_as_the_shell_tier() {
     if !local_target_ok() {
         return;
@@ -1442,6 +1452,7 @@ fn the_agent_tier_resolves_the_same_location_as_the_shell_tier() {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_agent_tier_and_the_shell_tier_index_the_same_rows() {
     if !local_target_ok() {
         return;
@@ -1519,6 +1530,7 @@ fn transport_of_idx(idx: &crate::index::Index, uuid: &str) -> String {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_whole_agent_run_only_ever_sends_read_requests() {
     if !local_target_ok() {
         return;
@@ -1781,6 +1793,7 @@ fn hash_requests_are_batched_in_one_session_and_aligned_by_path() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_agent_scan_cut_short_drops_no_rows() {
     if !local_target_ok() {
         return;
@@ -1955,6 +1968,7 @@ fn remote_scan_errors_carry_the_hosts_own_message() {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_agent_tier_and_the_shell_tier_build_the_same_tree() {
     if !local_target_ok() {
         return;
@@ -2069,6 +2083,7 @@ fn an_agent_enumerate_ticks_progress_per_file_frame() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_live_listing_on_real_tools_ends_with_exact_counts() {
     let e = Estate::new("remote-live-exec");
     let root = e.loc("r");

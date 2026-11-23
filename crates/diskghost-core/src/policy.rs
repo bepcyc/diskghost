@@ -223,7 +223,7 @@ impl Policy {
         let mut best: Option<(usize, Role)> = None;
         for r in &self.locations {
             if let Some(s) = score(&r.matches, uuid, host, root) {
-                if best.map_or(true, |(b, _)| s > b) {
+                if best.is_none_or(|(b, _)| s > b) {
                     best = Some((s, r.role));
                 }
             }

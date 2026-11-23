@@ -660,9 +660,9 @@ fn pick_mount<'m>(mounts: &'m [MountEntry], dev: u64, path: &Path) -> Option<&'m
             .iter()
             .filter(|m| pred(m) && path.starts_with(&m.mount_point))
         {
-            if best.map_or(true, |b| {
-                m.mount_point.as_os_str().len() >= b.mount_point.as_os_str().len()
-            }) {
+            if best
+                .is_none_or(|b| m.mount_point.as_os_str().len() >= b.mount_point.as_os_str().len())
+            {
                 best = Some(m);
             }
         }

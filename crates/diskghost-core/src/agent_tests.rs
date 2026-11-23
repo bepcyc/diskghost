@@ -78,6 +78,7 @@ fn requests_are_independent_and_answered_in_order() {
 }
 
 /// A fixture: two copies, a hard link, a non-UTF-8 name, a symlink.
+#[cfg(unix)]
 fn fixture(label: &str) -> (Estate, std::path::PathBuf) {
     use std::os::unix::ffi::OsStrExt;
     let e = Estate::new(label);
@@ -93,6 +94,7 @@ fn fixture(label: &str) -> (Estate, std::path::PathBuf) {
 }
 
 #[test]
+#[cfg(unix)]
 fn enumerate_streams_files_skips_non_utf8_and_ends_with_a_count() {
     use std::os::unix::fs::MetadataExt;
     let (_e, root) = fixture("agent-enum");
@@ -133,6 +135,7 @@ fn enumerate_of_a_relative_or_missing_root_is_an_error_frame() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_unreadable_folder_makes_enumerate_incomplete() {
     use std::os::unix::fs::PermissionsExt;
     let (_e, root) = fixture("agent-enum-locked");
@@ -149,6 +152,7 @@ fn an_unreadable_folder_makes_enumerate_incomplete() {
 }
 
 #[test]
+#[cfg(unix)]
 fn hash_batch_reports_a_bad_file_per_item_and_never_aborts() {
     use std::os::unix::fs::PermissionsExt;
     let (_e, root) = fixture("agent-hash");
@@ -193,6 +197,7 @@ fn hash_batch_reports_a_bad_file_per_item_and_never_aborts() {
 }
 
 #[test]
+#[cfg(unix)]
 fn stat_fs_names_the_canonical_root_and_its_filesystem() {
     let (_e, root) = fixture("agent-statfs");
     let out = talk(&[json!({"op": "stat_fs", "root": root.join("sub/..").to_str().unwrap()})]);

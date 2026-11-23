@@ -17,7 +17,7 @@ fs4 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zstd = "0.14"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 # Copy-policy files. 1.0.x: later 1.x needs Rust 1.85 (workspace MSRV 1.80).
 toml = { version = "~1.0", default-features = false, features = ["std", "serde", "parse", "display"] }
 

@@ -849,7 +849,7 @@ fn dupes_output(
     let mut groups: Vec<&diskghost_core::IndexGroup> = r
         .groups
         .iter()
-        .filter(|g| location.map_or(true, |u| g.copies.iter().any(|c| c.location_uuid == u)))
+        .filter(|g| location.is_none_or(|u| g.copies.iter().any(|c| c.location_uuid == u)))
         .collect();
     groups.sort_by(|a, b| {
         let key = |g: &diskghost_core::IndexGroup| {

@@ -66,9 +66,16 @@ fn status_of(r: &RunReport, from: &Path) -> Status {
         .status
 }
 
+#[cfg(unix)]
 fn ino(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(p).unwrap().ino()
+}
+
+#[cfg(windows)]
+fn ino(p: &Path) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::metadata(p).unwrap().file_index().unwrap_or(0)
 }
 
 fn qdir(e: &Estate, name: &str) -> PathBuf {
@@ -342,6 +349,7 @@ fn an_existing_quarantine_file_is_never_replaced() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_permission_failure_is_an_error_and_the_run_goes_on() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: geteuid has no preconditions.
@@ -557,6 +565,7 @@ fn a_path_no_scan_root_covers_falls_back_to_the_mount_root() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_unwritable_scan_root_is_an_error_never_a_fallback_and_resume_retries() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: geteuid has no preconditions.
