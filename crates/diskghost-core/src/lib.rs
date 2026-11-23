@@ -34,7 +34,7 @@ pub mod remote;
 mod remote_tests;
 mod rotational;
 mod snapshot;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod testkit;
 mod tree;
 mod walk;

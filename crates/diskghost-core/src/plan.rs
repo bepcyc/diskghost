@@ -452,7 +452,7 @@ fn plan_group(c: &Groups, roles: &[Role], policy: &Policy, d: &Draft) -> Option<
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::policy::LocationRule;

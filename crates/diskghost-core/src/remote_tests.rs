@@ -11,6 +11,7 @@ use crate::index::Role;
 use crate::plan::plan_with;
 use crate::policy::{Distinct, Policy};
 use crate::remote::*;
+#[cfg(unix)]
 use crate::testkit::*;
 use crate::Progress;
 

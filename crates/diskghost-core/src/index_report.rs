@@ -1206,7 +1206,7 @@ pub(crate) fn abs(root: &Path, rel: &str) -> PathBuf {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::testkit::*;
