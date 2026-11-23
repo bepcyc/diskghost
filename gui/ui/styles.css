@@ -276,8 +276,8 @@ input[type="text"], input[type="search"], input[type="number"], select {
 input:focus-visible, select:focus-visible { outline-color: var(--color-focus); border-color: var(--color-ink-2); }
 input[aria-invalid="true"] { border-color: var(--color-danger); }
 input::placeholder { color: var(--color-muted); }
-input[type="number"] { width: 7rem; font-variant-numeric: tabular-nums; }
-input.filter { width: 18rem; }
+input[type="number"] { width: 7rem; max-width: 100%; font-variant-numeric: tabular-nums; }
+input.filter { width: 18rem; max-width: 100%; }
 input[type="checkbox"], input[type="radio"] { accent-color: var(--color-accent); width: 1rem; height: 1rem; margin: 0; flex: none; }
 kbd {
   font-family: var(--font-mono); font-size: var(--text-xs); padding: 0 var(--space-2xs);
@@ -411,7 +411,7 @@ kbd {
 
 /* ------------------------------ scan view ------------------------------ */
 .view { display: flex; flex-direction: column; gap: var(--space-sm); min-height: 100%; }
-.scan-view { height: max(100%, 50rem); }
+.scan-view { min-height: 100%; }
 .scan-view > .split { flex: 1.15 1 18rem; }
 .scan-view > .details { flex: 1 1 17rem; }
 .viewhead { display: flex; align-items: center; gap: var(--space-xs); min-width: 0; }
@@ -501,6 +501,7 @@ kbd {
 .cell-name { max-width: 0; width: 45%; }
 .cell-name > * { display: block; }
 .cell-name > .with-ic { display: flex; }
+.cell-name .with-ic > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-title { display: block; font-weight: var(--weight-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-path { display: block; font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--color-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-bar { width: 18%; min-width: 7rem; }
@@ -530,8 +531,8 @@ tr.is-added .delta { color: var(--color-accent); font-weight: var(--weight-stron
 .vrow.is-head:hover { background: var(--color-paper-1); }
 
 .sizes { display: flex; flex-direction: column; gap: var(--space-sm); height: 100%; }
-.cols-wrap { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-xl); min-height: 13rem; }
-.cols { display: flex; flex-direction: column; gap: var(--space-xs); min-height: 0; }
+.cols-wrap { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--space-xl); min-height: 13rem; }
+.cols { display: flex; flex-direction: column; gap: var(--space-xs); min-width: 0; min-height: 0; }
 .cols figcaption { font-size: var(--text-sm); font-weight: var(--weight-strong); color: var(--color-ink-2); }
 .plot { flex: 1; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: var(--space-3xs); align-items: end; border-bottom: 1px solid var(--color-rule-2); min-height: 8rem; }
 .col { height: 100%; display: flex; flex-direction: column; justify-content: flex-end; padding: 0 var(--space-2xs); }
@@ -633,7 +634,7 @@ tr.is-added .delta { color: var(--color-accent); font-weight: var(--weight-stron
 .preset.is-on { border-color: var(--color-rule-2); background: var(--color-paper-2); }
 .preset-head { display: flex; align-items: center; gap: var(--space-xs); font-size: var(--text-sm); font-weight: var(--weight-strong); }
 .addrow { display: flex; gap: var(--space-xs); }
-.addrow input { flex: 1; }
+.addrow input { flex: 1; min-width: 0; }
 
 @media (max-width: 80rem) {
   .split { grid-template-columns: minmax(0, 1fr) 17rem; }
@@ -644,3 +645,9 @@ tr.is-added .delta { color: var(--color-accent); font-weight: var(--weight-stron
 .dup-path .path { color: inherit; }
 .welcome .table td { white-space: nowrap; }
 .table td.cell-date { width: 10rem; white-space: nowrap; }
+
+/* Short windows (the shell floor is 640 px): shrink the map's minimum so
+   the scan view reflows instead of demanding a fixed canvas. */
+@media (max-height: 48rem) {
+  .treemap { min-height: 9rem; }
+}
