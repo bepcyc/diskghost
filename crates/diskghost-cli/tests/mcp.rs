@@ -297,6 +297,52 @@ fn mcp_unknown_method_is_an_error_and_unknown_notifications_are_ignored() {
     assert_eq!(p["result"], json!({}));
 }
 
+// 2026-07-28: no `initialize`; every request names its version in `_meta`,
+// `server/discover` says what the server speaks.
+#[test]
+fn mcp_2026_07_28_is_stateless_with_server_discover() {
+    let sb = Sandbox::new("modern");
+    let mut m = sb.spawn(&[]);
+    let meta = json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}});
+    // No handshake at all.
+    let d = m.request("server/discover", meta.clone());
+    let r = &d["result"];
+    assert_eq!(r["resultType"], "complete");
+    assert_eq!(
+        r["supportedVersions"],
+        json!(["2025-06-18", "2025-11-25", "2026-07-28"])
+    );
+    assert!(r["capabilities"]["tools"].is_object());
+    assert_eq!(
+        r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "diskghost"
+    );
+    assert!(r["ttlMs"].as_u64().is_some() && r["cacheScope"].is_string());
+    // tools/list carries resultType + ttlMs + cacheScope on the result.
+    let l = m.request("tools/list", meta.clone());
+    assert_eq!(l["result"]["resultType"], "complete");
+    assert!(l["result"]["ttlMs"].as_u64().is_some());
+    assert!(l["result"]["cacheScope"].is_string());
+    assert_eq!(
+        l["result"]["tools"].as_array().unwrap().len(),
+        ALLOWLIST.len()
+    );
+    // tools/call too.
+    let c = m.request(
+        "tools/call",
+        json!({"name": "list_jobs", "arguments": {}, "_meta": meta["_meta"].clone()}),
+    );
+    assert_eq!(c["result"]["resultType"], "complete");
+    // An unknown version is refused with the supported list.
+    let bad = m.request(
+        "tools/list",
+        json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2099-01-01"}}),
+    );
+    assert_eq!(bad["error"]["code"], -32022, "{bad}");
+    assert_eq!(bad["error"]["data"]["requested"], "2099-01-01");
+    assert!(bad["error"]["data"]["supported"].is_array());
+}
+
 // --------------------------------------------------- the read-only surface
 
 #[test]
@@ -614,7 +660,7 @@ fn mcp_index_busy_is_honest_when_another_process_holds_the_lock() {
     let started = Instant::now();
     for (tool, args) in [
         ("add_location", json!({"path": tree.to_str().unwrap()})),
-        ("dupes_report", json!({})),
+        ("dupes_report", json!({"min_size_bytes": 1})),
         ("plan_dedup", json!({"min_copies": 1, "distinct": "none"})),
     ] {
         let r = m.call(tool, args);

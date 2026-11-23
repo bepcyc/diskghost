@@ -9,6 +9,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+mod mcp;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::remote::{parse_ssh_url, AgentMode};
 use diskghost_core::{
@@ -99,6 +101,18 @@ enum Command {
     /// construction. Nothing else is opened, created or written.
     #[command(hide = true)]
     Agent,
+    /// Serve an MCP (Model Context Protocol) server on stdin/stdout, so an AI
+    /// agent can list drives, index folders and ssh:// hosts as background
+    /// jobs, find duplicates and write a dedup plan. Read-only by
+    /// construction: no tool moves, deletes, renames or writes a user file —
+    /// a plan is a JSON file under $XDG_STATE_HOME/diskghost/plans/ that you
+    /// carry out yourself with `diskghost apply`. Not for interactive use:
+    /// register it with the agent (`claude mcp add diskghost -- diskghost mcp`).
+    Mcp {
+        /// Index database (default: as `diskghost index`).
+        #[arg(long, value_name = "FILE")]
+        db: Option<PathBuf>,
+    },
     /// Scan a directory: total size, biggest sub-folders and biggest files.
     Scan {
         /// Directory to scan.
@@ -417,6 +431,7 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Command::Mcp { db } => return mcp::run(db),
         Command::Scan {
             path,
             top,
@@ -685,6 +700,21 @@ fn open_index(db: Option<PathBuf>) -> Result<Index, ExitCode> {
     })
 }
 
+/// A journal beside the output belongs to an earlier plan of that name: a
+/// new plan there would mix its records with this one's. Shared by `plan -o`
+/// and the MCP server's plan files.
+pub(crate) fn check_no_journal(output: &Path) -> Result<(), String> {
+    let journal = journal_path(output);
+    if journal.exists() {
+        return Err(format!(
+            "{} exists (an earlier apply of a plan at this path); write the \
+             new plan elsewhere or move that journal away first",
+            journal.display()
+        ));
+    }
+    Ok(())
+}
+
 /// `plan --index`: write the plan file, print its summary.
 fn run_plan(json: bool, db: Option<PathBuf>, policy: Option<&Path>, output: &Path) -> ExitCode {
     let policy = match policy.map(Policy::load) {
@@ -695,15 +725,8 @@ fn run_plan(json: bool, db: Option<PathBuf>, policy: Option<&Path>, output: &Pat
             return ExitCode::FAILURE;
         }
     };
-    // A journal beside the output belongs to an earlier plan of that name:
-    // a new plan there would mix its records with this one's.
-    let journal = journal_path(output);
-    if journal.exists() {
-        eprintln!(
-            "error: {} exists (an earlier apply of a plan at this path); write the \
-             new plan elsewhere or move that journal away first",
-            journal.display()
-        );
+    if let Err(e) = check_no_journal(output) {
+        eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
     let idx = match open_index(db) {
