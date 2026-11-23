@@ -71,7 +71,7 @@ pub(crate) fn definitions() -> Vec<Value> {
     scan_props.insert("agent".into(), agent.clone());
     let mut add_props = scan_props.clone();
     add_props.insert("path".into(), json!({"type": "string",
-        "description": "An absolute local folder, or ssh://host//absolute/path (ssh://host/rel is relative to the remote home)."}));
+        "description": "An absolute local folder, or ssh://host//absolute/path (note the double slash; a relative remote path is refused)."}));
     add_props.insert("role".into(), json!({"type": "string", "enum": ["normal", "master", "scratch"],
         "description": "Role of the volume in later copy policies: master = the copy to keep, scratch = copies here are expendable."}));
     let mut start_props = scan_props;
@@ -324,7 +324,15 @@ fn parse_target(s: &str) -> Result<Target, ToolError> {
         ));
     }
     if s.starts_with("ssh://") {
-        let (host, _) = parse_ssh_url(s).map_err(ToolError::invalid)?;
+        let (host, path) = parse_ssh_url(s).map_err(ToolError::invalid)?;
+        // The path half is model input as well. Only `ssh://host//abs/path`
+        // is accepted: a relative path (`-delete`, `-fprintf…`) could be
+        // read as an option by the remote `find`.
+        if !path.starts_with('/') {
+            return Err(ToolError::invalid(format!(
+                "{s:?}: the remote path must be absolute — write ssh://{host}//absolute/path"
+            )));
+        }
         return Ok(Target::Remote {
             url: s.to_string(),
             host,
