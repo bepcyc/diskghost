@@ -271,6 +271,13 @@ fn mcp_hostile_ssh_urls_are_rejected_before_any_process_is_spawned() {
         "ssh://host;rm//p",
         "ssh://$(id)//p",
         "ssh://host`id`//p",
+        // The path half is model input too: relative paths (a leading dash
+        // reads as an option to remote `find`) are refused, only
+        // `ssh://host//absolute/path` is accepted.
+        "ssh://h/-delete",
+        "ssh://h/rel/dir",
+        "ssh://h",
+        "ssh://h/",
     ] {
         for tool in ["add_location", "start_scan"] {
             let r = m.call(tool, json!({"path": url}));
