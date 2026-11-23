@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use diskghost_core::{
-    diff, disk_space, find_duplicates_cached, is_mount_point, reclaim, remove_path, validate_globs,
-    DiffReport, DirSize, DupGroup, FileStats, HashCache, Options, Progress, ReclaimAction,
-    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
+    diff, disk_space, find_duplicates_cached, index_remote, index_scan, is_mount_point, reclaim,
+    remove_path, validate_globs, DiffReport, DirSize, DupGroup, FileStats, HashCache, Index,
+    Options, Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, Role, ScanReport,
+    ScanSummary, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager};
@@ -1007,6 +1008,175 @@ fn agent_binary() -> Option<diskghost_core::remote::AgentBinary> {
         .and_then(|p| diskghost_core::remote::AgentBinary::from_file(&p))
 }
 
+/// A folder `add_location` is allowed to index — an absolute local directory
+/// or `ssh://host//absolute/path`: the same gate `diskghost index add` and
+/// the MCP `add_location` apply. A relative remote path is refused: the
+/// host's own tools could read one (`-delete`, `-fprintf`…) as an option.
+enum LocationTarget {
+    Local(PathBuf),
+    Remote { url: String, host: String },
+}
+
+fn location_target(path: &str) -> Result<LocationTarget, String> {
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return Err("a path must be non-empty and free of control characters".to_string());
+    }
+    if is_remote_url(path) {
+        let (host, p) = diskghost_core::remote::parse_ssh_url(path)?;
+        if !p.starts_with('/') {
+            return Err(format!(
+                "{path}: the remote path must be absolute — write ssh://{host}//absolute/path"
+            ));
+        }
+        return Ok(LocationTarget::Remote {
+            url: path.to_string(),
+            host,
+        });
+    }
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!("not an absolute path: {path}"));
+    }
+    if !p.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    Ok(LocationTarget::Local(p.to_path_buf()))
+}
+
+/// The index the command-line `diskghost index` uses — the locations added
+/// here and by the CLI or the MCP server are the same ones.
+fn index_db() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))?;
+    Some(base.join("diskghost").join("index.db"))
+}
+
+/// Index a folder as job `job` — `diskghost index add` from the GUI: new and
+/// changed files are recorded in the persistent index, so a re-scan only
+/// re-reads what changed. `exclude` holds walk globs, applied to local
+/// folders only (a remote host lists its own files); `agent` is the remote
+/// agent policy — `auto` runs the agent where the host can, `never` uses the
+/// host's shell tools.
+#[tauri::command]
+async fn add_location(
+    app: tauri::AppHandle,
+    job: u64,
+    path: String,
+    exclude: Vec<String>,
+    agent: Option<String>,
+) -> Result<ScanSummary, String> {
+    let mode = match agent.as_deref() {
+        None | Some("auto") => diskghost_core::remote::AgentMode::Auto,
+        Some("never") => diskghost_core::remote::AgentMode::Never,
+        Some(other) => return Err(format!("agent {other:?}: expected auto or never")),
+    };
+    let target = location_target(&path)?;
+    if matches!(target, LocationTarget::Remote { .. }) && !exclude.is_empty() {
+        return Err(
+            "exclude applies to local folders only: the host lists its own files".to_string(),
+        );
+    }
+    let bad = validate_globs(&exclude);
+    if !bad.is_empty() {
+        return Err(format!("invalid exclude glob(s): {}", bad.join(", ")));
+    }
+    let running = Running::start(&app, job);
+    blocking(move || {
+        let db = index_db()
+            .ok_or_else(|| "no data directory (set HOME or XDG_DATA_HOME)".to_string())?;
+        let idx =
+            Index::open(&db).map_err(|e| format!("cannot open index {}: {e}", db.display()))?;
+        match target {
+            LocationTarget::Local(p) => {
+                let opts = Options {
+                    exclude,
+                    skip_remote: true,
+                    ..Options::default()
+                };
+                index_scan(&idx, &p, &opts, &running.progress)
+                    .and_then(|s| idx.configure(&s.uuid, None, "local").map(|()| s))
+            }
+            LocationTarget::Remote { url, host } => {
+                // `index_remote` picks the agent itself (`AgentBinary::current`
+                // is the GUI binary, which cannot serve the protocol): on
+                // `auto` the hello check falls back to the host's shell tools
+                // and `agent_note` on the summary says why.
+                index_remote(&idx, &url, mode, &running.progress).and_then(|s| {
+                    idx.configure(&s.uuid, None, &format!("ssh://{host}"))
+                        .map(|()| s)
+                })
+            }
+        }
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// One indexed location, as the sidebar lists it.
+#[derive(Serialize)]
+struct LocationInfo {
+    uuid: String,
+    /// `local` or `ssh://<host>`.
+    host: String,
+    /// The volume's last known mountpoint (a path on its own machine).
+    root: String,
+    /// The folders `index add` was given on the volume.
+    roots: Vec<String>,
+    role: Role,
+    files: u64,
+    bytes: u64,
+    /// Unix seconds of the location's last scan.
+    last_seen: i64,
+    /// `None` for a remote location: it is not probed here, so nothing is
+    /// claimed about its reachability.
+    online: Option<bool>,
+}
+
+/// Every location in the index, as `diskghost index status` reports them.
+/// Remote hosts are not probed — each ssh answer could cost seconds.
+#[tauri::command]
+async fn list_locations() -> Result<Vec<LocationInfo>, String> {
+    blocking(|| {
+        let Some(db) = index_db() else {
+            return Ok(Vec::new());
+        };
+        if !db.exists() {
+            return Ok(Vec::new());
+        }
+        let idx =
+            Index::open(&db).map_err(|e| format!("cannot open index {}: {e}", db.display()))?;
+        let mut st = idx
+            .status_without_remote_probe()
+            .map_err(|e| e.to_string())?;
+        st.sort_by(|a, b| (&a.host, &a.root, &a.uuid).cmp(&(&b.host, &b.root, &b.uuid)));
+        Ok(st
+            .into_iter()
+            .map(|l| {
+                let remote = diskghost_core::remote::is_remote_host(&l.host);
+                LocationInfo {
+                    uuid: l.uuid,
+                    host: l.host,
+                    root: l.root.to_string_lossy().into_owned(),
+                    roots: l
+                        .roots
+                        .iter()
+                        .map(|r| r.to_string_lossy().into_owned())
+                        .collect(),
+                    role: l.role,
+                    files: l.files,
+                    bytes: l.bytes,
+                    last_seen: l.last_seen,
+                    online: if remote { None } else { Some(l.online) },
+                }
+            })
+            .collect())
+    })
+    .await
+}
+
 /// The drives to offer for the real local filesystems `mounts`: `/` first
 /// (always, even when the table names it differently), then the others by
 /// mount point. (path, filesystem type, kind, media). `rotational` is the
@@ -1176,7 +1346,9 @@ fn main() {
             load_settings,
             save_settings,
             app_version,
-            is_elevated
+            is_elevated,
+            add_location,
+            list_locations
         ])
         .run(tauri::generate_context!())
         .expect("error while running Diskghost");
@@ -1193,6 +1365,48 @@ mod tests {
         assert!(!is_remote_url("/home/u"));
         assert!(!is_remote_url("C:\\"));
         assert!(!is_remote_url("./ssh://x"));
+    }
+
+    #[test]
+    fn add_location_takes_only_absolute_targets() {
+        // A remote folder is accepted only as ssh://host//abs/path: a
+        // relative path could be read as an option by the host's `find`.
+        match location_target("ssh://nas//storage").unwrap() {
+            LocationTarget::Remote { url, host } => {
+                assert_eq!(url, "ssh://nas//storage");
+                assert_eq!(host, "nas");
+            }
+            LocationTarget::Local(_) => panic!("an ssh URL read as local"),
+        }
+        match location_target("ssh://u@nas//").unwrap() {
+            LocationTarget::Remote { host, .. } => assert_eq!(host, "u@nas"),
+            LocationTarget::Local(_) => panic!("an ssh URL read as local"),
+        }
+        for bad in [
+            "ssh://nas",
+            "ssh://nas/",
+            "ssh://nas/rel",
+            "ssh://",
+            "ssh://-oProxyCommand=x//a",
+            "ssh://a b//x",
+            "",
+            "rel/path",
+            "nas//x",
+            " \t",
+        ] {
+            assert!(location_target(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_location_takes_only_existing_local_dirs() {
+        match location_target("/").unwrap() {
+            LocationTarget::Local(p) => assert_eq!(p, Path::new("/")),
+            LocationTarget::Remote { .. } => panic!("a local dir read as remote"),
+        }
+        assert!(location_target("home/user").is_err());
+        assert!(location_target("/definitely-not-a-dir-xyz").is_err());
     }
 
     #[cfg(unix)]

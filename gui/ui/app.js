@@ -452,6 +452,113 @@ function rememberRemote(root) {
   saveSettings();
 }
 
+// ---------------------- locations (the persistent index) ----------------------
+// The same index.db the CLI's `index` commands and the MCP server use: a
+// location added anywhere shows up for the others.
+let locations = [];
+
+async function loadLocations() {
+  try {
+    locations = await invoke("list_locations");
+  } catch (e) {
+    status(`${t("locFailed")} ${errText(e)}`, true);
+  }
+  renderLocations();
+}
+
+// One row per folder `index add` was given; clicking it scans it like a
+// drive. A remote location is never probed for the list — an unreachable
+// host only shows up as that scan's own error.
+function renderLocations() {
+  const rows = [];
+  for (const l of locations) {
+    const remote = l.host.startsWith("ssh://");
+    for (const r of l.roots.length ? l.roots : [l.root]) {
+      const target = remote ? `${l.host}/${r}` : String(r);
+      const label = remote ? `${l.host.slice(6)}:${r}` : String(r);
+      const offline = l.online === false;
+      const b = el("button", { type: "button", class: "drive", disabled: offline, onclick: () => enqueue("scan", target), "aria-label": `${t("scan")} ${target}` },
+        icon(remote ? "network" : "drive"),
+        el("span", { class: "drive-name", text: label }),
+        el("span", { class: "drive-free num", text: offline ? t("locOffline") : `${num(l.files)} ${t("files")}` }));
+      tip(b, () => [
+        el("b", { text: target }),
+        tipRow(t("locUuid"), l.uuid),
+        tipRow(t("kFiles"), `${num(l.files)} ${t("files")} · ${human(l.bytes)}`),
+        tipRow(t("locLastScan"), fmtDate(l.last_seen)),
+        tipRow(t("locReach"), l.online === null ? t("locNotProbed") : l.online ? t("locOnlineNow") : t("locOffline")),
+      ]);
+      rows.push(b);
+    }
+  }
+  $("locations").replaceChildren(...(rows.length ? rows : [el("p", { class: "side-empty", text: t("locEmpty") })]));
+}
+
+// The add-location dialog: validate the shape before the job is queued, the
+// backend then applies the same gate (and the filesystem checks) again.
+function openAddLocation() {
+  const dlg = $("addloc-dlg");
+  const pathIn = el("input", { type: "text", spellcheck: "false", "data-fk": "loc-path", "aria-label": t("locPath"), placeholder: t("locPathPh") });
+  const exclIn = el("input", { type: "text", spellcheck: "false", "data-fk": "loc-excl", "aria-label": t("locExclude"), placeholder: "node_modules, *.tmp" });
+  const agentSel = selectInput("auto", [["auto", t("locAgentAuto")], ["never", t("locAgentNever")]], () => {}, { "data-fk": "loc-agent" });
+  const msg = el("p", { class: "field-help", "aria-live": "polite" });
+  const showErr = (text) => { msg.textContent = text; msg.classList.toggle("is-error", Boolean(text)); };
+  pathIn.addEventListener("input", () => {
+    const r = locationTarget(pathIn.value);
+    agentSel.disabled = r.kind !== "remote";
+    showErr(r.error ? t(r.error) : "");
+  });
+  const submit = async () => {
+    const r = locationTarget(pathIn.value);
+    if (r.error) {
+      showErr(t(r.error));
+      pathIn.focus();
+      return;
+    }
+    const exclude = exclIn.value.split(",").map((s) => s.trim()).filter(Boolean);
+    if (r.kind === "remote" && exclude.length) {
+      showErr(t("locExclRemote"));
+      exclIn.focus();
+      return;
+    }
+    if (exclude.length) {
+      try {
+        const bad = await invoke("check_globs", { patterns: exclude });
+        if (bad.length) {
+          showErr(`${t("setBadGlob")} ${bad.join(", ")}`);
+          exclIn.focus();
+          return;
+        }
+      } catch (e) {
+        showErr(`${t("globCheckFailed")} ${errText(e)}`);
+        return;
+      }
+    }
+    enqueue("index", r.kind === "remote" ? r.url : r.path, { locExclude: exclude, locAgent: agentSel.value });
+    dlg.close();
+  };
+  dlg.replaceChildren(el("div", { class: "dlg-in" },
+    el("header", { class: "dlg-head" }, el("h2", { text: t("locAdd") })),
+    el("div", { class: "dlg-body" },
+      el("p", { text: t("locIntro") }),
+      field(t("locPath"), t("locPathD"), pathIn),
+      field(t("locExclude"), t("locExcludeD"), exclIn),
+      field(t("locAgent"), t("locAgentD"), agentSel),
+      msg),
+    el("footer", { class: "dlg-foot" },
+      el("button", { type: "button", onclick: () => dlg.close() }, t("cancel")),
+      el("button", { type: "button", class: "primary", onclick: submit }, t("locGo")))));
+  pathIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submit();
+    }
+  });
+  dlg.showModal();
+  agentSel.disabled = true;
+  pathIn.focus();
+}
+
 // ---------------------------------- jobs ----------------------------------
 const active = () => jobs.find((j) => j.id === activeId) || null;
 const byId = (id) => jobs.find((j) => j.id === id);
@@ -464,14 +571,14 @@ function dupeOpts(includeProt) {
   return o;
 }
 
-function enqueue(kind, path, { select = true, includeProt = false } = {}) {
+function enqueue(kind, path, { select = true, includeProt = false, locExclude = [], locAgent = "auto" } = {}) {
   path = String(path || "").trim();
   if (!path) {
     status(t("enterPath"), true);
     $("path").focus();
     return null;
   }
-  const opts = kind === "dupes" ? dupeOpts(includeProt) : walkOpts();
+  const opts = kind === "dupes" ? dupeOpts(includeProt) : kind === "index" ? { exclude: locExclude, agent: locAgent } : walkOpts();
   // The same scan again: just show it (Rescan walks it afresh).
   const same = jobs.find((j) => j.kind === kind && j.root === path && j.state !== "error" &&
     JSON.stringify(j.opts) === JSON.stringify(opts));
@@ -548,6 +655,10 @@ async function runJob(j) {
       if (back && back !== j.root && !j.closed) navigate(j, back, { keepTab: true, record: false });
       if (!j.partial && !j.closed) autoCompare(j);
       if (view.mft_fallback) status(`${t("mftFallback")}: ${view.mft_fallback}`, true);
+    } else if (j.kind === "index") {
+      j.summary = await invoke("add_location", { job: j.id, path: j.root, exclude: j.opts.exclude || [], agent: j.opts.agent || "auto" });
+      j.elapsedMs = performance.now() - j.startedAt;
+      j.state = j.cancelRequested ? "cancelled" : "done";
     } else {
       j.groups = await invoke("find_dupes", { job: j.id, path: j.root, mb: j.mb, opts: j.opts });
       j.elapsedMs = performance.now() - j.startedAt;
@@ -574,6 +685,7 @@ async function runJob(j) {
     rememberRemote(j.root);
     loadDrives();
   }
+  if (j.kind === "index") loadLocations();
 }
 
 async function cancelJob(j) {
@@ -615,7 +727,7 @@ function selectJob(id) {
 
 function rescan(j) {
   if (j.state === "running" || j.state === "queued") return;
-  j.opts = j.kind === "dupes" ? dupeOpts(j.includeProt) : walkOpts();
+  j.opts = j.kind === "dupes" ? dupeOpts(j.includeProt) : j.kind === "index" ? j.opts : walkOpts();
   j.top = settings.top;
   j.mb = settings.min_mb;
   j.returnTo = j.kind === "scan" ? j.path : null;
@@ -689,7 +801,7 @@ function renderQueueInfo() {
 function jobState(j) {
   if (j.state === "error") return ["alert", t("stError")];
   if (j.state === "queued") return ["queue", t("stQueued")];
-  if (j.state === "running") return ["clock", j.cancelRequested ? t("cancelling") : j.kind === "dupes" ? t("stSearching") : t("stRunning")];
+  if (j.state === "running") return ["clock", j.cancelRequested ? t("cancelling") : j.kind === "dupes" ? t("stSearching") : j.kind === "index" ? t("stIndexing") : t("stRunning")];
   if (j.state === "cancelled") return ["stop", t("stCancelled")];
   if (j.kind === "scan" && j.partial) return ["alert", t("stPartial")];
   return ["check", t("stDone")];
@@ -709,6 +821,7 @@ function jobSub(j) {
     return `${num(j.files)} ${t("files")} · ${human(j.bytes)}`;
   }
   if (j.state === "error") return j.error;
+  if (j.kind === "index" && j.summary) return `${num(j.summary.seen)} ${t("files")} · ${num(j.summary.new)} ${t("newShort")}`;
   if (j.kind === "dupes") {
     if (j.state === "cancelled") return t("noResultsCancelled");
     tagGroups(j);
@@ -768,7 +881,7 @@ function renderJobs() {
   for (const id of jobRows.keys()) if (!byId(id)) jobRows.delete(id);
   for (const [kind, boxId, emptyKey] of [["scan", "jobs-scan", "noScans"], ["dupes", "jobs-dupes", "noSearches"]]) {
     const box = $(boxId);
-    const list = jobs.filter((j) => j.kind === kind);
+    const list = jobs.filter((j) => (kind === "scan" ? j.kind !== "dupes" : j.kind === kind));
     list.forEach((j, i) => {
       const r = jobRow(j);
       const busy = j.state === "running";
@@ -818,6 +931,7 @@ function renderMain() {
   else if (j.state === "running") next = progressView(j);
   else if (j.state === "error") next = errorView(j);
   else if (j.kind === "dupes") next = dupesView(j);
+  else if (j.kind === "index") next = indexedView(j);
   else next = scanView(j);
   main.replaceChildren(next);
   if (hadFocus) {
@@ -886,6 +1000,34 @@ function queuedView(j) {
     el("div", { class: "row-acts" }, btn("close", t("removeFromQueue"), { onclick: () => closeJob(j) }))));
 }
 
+// A finished `index add`: the summary the engine returned, never invented.
+function indexedView(j) {
+  const s = j.summary || {};
+  const remote = String(j.root).startsWith("ssh://");
+  const notes = [];
+  if (s.agent_note) notes.push(banner("info", `${t("locAgentNote")} ${s.agent_note}`));
+  if (s.skipped) notes.push(banner("info", `${num(s.skipped)} ${t("kSkipped")}`));
+  if (s.complete === false) notes.push(banner("warn", t("locIncomplete")));
+  if (s.algo && s.algo !== "blake3") notes.push(banner("info", t("locAlgoNote")));
+  return el("div", { class: "stage" }, el("section", { class: "panel stage-panel" },
+    el("header", { class: "panel-head" }, el("h2", { text: t("locDone") })),
+    el("p", { class: "path", text: j.root }),
+    el("p", { class: "muted", text: [s.root, s.uuid].filter(Boolean).join(" · ") }),
+    notes,
+    el("dl", { class: "stats" },
+      stat(t("kFiles"), num(s.seen)),
+      stat(t("newFiles"), num(s.new)),
+      stat(t("changedFiles"), num(s.changed)),
+      stat(t("locUnchanged"), num(s.unchanged)),
+      stat(t("locVanished"), num(s.vanished)),
+      remote
+        ? stat(t("locHashed"), num(s.hashed ?? 0), `${s.algo || "—"} · ${s.transport === "agent" ? t("locViaAgent") : t("locViaShell")}`)
+        : stat(t("locSampled"), num(s.sampled))),
+    el("div", { class: "row-acts" },
+      btn("refresh", t("rescan"), { onclick: () => rescan(j) }),
+      btn("close", t("close"), { class: "quiet", onclick: () => closeJob(j) }))));
+}
+
 // Title, 0..1 fraction (or null) and detail line of a running job: a scan
 // estimates against the drive's used space, a duplicate search reports its
 // three phases against their known totals.
@@ -894,7 +1036,7 @@ function progressInfo(j) {
     const est = estimate(j);
     return {
       // Only "requested": the helper may still fall back to the walk.
-      title: `${t("stRunning")}${j.opts?.mft ? ` · ${t("mftRequested")}` : ""}`,
+      title: j.kind === "index" ? t("stIndexing") : `${t("stRunning")}${j.opts?.mft ? ` · ${t("mftRequested")}` : ""}`,
       frac: est,
       detail: est == null ? t("noEstimate") : `≈ ${pct(est, 1)} ${t("estimated")}`,
     };
@@ -1937,6 +2079,8 @@ setInterval(() => {
   if (jobs.some((j) => j.state === "running") || op) repaintLive();
 }, 500);
 
+$("btn-add-loc").addEventListener("click", openAddLocation);
+
 // Drag & drop: every dropped folder becomes its own queued scan.
 try {
   const wv = window.__TAURI__?.webview?.getCurrentWebview?.();
@@ -2002,4 +2146,5 @@ try {
   updateExcludeChip();
   renderAll();
   loadDrives();
+  loadLocations();
 })();

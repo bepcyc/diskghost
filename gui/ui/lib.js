@@ -430,6 +430,29 @@
     return used > 0 && scanned > used;
   }
 
+  // The target an "add location" accepts: an absolute local path or
+  // `ssh://host//abs/path` — the gate the backend and `diskghost index add`
+  // apply (a relative remote path could be read as an option by the host's
+  // own `find`). {kind, path|url, host?} or {error: "<i18n key>"}.
+  function locationTarget(input) {
+    const raw = String(input || "");
+    if (/[\x00-\x1f\x7f]/.test(raw)) return { error: "locBadPath" };
+    const p = raw.trim();
+    if (!p) return { error: "locBadPath" };
+    if (p.startsWith("ssh://")) {
+      const m = p.match(/^ssh:\/\/([^/]*)(?:\/(.*))?$/s);
+      const host = (m && m[1]) || "";
+      const word = (w) => /^[A-Za-z0-9._-]+$/.test(w) && !w.startsWith("-");
+      const ok = host.includes("@") ? host.split("@").length === 2 && host.split("@").every(word) : word(host);
+      if (!ok) return { error: "locBadHost" };
+      const rel = (m && m[2]) || "";
+      if (!rel.startsWith("/")) return { error: "locNotAbsolute" };
+      return { kind: "remote", url: p, host };
+    }
+    const abs = p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("\\\\");
+    return abs ? { kind: "local", path: p } : { error: "locNotAbsolute" };
+  }
+
   // The drive a path lives on ("c:", "\\server\share", "/"), for scheduling.
   function driveKey(path) {
     const p = String(path);
@@ -568,6 +591,7 @@
     human, humanDelta, unmeasured, sizeText, countText, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, driveMedia, groupDrives, remoteDrive, mapItems, parentPath, isUnder, SETTINGS_VERSION,
+    locationTarget,
     estimateScan, exceedsUsed, COMPRESS_FS,
     isProtectedPath, folderSets, protectedExcludes, dropReclaimed,
   };

@@ -521,3 +521,30 @@ test("exceedsUsed marks scans larger than the physical used space", () => {
   assert.equal(lib.exceedsUsed(100, 100), false);
   assert.equal(lib.exceedsUsed(10, 0), false);
 });
+
+// An "add location" target: an absolute local path or
+// ssh://host//abs/path — the same gate the backend and `diskghost index
+// add` apply (a relative remote path could be read as an option by the
+// host's own `find`).
+test("locationTarget accepts absolute local paths", () => {
+  assert.deepEqual(lib.locationTarget("/data"), { kind: "local", path: "/data" });
+  assert.deepEqual(lib.locationTarget(" /data/with space "), { kind: "local", path: "/data/with space" });
+  assert.deepEqual(lib.locationTarget("C:\\Media"), { kind: "local", path: "C:\\Media" });
+  assert.deepEqual(lib.locationTarget("D:/Games"), { kind: "local", path: "D:/Games" });
+  assert.deepEqual(lib.locationTarget("\\\\server\\share"), { kind: "local", path: "\\\\server\\share" });
+  for (const bad of ["", "   ", "\t/a", "/a\nb"]) assert.equal(lib.locationTarget(bad).error, "locBadPath", bad);
+  for (const bad of ["rel/path", "./x", "C:rel", "data", "ssh:/x"])
+    assert.equal(lib.locationTarget(bad).error, "locNotAbsolute", bad);
+});
+
+test("locationTarget accepts only ssh://host//abs/path remotes", () => {
+  assert.deepEqual(lib.locationTarget("ssh://nas//storage"), { kind: "remote", url: "ssh://nas//storage", host: "nas" });
+  assert.deepEqual(lib.locationTarget("ssh://u@nas//"), { kind: "remote", url: "ssh://u@nas//", host: "u@nas" });
+  assert.deepEqual(lib.locationTarget("ssh://nas-1.example//a/b"), { kind: "remote", url: "ssh://nas-1.example//a/b", host: "nas-1.example" });
+  // no path, an empty one, or a relative one: the remote path must be absolute
+  for (const bad of ["ssh://nas", "ssh://nas/", "ssh://nas/rel", "ssh://nas/rel/abs"])
+    assert.equal(lib.locationTarget(bad).error, "locNotAbsolute", bad);
+  // empty or unsafe hosts are refused before any ssh runs
+  for (const bad of ["ssh://", "ssh:////a", "ssh://-x//a", "ssh://a b//x", "ssh://a@b@c//x", "ssh://@//x", "ssh://u@//x"])
+    assert.equal(lib.locationTarget(bad).error, "locBadHost", bad);
+});
