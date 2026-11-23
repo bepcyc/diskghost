@@ -1423,13 +1423,6 @@ mod tests {
         std::fs::canonicalize(&d).unwrap()
     }
 
-    fn write(path: &Path, content: &[u8]) {
-        if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p).unwrap();
-        }
-        std::fs::write(path, content).unwrap();
-    }
-
     fn open_db(dir: &Path) -> Index {
         Index::open(&dir.join("db").join("index.db")).unwrap()
     }
@@ -1780,6 +1773,13 @@ mod tests {
         use std::collections::BTreeSet;
         use std::sync::Mutex;
         use std::time::{Duration, SystemTime};
+
+        fn write(path: &Path, content: &[u8]) {
+            if let Some(p) = path.parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
 
         /// Move a file's mtime to a time it cannot already have.
         fn touch(path: &Path, secs_ago: u64) {
