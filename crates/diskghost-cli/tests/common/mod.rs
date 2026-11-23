@@ -221,6 +221,13 @@ impl Mcp {
         r
     }
 
+    /// Kill the server hard (SIGKILL): it cannot clean up — the way a dead
+    /// job writer looks to the shared registry.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     /// `tools/call`: the result object.
     pub fn call(&mut self, name: &str, args: Value) -> Value {
         let r = self.request("tools/call", json!({"name": name, "arguments": args}));

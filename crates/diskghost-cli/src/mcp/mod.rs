@@ -28,6 +28,10 @@
 //! takes one writer at a time: they run as jobs, one writer per server,
 //! the rest queued. When *another process* holds the index lock the tool
 //! answers `index_busy` (naming the database) instead of waiting forever.
+//! Every job is also recorded in the shared job registry (`index-jobs.db`
+//! beside the index, [`diskghost_core::jobs`]), so a second MCP server and
+//! the GUI see this server's jobs — and a killed writer's live-looking rows
+//! are reported `interrupted` once their heartbeat goes stale.
 
 mod jobs;
 mod tools;
@@ -209,6 +213,21 @@ fn millis_env(name: &str, default: u64) -> Duration {
     )
 }
 
+/// The job queue plus its shared registry (`index-jobs.db` next to `db`):
+/// leftovers of dead writers are marked `interrupted` and old finished rows
+/// pruned once, before the first request. Without the registry jobs live in
+/// this process only — exactly as they always did.
+fn jobs(db: &std::path::Path) -> Arc<Jobs> {
+    use diskghost_core::jobs::{now_ms, JobRegistry, RETAIN_MS};
+    let registry = JobRegistry::for_index(db).ok();
+    if let Some(reg) = &registry {
+        let now = now_ms();
+        let _ = reg.interrupt_stale(now);
+        let _ = reg.prune_finished(now, RETAIN_MS);
+    }
+    Jobs::with_registry(registry)
+}
+
 /// `diskghost mcp [--db FILE]`: serve until stdin closes.
 pub(crate) fn run(db: Option<PathBuf>) -> ExitCode {
     let Some(db) = db.or_else(crate::default_index_db) else {
@@ -216,11 +235,11 @@ pub(crate) fn run(db: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let ctx = Arc::new(Ctx {
+        jobs: jobs(&db),
         db,
         busy: millis_env("DISKGHOST_MCP_BUSY_MS", 10_000),
         inline_wait: millis_env("DISKGHOST_MCP_INLINE_WAIT_MS", 20_000),
         hold: millis_env("DISKGHOST_MCP_JOB_HOLD_MS", 0),
-        jobs: Arc::new(Jobs::default()),
     });
     let session = Arc::new(Session {
         negotiated: Mutex::new(None),

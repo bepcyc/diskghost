@@ -400,6 +400,122 @@ fn mcp_writer_jobs_are_serialized_and_queued() {
     assert_eq!(jobs["jobs"].as_array().unwrap().len(), 2);
 }
 
+// ------------------------------------------------ shared job registry
+
+#[test]
+fn mcp_jobs_are_visible_across_server_processes() {
+    // The shared job registry (index-jobs.db): a job queued on server A is
+    // reported by server B's list_jobs and job_status, with the same field
+    // shape a same-process job has.
+    let sb = Sandbox::new("shared");
+    let tree = sb.fixture("tree");
+    let mut a = sb.spawn(&[("DISKGHOST_MCP_JOB_HOLD_MS", "1500")]);
+    a.handshake("2025-06-18");
+    let add = a.ok("add_location", json!({"path": tree.to_str().unwrap()}));
+    let id = add["job_id"].as_str().unwrap();
+
+    let mut b = sb.spawn(&[]);
+    b.handshake("2025-06-18");
+    let st = b.ok("job_status", json!({"job_id": id}));
+    for key in [
+        "job_id",
+        "kind",
+        "target",
+        "state",
+        "phase",
+        "files",
+        "bytes",
+        "total_files",
+        "total_bytes",
+        "elapsed_ms",
+        "queued_ms",
+    ] {
+        assert!(st.get(key).is_some(), "foreign job row lacks {key}: {st}");
+    }
+    assert_eq!(st["job_id"], id);
+    assert_eq!(st["target"], tree.to_str().unwrap());
+    assert!(
+        ["queued", "running"].contains(&st["state"].as_str().unwrap()),
+        "{st}"
+    );
+    let foreign = b.ok("list_jobs", json!({}));
+    let rows = foreign["jobs"].as_array().unwrap();
+    let row = rows
+        .iter()
+        .find(|j| j["job_id"] == id)
+        .unwrap_or_else(|| panic!("server B cannot see A's job {id}: {rows:?}"));
+    assert_eq!(row["kind"], "scan", "{row}");
+
+    // When A's job finishes, B reads its final state and result.
+    a.wait_job(id, "done");
+    let done = b.ok("job_status", json!({"job_id": id}));
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(done["result"]["summaries"].is_array(), "{done}");
+
+    // A foreign job cannot be cancelled here — with an honest answer.
+    let add2 = a.ok("add_location", json!({"path": tree.to_str().unwrap()}));
+    let id2 = add2["job_id"].as_str().unwrap();
+    let c = b.call("cancel_job", json!({"job_id": id2}));
+    assert_eq!(c["isError"], json!(true));
+    assert_eq!(
+        c["structuredContent"]["error"]["code"], "foreign_job",
+        "{c}"
+    );
+    // And an id nobody knows still answers unknown_job.
+    let u = b.call("cancel_job", json!({"job_id": "job-0-999"}));
+    assert_eq!(
+        u["structuredContent"]["error"]["code"], "unknown_job",
+        "{u}"
+    );
+    a.wait_job(id2, "done");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_a_killed_writers_job_reports_interrupted() {
+    // A writer that dies mid-job stops heartbeating: its 'running' row ages
+    // past the stale threshold and reads 'interrupted', never 'running'
+    // forever — through a second process's job_status.
+    let sb = Sandbox::new("killed");
+    let tree = sb.fixture("tree");
+    let mut a = sb.spawn(&[("DISKGHOST_MCP_JOB_HOLD_MS", "60000")]);
+    a.handshake("2025-06-18");
+    let add = a.ok("add_location", json!({"path": tree.to_str().unwrap()}));
+    let id = add["job_id"].as_str().unwrap().to_string();
+    a.wait_job(&id, "running");
+
+    let mut b = sb.spawn(&[]);
+    b.handshake("2025-06-18");
+    assert_eq!(
+        b.ok("job_status", json!({"job_id": id}))["state"],
+        "running"
+    );
+    a.kill(); // SIGKILL: no cleanup, heartbeats stop here.
+
+    let t = Instant::now();
+    loop {
+        let s = b.ok("job_status", json!({"job_id": id}));
+        if s["state"] == "interrupted" {
+            break;
+        }
+        assert_eq!(s["state"], "running", "unexpected state: {s}");
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "never interrupted: {s}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // The interruption is visible in list_jobs too.
+    let jobs = b.ok("list_jobs", json!({}));
+    let row = jobs["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["job_id"] == id)
+        .unwrap();
+    assert_eq!(row["state"], "interrupted", "{row}");
+}
+
 #[test]
 fn mcp_cancel_job_ends_cancelled() {
     let sb = Sandbox::new("cancel");

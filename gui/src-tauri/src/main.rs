@@ -1295,6 +1295,35 @@ fn index_db() -> Option<PathBuf> {
     Some(base.join("diskghost").join("index.db"))
 }
 
+/// The shared job registry of `db` (`index-jobs.db` next to the index):
+/// every job any `diskghost mcp` server on this machine recorded, with
+/// dead writers' live-looking rows already reported `interrupted`. Read
+/// side only — the window owns no writer jobs, and a machine that never ran
+/// one has no registry at all (an empty list, no new file).
+fn read_index_jobs(db: &Path) -> Result<Vec<diskghost_core::jobs::JobRow>, String> {
+    match diskghost_core::jobs::JobRegistry::for_index_reader(db)
+        .map_err(|e| format!("cannot open job registry of {}: {e}", db.display()))?
+    {
+        Some(reg) => reg
+            .list(diskghost_core::jobs::now_ms())
+            .map_err(|e| e.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The jobs queued through `diskghost mcp` servers (or any other registry
+/// writer) — the SCANS section shows them next to this window's own jobs.
+#[tauri::command]
+async fn list_index_jobs() -> Result<Vec<diskghost_core::jobs::JobRow>, String> {
+    blocking(|| {
+        let Some(db) = index_db() else {
+            return Ok(Vec::new());
+        };
+        read_index_jobs(&db)
+    })
+    .await
+}
+
 /// Index a folder as job `job` — `diskghost index add` from the GUI: new and
 /// changed files are recorded in the persistent index, so a re-scan only
 /// re-reads what changed. `exclude` holds walk globs, applied to local
@@ -1589,7 +1618,8 @@ fn main() {
             app_version,
             is_elevated,
             add_location,
-            list_locations
+            list_locations,
+            list_index_jobs
         ])
         .run(tauri::generate_context!())
         .expect("error while running Diskghost");
@@ -1598,6 +1628,54 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_index_jobs_returns_another_writers_job() {
+        // The SCANS read path (`list_index_jobs` → `read_index_jobs`): a row
+        // written by a different process shows up, including its reported
+        // `interrupted` state once the writer's heartbeat went stale.
+        let d = std::env::temp_dir().join(format!("diskghost-gui-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let db = d.join("index.db");
+        // No registry yet: the read path answers empty, creating nothing.
+        assert!(read_index_jobs(&db).unwrap().is_empty());
+        assert!(!diskghost_core::jobs::jobs_db_path(&db).exists());
+        let reg = diskghost_core::jobs::JobRegistry::for_index(&db).unwrap();
+        let now = diskghost_core::jobs::now_ms();
+        reg.announce("job-99-1", "scan", "/media/disk", 99, now - 2)
+            .unwrap();
+        reg.mark_running("job-99-1", now - 1).unwrap();
+        let rows = read_index_jobs(&db).unwrap();
+        assert_eq!(rows.len(), 1);
+        let j = &rows[0];
+        assert_eq!(
+            (
+                j.job_id.as_str(),
+                j.state.as_str(),
+                j.target.as_str(),
+                j.writer_pid
+            ),
+            ("job-99-1", "running", "/media/disk", 99)
+        );
+        // Kill simulation: the last heartbeat is far in the past.
+        reg.beat(
+            &[diskghost_core::jobs::Beat {
+                job_id: "job-99-1".into(),
+                phase: "walk".into(),
+                files: 10,
+                bytes: 100,
+                total_files: 0,
+                total_bytes: 0,
+            }],
+            now - diskghost_core::jobs::STALE_MS - 1,
+        )
+        .unwrap();
+        let rows = read_index_jobs(&db).unwrap();
+        assert_eq!(rows[0].state, "interrupted", "{rows:?}");
+        assert_eq!(rows[0].files, 10);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn ssh_urls_are_remote_and_local_paths_are_not() {

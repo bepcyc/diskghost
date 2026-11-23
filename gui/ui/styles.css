@@ -389,7 +389,8 @@ kbd {
 .job-ic { grid-row: span 2; display: inline-flex; color: var(--color-muted); }
 .job.is-running .job-ic { color: var(--color-accent); }
 .job.is-error .job-ic, .job.is-error .job-sub { color: var(--color-danger); }
-.job.is-partial .job-ic, .job.is-cancelled .job-ic { color: var(--color-warn); }
+.job.is-partial .job-ic, .job.is-cancelled .job-ic, .job.is-interrupted .job-ic { color: var(--color-warn); }
+.job.is-foreign .job-name, .job.is-foreign .job-sub { opacity: .75; }
 .job-name { font-weight: var(--weight-strong); font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-sub { font-size: var(--text-xs); color: var(--color-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .job-x { width: var(--control-h-sm); height: var(--control-h-sm); margin-right: var(--space-2xs); color: var(--color-muted); }

@@ -664,3 +664,28 @@ test("locationTarget accepts only ssh://host//abs/path remotes", () => {
   for (const bad of ["ssh://", "ssh:////a", "ssh://-x//a", "ssh://a b//x", "ssh://a@b@c//x", "ssh://@//x", "ssh://u@//x"])
     assert.equal(lib.locationTarget(bad).error, "locBadHost", bad);
 });
+
+test("indexJobView maps shared-registry rows to sidebar state", () => {
+  // A job written by another process (list_index_jobs → index-jobs.db):
+  // the sidebar needs icon, label key, display name and live-ness from it.
+  const run = lib.indexJobView({
+    job_id: "job-4242-1", kind: "scan", target: "/media/disk2",
+    state: "running", phase: "walk", files: 1200, bytes: 4_000_000, elapsed_ms: 5000,
+  });
+  assert.deepEqual([run.icon, run.key, run.state, run.name, run.live],
+    ["clock", "stRunning", "running", "disk2", true]);
+  assert.equal(run.files, 1200);
+
+  const dead = lib.indexJobView({ job_id: "job-7-1", kind: "scan", target: "/data", state: "interrupted" });
+  assert.deepEqual([dead.icon, dead.key, dead.live], ["alert", "stInterrupted", false]);
+
+  const failed = lib.indexJobView({ target: "C:\\Media", state: "failed" });
+  assert.deepEqual([failed.icon, failed.key, failed.name], ["alert", "stError", "Media"]);
+  const driveRoot = lib.indexJobView({ target: "C:\\", state: "done" });
+  assert.equal(driveRoot.name, "C:\\");
+
+  // A row no one recognizes still renders — as interrupted, never running.
+  const odd = lib.indexJobView({ target: "", state: "bogus" });
+  assert.deepEqual([odd.icon, odd.key, odd.state], ["alert", "stInterrupted", "bogus"]);
+  assert.equal(lib.indexJobView(null).state, "interrupted");
+});

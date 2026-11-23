@@ -25,6 +25,7 @@ mod apply_tests;
 mod dupes;
 pub mod index;
 mod index_report;
+pub mod jobs;
 #[cfg(windows)]
 mod mft;
 pub mod plan;

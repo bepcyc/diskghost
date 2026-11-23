@@ -193,7 +193,11 @@ Long work is a **job**: the tool returns a `job_id` immediately and you poll
 takes one writer at a time, so they run one after another (later ones show
 `queued`). If another process — say a long `diskghost index add` — holds the
 index, the tool answers `index_busy` naming the database instead of hanging.
-Jobs live in the server process: stop the server and they end, and a local
+Every job is recorded in a shared registry (`index-jobs.db` beside the
+index), so `list_jobs` and `job_status` also see the jobs of other
+`diskghost` processes and the GUI lists them too — a job whose writer died
+mid-way shows `interrupted`, never a stale `running`. The job itself still
+lives in the server that runs it: stop the server and it ends, and a local
 scan stopped mid-way records nothing — run it again.
 
 Register it with your agent (use the absolute path of your `diskghost`):

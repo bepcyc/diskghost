@@ -652,6 +652,33 @@
     return { state: "cancelled", hashesKept: (lastPhase || 0) >= 1 };
   }
 
+  // A row of the shared job registry (`list_index_jobs`, index-jobs.db) as
+  // the SCANS sidebar shows it: icon and state label key (the same set own
+  // jobs use, plus "interrupted" for a dead writer's row), the target's
+  // display name, and the counters for the sub-line. The row belongs to
+  // another process, so nothing here decides cancel-ability — there is none.
+  function indexJobView(j) {
+    const byState = {
+      queued: ["queue", "stQueued"],
+      running: ["clock", "stRunning"],
+      done: ["check", "stDone"],
+      cancelled: ["stop", "stCancelled"],
+      failed: ["alert", "stError"],
+      interrupted: ["alert", "stInterrupted"],
+    };
+    const [icon, key] = byState[j?.state] || ["alert", "stInterrupted"];
+    const target = String(j?.target || "");
+    return {
+      icon, key,
+      state: j?.state || "interrupted",
+      name: /^[A-Za-z]:\\?$/.test(target) || target === "/" ? target : baseName(target),
+      files: j?.files || 0,
+      bytes: j?.bytes || 0,
+      elapsedMs: j?.elapsed_ms || 0,
+      live: j?.state === "running" || j?.state === "queued",
+    };
+  }
+
   // Guards async results against arriving out of order: take a ticket before
   // the request, apply the answer only if it is still the newest ticket.
   function latestOnly() {
@@ -695,7 +722,7 @@
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, driveMedia, groupDrives, remoteDrive, driveLines, mapItems, parentPath, isUnder, SETTINGS_VERSION,
     diskOf, deviceKey, volumeName, deviceTree,
-    locationTarget,
+    locationTarget, indexJobView,
     estimateScan, exceedsUsed, COMPRESS_FS,
     isProtectedPath, folderSets, protectedExcludes, dropReclaimed,
   };

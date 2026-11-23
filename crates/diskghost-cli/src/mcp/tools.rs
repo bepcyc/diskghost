@@ -119,19 +119,19 @@ pub(crate) fn definitions() -> Vec<Value> {
         def(
             "job_status",
             "Job status",
-            "State (queued, running, done, failed, cancelled), phase, live counters, elapsed time and — when finished — the result or the error of a background job. Read-only.",
+            "State (queued, running, done, failed, cancelled, interrupted), phase, live counters, elapsed time and — when finished — the result or the error of a background job — of this or of another diskghost process on the same index. Read-only.",
             json!({"job_id": {"type": "string"}}), &["job_id"], true, true,
         ),
         def(
             "list_jobs",
             "List jobs",
-            "Every job this server has started, with its state and counters. Read-only.",
+            "Every background job every diskghost process on this index recorded — this server's and other MCP servers' alike; `interrupted` means the job's writer died mid-way. Read-only.",
             json!({}), &[], true, true,
         ),
         def(
             "cancel_job",
             "Cancel a job",
-            "Ask a queued or running job to stop. A cancelled local scan keeps what it already committed; nothing in the scanned folders is touched.",
+            "Ask a queued or running job to stop — only a job of this server; another process's job answers foreign_job. A cancelled local scan keeps what it already committed; nothing in the scanned folders is touched.",
             json!({"job_id": {"type": "string"}}), &["job_id"], false, true,
         ),
         def(
@@ -546,10 +546,19 @@ fn list_jobs(ctx: &Arc<Ctx>, args: &Value) -> R {
 fn cancel_job(ctx: &Arc<Ctx>, args: &Value) -> R {
     let m = args_of(args, &["job_id"])?;
     let id = req_str(&m, "job_id")?;
-    let live = ctx
-        .jobs
-        .cancel(id)
-        .ok_or_else(|| ToolError::new("unknown_job", format!("no job {id:?} in this server")))?;
+    let live = ctx.jobs.cancel(id).ok_or_else(|| {
+        if ctx.jobs.foreign(id) {
+            ToolError::new(
+                "foreign_job",
+                format!(
+                    "job {id:?} is owned by another diskghost process; \
+                     only the server that started it can cancel it"
+                ),
+            )
+        } else {
+            ToolError::new("unknown_job", format!("no job {id:?} in this server"))
+        }
+    })?;
     let state = ctx
         .jobs
         .get(id)

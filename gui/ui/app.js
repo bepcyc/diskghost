@@ -24,12 +24,13 @@ const IS_WINDOWS = /Windows/i.test(navigator.userAgent);
 // cancelled or error. A finished scan keeps its current view, so the user can
 // switch between several scans without losing their place.
 //
-// Only this process's jobs: `diskghost mcp` keeps its own queue in its own
-// process (crates/diskghost-cli/src/mcp/jobs.rs) and the shared index.db has
-// no jobs table, so MCP- or CLI-queued scans never appear in SCANS. Listing
-// them here needs a shared job registry — left out on purpose
-// (diskghost-src#1383).
+// This window's own jobs: scans queued here run in this process. Jobs other
+// `diskghost` processes run — every `diskghost mcp` server writes them to
+// the shared job registry (index-jobs.db beside index.db,
+// diskghost_core::jobs) — arrive through `list_index_jobs` into `indexJobs`
+// and are drawn into SCANS as read-only rows: only the writer can cancel.
 const jobs = [];
+let indexJobs = [];
 let activeId = null;
 let nextId = 1;
 // The one removal (delete / trash of a path) in flight, shown in the status bar.
@@ -992,11 +993,43 @@ function put(node, key, value) {
   if (node[key] !== value) node[key] = value;
 }
 
+// Rows for registry jobs other diskghost processes run (indexJobs) — same
+// look as own rows, but no open button and no cancel: this window is not
+// their writer, so it only ever watches.
+const foreignRows = new Map(); // registry job_id -> { row, open, ic, name, sub }
+
+function foreignRow(j) {
+  let r = foreignRows.get(j.job_id);
+  if (r) return r;
+  r = {
+    ic: el("span", { class: "job-ic" }),
+    name: el("span", { class: "job-name" }),
+    sub: el("span", { class: "job-sub" }),
+  };
+  r.open = el("button", { type: "button", class: "job-open", disabled: true }, r.ic, r.name, r.sub);
+  r.row = el("div", { class: "job is-foreign" }, r.open);
+  foreignRows.set(j.job_id, r);
+  return r;
+}
+
+function foreignSub(j, v) {
+  if (j.state === "failed") return j.error?.message || t(v.key);
+  if (j.state === "queued") return t("stQueued");
+  if (j.state === "cancelled" || j.state === "interrupted") return t(v.key);
+  return `${num(j.files)} ${t("files")} · ${human(j.bytes)}`;
+}
+
+// Which sidebar box a registry kind belongs to: report/plan jobs are
+// duplicate-search work, everything else a scan row.
+const DUPES_KINDS = new Set(["dupes_report", "plan_dedup"]);
+
 function renderJobs() {
   for (const id of jobRows.keys()) if (!byId(id)) jobRows.delete(id);
+  for (const id of foreignRows.keys()) if (!indexJobs.some((j) => j.job_id === id)) foreignRows.delete(id);
   for (const [kind, boxId, emptyKey] of [["scan", "jobs-scan", "noScans"], ["dupes", "jobs-dupes", "noSearches"]]) {
     const box = $(boxId);
     const list = jobs.filter((j) => (kind === "scan" ? j.kind !== "dupes" : j.kind === kind));
+    const foreign = indexJobs.filter((j) => (kind === "dupes") === DUPES_KINDS.has(j.kind));
     list.forEach((j, i) => {
       const r = jobRow(j);
       const busy = j.state === "running";
@@ -1020,8 +1053,21 @@ function renderJobs() {
       r.meter.firstChild.style.setProperty("--w", frac == null ? "30%" : `${Math.min(1, frac) * 100}%`);
       if (box.children[i] !== r.row) box.insertBefore(r.row, box.children[i] || null);
     });
-    while (box.children.length > list.length) box.lastChild.remove();
-    if (!list.length) box.replaceChildren(el("p", { class: "side-empty", text: t(emptyKey) }));
+    foreign.forEach((j, k) => {
+      const r = foreignRow(j);
+      const v = indexJobView(j);
+      const cls = v.state === "failed" ? "error" : v.state;
+      put(r.row, "className", `job is-foreign is-${cls}`);
+      put(r.open, "title", `${t(v.key)} — ${j.target}`);
+      if (r.ic.dataset.ic !== v.icon) { r.ic.dataset.ic = v.icon; r.ic.replaceChildren(icon(v.icon, t(v.key))); }
+      put(r.name, "textContent", v.name);
+      put(r.sub, "textContent", foreignSub(j, v));
+      const i = list.length + k;
+      if (box.children[i] !== r.row) box.insertBefore(r.row, box.children[i] || null);
+    });
+    const shown = list.length + foreign.length;
+    while (box.children.length > shown) box.lastChild.remove();
+    if (!shown) box.replaceChildren(el("p", { class: "side-empty", text: t(emptyKey) }));
   }
   $("btn-clear-done").disabled = !jobs.some((j) => ["done", "cancelled", "error"].includes(j.state));
 }
@@ -2210,6 +2256,20 @@ setInterval(() => {
   if (jobs.some((j) => j.state === "running") || op) repaintLive();
 }, 500);
 
+// Foreign jobs are polled, not evented: their writer is another process, so
+// the counters move even while this window does nothing at all.
+const indexJobsTicket = latestOnly();
+async function pollIndexJobs() {
+  const ticket = indexJobsTicket.next();
+  try {
+    const rows = await invoke("list_index_jobs");
+    if (!indexJobsTicket.current(ticket)) return;
+    indexJobs = rows || [];
+    renderJobs();
+  } catch (_) { /* backend without a registry — nothing foreign to show */ }
+}
+setInterval(pollIndexJobs, 2000);
+
 $("btn-add-loc").addEventListener("click", openAddLocation);
 
 // Drag & drop: every dropped folder becomes its own queued scan.
@@ -2278,4 +2338,5 @@ try {
   renderAll();
   loadDrives();
   loadLocations();
+  pollIndexJobs();
 })();
