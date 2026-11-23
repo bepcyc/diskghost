@@ -10,8 +10,45 @@ permissions:
   attestations: write
 
 jobs:
+  # Gate every release on facts a tag alone does not prove: the tag's version
+  # is what every package declares, and the tagged commit is part of main —
+  # a release cut from an unmerged side branch ships code nobody lands.
+  check:
+    name: release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Tag matches every declared version
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          ws=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          gui_cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' gui/src-tauri/Cargo.toml | head -1)
+          tauri=$(sed -n 's/.*"version": "\(.*\)",/\1/p' gui/src-tauri/tauri.conf.json | head -1)
+          echo "tag=$want workspace=$ws gui-cargo=$gui_cargo tauri=$tauri"
+          for v in "$ws" "$gui_cargo" "$tauri"; do
+            if [ "$v" != "$want" ]; then
+              echo "::error::version $v does not match tag $want"
+              exit 1
+            fi
+          done
+      - name: Tag is reachable from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD || {
+            echo "::error::tag $GITHUB_REF_NAME is not reachable from main — merge the release branch first"
+            exit 1
+          }
+
   cli:
     name: cli • ${{ matrix.target }}
+    needs: check
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -81,6 +118,7 @@ jobs:
 
   gui:
     name: gui bundle • ${{ matrix.name }}
+    needs: check
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
