@@ -23,6 +23,12 @@ const IS_WINDOWS = /Windows/i.test(navigator.userAgent);
 // queued until a slot is free (settings.parallel), then running, then done,
 // cancelled or error. A finished scan keeps its current view, so the user can
 // switch between several scans without losing their place.
+//
+// Only this process's jobs: `diskghost mcp` keeps its own queue in its own
+// process (crates/diskghost-cli/src/mcp/jobs.rs) and the shared index.db has
+// no jobs table, so MCP- or CLI-queued scans never appear in SCANS. Listing
+// them here needs a shared job registry — left out on purpose
+// (diskghost-src#1383).
 const jobs = [];
 let activeId = null;
 let nextId = 1;
@@ -410,9 +416,14 @@ function driveTip(d) {
 
 function driveRow(d) {
   const used = d.total - d.free;
+  // Two lines, basename-first: the old single label held the whole mount
+  // path, so every "/media/<user>/…" drive truncated to the same prefix.
+  const name = driveLines(d);
   const b = el("button", { type: "button", class: "drive", onclick: () => enqueue("scan", d.path), "aria-label": `${t("scan")} ${driveName(d)}` },
     icon(driveIcon(d)),
-    el("span", { class: "drive-name", text: driveName(d) }),
+    el("span", { class: "drive-id" },
+      el("span", { class: "drive-name", text: name.title }),
+      el("span", { class: "drive-path", text: name.sub })),
     el("span", { class: "drive-free num", text: d.total ? `${human(d.free)} ${t("free")}` : d.fs }),
     bar(used / d.total, used / d.total > 0.9 ? "is-hot" : ""));
   tip(b, driveTip(d));

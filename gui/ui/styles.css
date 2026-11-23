@@ -319,8 +319,13 @@ kbd {
   height: auto; padding: var(--space-xs); text-align: left; justify-content: stretch;
   background: transparent; border-color: transparent; font-weight: var(--weight-body);
 }
-.drive > .ic { color: var(--color-muted); }
+.drive > .ic { color: var(--color-muted); grid-row: span 2; align-self: center; }
+/* Two-line name cell: the part that tells mounts apart (label or basename)
+   on line one, the whole path muted under it — a row of "/media/<user>/…"
+   mounts stays readable at the 17 rem rail instead of sharing one prefix. */
+.drive-id { display: flex; flex-direction: column; min-width: 0; align-self: center; }
 .drive-name { font-weight: var(--weight-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drive-path { font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--color-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .drive-free { font-size: var(--text-xs); color: var(--color-muted); }
 .drive > .bar { grid-column: 2 / -1; }
 
@@ -392,8 +397,11 @@ kbd {
 .stats.is-compact .stat-v { font-size: var(--text-lg); }
 
 /* -------------------------------- welcome -------------------------------- */
-.welcome { display: flex; flex-direction: column; gap: var(--space-lg); max-width: 64rem; }
-.welcome-head { display: flex; flex-direction: column; gap: var(--space-xs); padding-top: var(--space-lg); }
+/* The view fills main: only the text column keeps a reading width — the
+   drives table's %-based columns are meant to stretch (no pinned strip on
+   wide windows). */
+.welcome { display: flex; flex-direction: column; gap: var(--space-lg); }
+.welcome-head { display: flex; flex-direction: column; gap: var(--space-xs); padding-top: var(--space-lg); max-width: 64rem; }
 .welcome-head h1 { font-size: var(--text-2xl); font-weight: var(--weight-figure); line-height: var(--leading-tight); letter-spacing: -0.01em; }
 .welcome-head p { color: var(--color-ink-2); max-width: 70ch; }
 .keys { display: flex; flex-wrap: wrap; gap: var(--space-xs) var(--space-lg); font-size: var(--text-xs); color: var(--color-muted); margin-top: var(--space-xs); }

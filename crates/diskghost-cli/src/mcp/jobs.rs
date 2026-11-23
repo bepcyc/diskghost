@@ -5,7 +5,9 @@
 //! rest are `queued` in order. A queued or running job can be cancelled
 //! through its [`Progress`] handle. Jobs live in this process only — when the
 //! server ends, they end; a local scan holds a single transaction, so a
-//! killed one records nothing.
+//! killed one records nothing. Other diskghost processes cannot see these
+//! jobs either — the GUI keeps its own queue and the index has no jobs
+//! table; sharing them needs a job registry (deferred, diskghost-src#1383).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};

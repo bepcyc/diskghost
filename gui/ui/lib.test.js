@@ -253,6 +253,24 @@ test("isUnder respects separators and Windows case rules", () => {
   assert.ok(!lib.isUnder("/homer", "/home"));
 });
 
+test("driveLines puts the distinguishing name first and the whole path second", () => {
+  // Mounts sharing a prefix: the basename, not a truncated "/media/<user>/…".
+  assert.deepEqual(lib.driveLines({ path: "/media/bepcyc/games", label: "games" }),
+    { title: "games", sub: "/media/bepcyc/games" });
+  assert.equal(lib.driveLines({ path: "/media/bepcyc/photos", label: "" }).title, "photos");
+  // A trailing slash still names the mount.
+  assert.equal(lib.driveLines({ path: "/media/bepcyc/hdd_farm2/", label: "" }).title, "hdd_farm2");
+  // Roots: the path itself is the name, shown on both lines.
+  assert.deepEqual(lib.driveLines({ path: "/", label: "" }), { title: "/", sub: "/" });
+  // Windows: a volume label wins over the bare letter; the path stays below.
+  assert.deepEqual(lib.driveLines({ path: "C:\\", label: "System" }), { title: "System", sub: "C:\\" });
+  assert.deepEqual(lib.driveLines({ path: "D:\\", label: "" }), { title: "D:", sub: "D:\\" });
+  assert.deepEqual(lib.driveLines({ path: "E:\\Games\\", label: "Games" }), { title: "Games", sub: "E:\\Games\\" });
+  // A remembered remote names its host, not a URL fragment.
+  const remote = lib.remoteDrive({ url: "ssh://nas//storage", label: "" });
+  assert.deepEqual(lib.driveLines(remote), { title: "nas", sub: "ssh://nas//storage" });
+});
+
 test("isProtectedPath tells program and game files from the user's own", () => {
   // By folder (any depth, any case) ...
   assert.ok(lib.isProtectedPath("G:\\Steam\\steamapps\\common\\Patron\\Data\\Maps\\Map_16\\Forest.bmp"));

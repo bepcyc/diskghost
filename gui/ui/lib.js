@@ -410,6 +410,16 @@
     };
   }
 
+  // The two lines a sidebar drive row shows, split so the part that tells
+  // mounts apart survives the 17 rem rail: `title` is the volume label when
+  // there is one (the mount's basename on POSIX, the host on a remote, a
+  // Windows volume name), else the basename; `sub` is the whole path. One
+  // truncated "/media/<user>/…" prefix used to be every row's name.
+  function driveLines(d) {
+    const path = String(d.path || "");
+    return { title: String(d.label || "") || baseName(path), sub: path };
+  }
+
   // Filesystems where stored (logical) size can exceed physically used
   // space — transparent compression and reflinks make a "% of the used
   // space" estimate saturate early and look frozen.
@@ -590,7 +600,7 @@
     partialCauses, dupesOutcome, latestOnly, clampInt, reclaimPlan,
     human, humanDelta, unmeasured, sizeText, countText, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
-    categorize, bucketLabel, jobsToStart, driveKey, driveMedia, groupDrives, remoteDrive, mapItems, parentPath, isUnder, SETTINGS_VERSION,
+    categorize, bucketLabel, jobsToStart, driveKey, driveMedia, groupDrives, remoteDrive, driveLines, mapItems, parentPath, isUnder, SETTINGS_VERSION,
     locationTarget,
     estimateScan, exceedsUsed, COMPRESS_FS,
     isProtectedPath, folderSets, protectedExcludes, dropReclaimed,
