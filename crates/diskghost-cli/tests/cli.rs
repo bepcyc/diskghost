@@ -987,6 +987,7 @@ fn apply_dry_run_reports_and_touches_nothing() {
 }
 
 #[test]
+#[cfg(unix)]
 fn undo_moves_journaled_files_back() {
     let d = scratch("undo");
     let d = std::fs::canonicalize(&d).unwrap();
@@ -1033,6 +1034,7 @@ fn undo_moves_journaled_files_back() {
 // options and host and runs the (read-only) command locally, inside the
 // test's own scratch dir. A marker file makes the "host" unreachable.
 
+#[cfg(unix)]
 fn fake_ssh(d: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = d.join("fake-ssh");
@@ -1063,6 +1065,7 @@ fn remote_cmd(d: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+#[cfg(unix)]
 fn index_add_ssh_status_and_dupes_over_a_stand_in_ssh() {
     let d = scratch("index-ssh");
     fake_ssh(&d);
@@ -1150,6 +1153,7 @@ fn index_add_ssh_status_and_dupes_over_a_stand_in_ssh() {
 }
 
 #[test]
+#[cfg(unix)]
 fn index_add_rejects_a_malformed_ssh_url() {
     let d = scratch("index-ssh-bad");
     fake_ssh(&d);
@@ -1239,6 +1243,7 @@ fn agent_files(d: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
+#[cfg(unix)]
 fn index_add_ssh_uploads_the_agent_into_the_remote_cache_once_and_uses_it() {
     use std::os::unix::fs::PermissionsExt;
     if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
@@ -1319,6 +1324,7 @@ fn index_add_ssh_uploads_the_agent_into_the_remote_cache_once_and_uses_it() {
 }
 
 #[test]
+#[cfg(unix)]
 fn scan_of_an_ssh_url_lists_the_remote_folder_over_a_stand_in_ssh() {
     let d = scratch("scan-ssh");
     fake_ssh(&d);
