@@ -410,6 +410,99 @@
     };
   }
 
+  // The whole-disk device a mounted source belongs to, by kernel block-name
+  // rules: `nvme0n1p5` → `nvme0n1`, `mmcblk0p2` → `mmcblk0`, `md0p1` → `md0`
+  // (a `pN` suffix after a name ending in a digit), `sda2` → `sda`,
+  // `vda1` → `vda` (a trailing number on a letters-only base). Names that
+  // already are whole disks (`sda`, `nvme0n1`) or stacked/virtual devices
+  // (`dm-0`, `md0`, `loop0`, `nbd0`) keep theirs. A source that is no
+  // `/dev` node — a ZFS dataset, FUSE, overlay — has no disk: null. This
+  // mirrors the backend's sysfs resolution; it is the fallback for drives
+  // reported without `device` (Windows, macOS, an older backend).
+  function diskOf(source) {
+    const s = String(source || "");
+    if (!s.startsWith("/dev/")) return null;
+    const base = baseName(s);
+    if (!base) return null;
+    const p = base.match(/^(.+\d)p\d+$/);
+    if (p) return p[1];
+    if (/^(dm-\d+|md\d+|loop\d+|nbd\d+|mmcblk\d+|sr\d+|zd\d+|pmem\d+|rbd\d+|mtdblock\d+|zram\d+)$/.test(base)) return base;
+    const d = base.match(/^([a-zA-Z]+)\d+$/);
+    if (d) return d[1];
+    return base;
+  }
+
+  // The device key one drive groups under in the hardware tree: the
+  // backend's resolved `device` first, then the disk its `source` implies.
+  // A volume without either keeps its own identity (`self:` — the
+  // Windows/macOS fallback, each drive its own device) or groups by
+  // filesystem type (`fs:` — ZFS datasets, FUSE: they share no disk).
+  function deviceKey(d) {
+    if (d && typeof d.device === "string" && d.device) return d.device;
+    const disk = d && diskOf(d.source);
+    if (disk) return disk;
+    if (d && d.source) return `fs:${d.fs || "other"}`;
+    return `self:${d && d.path ? d.path : "other"}`;
+  }
+
+  // The name a volume row shows: the partition (`nvme0n1p5`, `sda2`), else
+  // the mount's label or basename (ZFS datasets, Windows letters).
+  function volumeName(d) {
+    const src = String(d && d.source || "");
+    return (src.startsWith("/dev/") && baseName(src)) || String(d && d.label || "") || baseName(String(d && d.path || ""));
+  }
+
+  // The sidebar's physical hardware tree: every drive grouped under the
+  // disk its volume sits on — one Drive is one volume, and a volume
+  // mounted more than once lists every mountpoint as a sibling row.
+  // Returns { disks: [node], network: [drive] } where a node is
+  //   { key, name, model, transport, size, total, free, media, virtual,
+  //     volumes: [{ name, drive, mounts: [{ path, alias }] }] }
+  // — the first mount is the drive's own path, later ones the same
+  // filesystem seen again (`alias`). Disks sort by name (nvme0n1 before
+  // nvme1n1 before sda); virtual groups (`fs:`/`self:`) come after real
+  // disks; remote locations never enter the tree — they are `network`.
+  function deviceTree(drives) {
+    const order = [];
+    const byKey = new Map();
+    const network = [];
+    for (const d of drives || []) {
+      if (driveMedia(d) === "remote") { network.push(d); continue; }
+      const key = deviceKey(d);
+      let node = byKey.get(key);
+      if (!node) {
+        node = {
+          key,
+          name: key.startsWith("fs:") ? String(d.fs || "other")
+            : key.startsWith("self:") ? String(d.label || "") || baseName(String(d.path || ""))
+            : key,
+          model: "", transport: "", size: 0, total: 0, free: 0,
+          media: driveMedia(d),
+          virtual: key.startsWith("fs:") || key.startsWith("self:"),
+          volumes: [],
+        };
+        byKey.set(key, node);
+        order.push(node);
+      }
+      if (d.device_model && !node.model) node.model = String(d.device_model);
+      if (d.device_size && !node.size) node.size = Number(d.device_size) || 0;
+      if (d.transport && !node.transport) node.transport = String(d.transport);
+      const points = (Array.isArray(d.mounts) && d.mounts.length ? d.mounts : [d.path])
+        .map((p, i) => ({ path: String(p), alias: i > 0 }));
+      node.volumes.push({ name: volumeName(d), drive: d, mounts: points });
+      node.total += Number(d.total) || 0;
+      node.free += Number(d.free) || 0;
+    }
+    const nat = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+    return {
+      disks: [
+        ...order.filter((n) => !n.virtual).sort(nat),
+        ...order.filter((n) => n.virtual).sort(nat),
+      ],
+      network,
+    };
+  }
+
   // The two lines a sidebar drive row shows, split so the part that tells
   // mounts apart survives the 17 rem rail: `title` is the volume label when
   // there is one (the mount's basename on POSIX, the host on a remote, a
@@ -601,6 +694,7 @@
     human, humanDelta, unmeasured, sizeText, countText, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, driveMedia, groupDrives, remoteDrive, driveLines, mapItems, parentPath, isUnder, SETTINGS_VERSION,
+    diskOf, deviceKey, volumeName, deviceTree,
     locationTarget,
     estimateScan, exceedsUsed, COMPRESS_FS,
     isProtectedPath, folderSets, protectedExcludes, dropReclaimed,

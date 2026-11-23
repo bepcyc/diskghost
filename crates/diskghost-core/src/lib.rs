@@ -63,8 +63,8 @@ pub use snapshot::{
 };
 pub use tree::ScanTree;
 #[cfg(unix)]
-pub use walk::local_mounts;
-pub use walk::LocalMount;
+pub use walk::{local_mounts, mount_table};
+pub use walk::{LocalMount, MountEntry};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

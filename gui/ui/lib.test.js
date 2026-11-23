@@ -509,6 +509,104 @@ test("settings keep the drives view and remembered remotes", () => {
   assert.deepEqual(lib.mergeSettings({}).remotes, []);
 });
 
+test("diskOf strips a partition off its disk by kernel name rules", () => {
+  // `pN` after a name ending in a digit: NVMe, MMC, and md partitions.
+  assert.equal(lib.diskOf("/dev/nvme0n1p5"), "nvme0n1");
+  assert.equal(lib.diskOf("/dev/nvme1n1p1"), "nvme1n1");
+  assert.equal(lib.diskOf("/dev/mmcblk0p2"), "mmcblk0");
+  assert.equal(lib.diskOf("/dev/md0p1"), "md0");
+  // A trailing number on a letters-only base: sd, vd, hd, xvd.
+  assert.equal(lib.diskOf("/dev/sda2"), "sda");
+  assert.equal(lib.diskOf("/dev/sdb13"), "sdb");
+  assert.equal(lib.diskOf("/dev/vda1"), "vda");
+  // Whole disks and stacked/virtual devices keep their names.
+  assert.equal(lib.diskOf("/dev/sda"), "sda");
+  assert.equal(lib.diskOf("/dev/nvme0n1"), "nvme0n1");
+  assert.equal(lib.diskOf("/dev/dm-0"), "dm-0");
+  assert.equal(lib.diskOf("/dev/mmcblk0"), "mmcblk0");
+  assert.equal(lib.diskOf("/dev/loop0"), "loop0");
+  // No block device at all: no disk.
+  for (const src of ["tank/data", "tmpfs", "overlay", "//nas/share", "", null])
+    assert.equal(lib.diskOf(src), null, JSON.stringify(src));
+});
+
+test("deviceKey prefers the backend's device, then the source's disk", () => {
+  // Sysfs already told us: a dm over one disk groups under it.
+  assert.equal(lib.deviceKey({ source: "/dev/dm-0", device: "sda" }), "sda");
+  // No backend answer: the partition's own disk.
+  assert.equal(lib.deviceKey({ source: "/dev/nvme0n1p5" }), "nvme0n1");
+  // No disk behind the source: volumes group by filesystem type.
+  assert.equal(lib.deviceKey({ source: "tank/data", fs: "zfs" }), "fs:zfs");
+  // Nothing at all (a remembered row, Windows): each drive is its own device.
+  assert.equal(lib.deviceKey({ path: "C:\\" }), "self:C:\\");
+  assert.equal(lib.deviceKey({}), "self:other");
+});
+
+test("volumeName names the partition, else the label or mount basename", () => {
+  assert.equal(lib.volumeName({ source: "/dev/nvme0n1p5", label: "games" }), "nvme0n1p5");
+  assert.equal(lib.volumeName({ source: "tank/data", label: "data" }), "data");
+  assert.equal(lib.volumeName({ source: "", label: "", path: "/media/x" }), "x");
+});
+
+test("deviceTree nests volumes under their disk and multi-mounts under their volume", () => {
+  // The owner's table: two NVMe disks, a USB disk with two partitions, a
+  // filesystem seen at /home and /mnt/fast, a ZFS dataset, and remotes.
+  const ds = [
+    { path: "/media/bepcyc/games", source: "/dev/nvme1n1p1", device: "nvme1n1", device_model: "SAMSUNG MZPLJ3T2HBJR", device_size: 3_200_000_000_000, transport: "nvme", media: "ssd", total: 1_000, free: 353, mounts: ["/media/bepcyc/games"] },
+    { path: "/media/bepcyc/photo", source: "/dev/nvme1n1p3", device: "nvme1n1", device_model: "SAMSUNG MZPLJ3T2HBJR", device_size: 3_200_000_000_000, transport: "nvme", media: "ssd", total: 500, free: 91, mounts: ["/media/bepcyc/photo"] },
+    { path: "/home", source: "/dev/nvme1n1p4", device: "nvme1n1", device_model: "SAMSUNG MZPLJ3T2HBJR", device_size: 3_200_000_000_000, transport: "nvme", media: "ssd", total: 400, free: 100, mounts: ["/home", "/mnt/fast"] },
+    { path: "/media/bepcyc/games1", source: "/dev/nvme0n1p5", device: "nvme0n1", device_model: "Lexar NM790 4TB", device_size: 4_000_000_000_000, transport: "nvme", media: "ssd", total: 800, free: 200, mounts: ["/media/bepcyc/games1"] },
+    { path: "/media/bepcyc/X9 Pro1", source: "/dev/sda2", device: "sda", device_model: "CT4000X9PROSSD9", device_size: 4_000_000_000_000, transport: "usb", media: "ssd", total: 900, free: 300, mounts: ["/media/bepcyc/X9 Pro1"] },
+    { path: "/media/bepcyc/dev_portable", source: "/dev/sda3", device: "sda", device_model: "CT4000X9PROSSD9", device_size: 4_000_000_000_000, transport: "usb", media: "ssd", total: 900, free: 300, mounts: ["/media/bepcyc/dev_portable"] },
+    { path: "/tank/data", source: "tank/data", fs: "zfs", media: "hdd", total: 100, free: 50, mounts: ["/tank/data"] },
+    { path: "ssh://adroid//storage", media: "remote", kind: "network", total: 0, free: 0 },
+  ];
+  const t = lib.deviceTree(ds);
+  // Remotes never enter the hardware tree.
+  assert.equal(t.network.length, 1);
+  assert.equal(t.network[0].path, "ssh://adroid//storage");
+  // Three physical disks, sorted by name, then the virtual ZFS group.
+  assert.deepEqual(t.disks.map((n) => n.key), ["nvme0n1", "nvme1n1", "sda", "fs:zfs"]);
+  const nvme1 = t.disks[1];
+  assert.equal(nvme1.model, "SAMSUNG MZPLJ3T2HBJR");
+  assert.equal(nvme1.size, 3_200_000_000_000);
+  assert.equal(nvme1.transport, "nvme");
+  assert.equal(nvme1.total, 1_900); // partitions add up, not the disk size
+  assert.equal(nvme1.free, 544);
+  assert.deepEqual(nvme1.volumes.map((v) => v.name), ["nvme1n1p1", "nvme1n1p3", "nvme1n1p4"]);
+  // One filesystem, two mountpoints: one volume, a second alias row.
+  const home = nvme1.volumes[2];
+  assert.deepEqual(home.mounts, [
+    { path: "/home", alias: false },
+    { path: "/mnt/fast", alias: true },
+  ]);
+  // Both USB partitions sit under sda.
+  const sda = t.disks[2];
+  assert.equal(sda.transport, "usb");
+  assert.deepEqual(sda.volumes.map((v) => v.name), ["sda2", "sda3"]);
+  // ZFS without a device is a virtual group named by its filesystem.
+  assert.equal(t.disks[3].virtual, true);
+  assert.equal(t.disks[3].name, "zfs");
+});
+
+test("deviceTree falls back gracefully without backend device fields", () => {
+  // Old backend / Windows / macOS: no device info — sources still group
+  // partitions under their disk, bare drives stand alone.
+  const ds = [
+    { path: "/media/a", source: "/dev/sdb1", media: "ssd" },
+    { path: "/media/b", source: "/dev/sdb2", media: "ssd" },
+    { path: "C:\\", label: "System", media: "ssd" },
+  ];
+  const t = lib.deviceTree(ds);
+  assert.deepEqual(t.disks.map((n) => n.key), ["sdb", "self:C:\\"]);
+  assert.equal(t.disks[0].volumes.length, 2);
+  assert.equal(t.disks[1].virtual, true);
+  // A drive carrying no `mounts` lists its own path once.
+  assert.deepEqual(t.disks[1].volumes[0].mounts, [{ path: "C:\\", alias: false }]);
+  assert.deepEqual(lib.deviceTree([]).disks, []);
+  assert.deepEqual(lib.deviceTree(undefined).network, []);
+});
+
 // In the browser lib.js exports bare globals (Object.assign on the global
 // object) — there is no `lib` namespace. app.js must call the helpers
 // unqualified, like it already does for human()/mergeSettings().

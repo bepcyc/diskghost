@@ -8,7 +8,7 @@
 //! cost. The listing of one directory is handed to the caller as a [`Batch`]
 //! while the walk goes on, so building a tree overlaps with the I/O.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex};
@@ -269,20 +269,20 @@ fn parse_mountinfo_line(line: &str) -> Option<(u64, &str)> {
 /// needs to name a volume: `id parent major:minor root mountpoint options
 /// [optional tags] - fstype source super-options`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MountEntry {
+pub struct MountEntry {
     /// The device as `stat` reports it ([`makedev`] of `major:minor`).
-    pub(crate) dev: u64,
-    pub(crate) major: u64,
-    pub(crate) minor: u64,
+    pub dev: u64,
+    pub major: u64,
+    pub minor: u64,
     /// The directory of the filesystem shown at the mountpoint: `/` for a
     /// plain mount, the subdirectory of a bind mount or btrfs subvolume.
-    pub(crate) root: String,
+    pub root: String,
     /// Where it is mounted (octal escapes such as `\040` decoded).
-    pub(crate) mount_point: PathBuf,
-    pub(crate) fstype: String,
+    pub mount_point: PathBuf,
+    pub fstype: String,
     /// What was mounted: a device path such as `/dev/sda1`, or a pseudo
     /// source (`tmpfs`, `overlay`, a ZFS dataset name, …).
-    pub(crate) source: String,
+    pub source: String,
 }
 
 /// Parse one `/proc/self/mountinfo` line in full. The kernel escapes space,
@@ -314,12 +314,17 @@ pub(crate) fn parse_mountinfo_entry(line: &str) -> Option<MountEntry> {
 pub struct LocalMount {
     /// The device as `stat` reports it.
     pub dev: u64,
-    /// Where the filesystem's own root is mounted.
+    /// Where the filesystem's own root is mounted (the first of `mounts`).
     pub mount_point: PathBuf,
     /// Filesystem type as the kernel names it (`ext4`, `xfs`, `fuseblk`, …).
     pub fstype: String,
     /// What was mounted (`/dev/sda1`, a ZFS dataset, …).
     pub source: String,
+    /// Every place the filesystem's own root is mounted, in mount-table
+    /// order — a filesystem mounted more than once keeps every mountpoint
+    /// here (the drive tree lists them all under the one volume), while
+    /// `mount_point` stays the first.
+    pub mounts: Vec<PathBuf>,
 }
 
 /// Filesystem types that hold data on local storage. An explicit allowlist:
@@ -333,25 +338,38 @@ const REAL_FS: &[&str] = &[
 ];
 
 /// The real local filesystems of a `/proc/self/mountinfo` text, each once
-/// (first mountpoint of a device wins), in mount-table order.
+/// (first mountpoint of a device wins), in mount-table order. Every further
+/// whole-filesystem mount of an already seen device is remembered on its
+/// `mounts` — a filesystem mounted twice is still one volume, with both
+/// mountpoints.
 #[cfg_attr(not(any(test, unix)), allow(dead_code))]
 pub(crate) fn local_mounts_from(info: &str) -> Vec<LocalMount> {
-    let mut seen = HashSet::new();
-    info.lines()
+    let mut slots: HashMap<u64, usize> = HashMap::new();
+    let mut out: Vec<LocalMount> = Vec::new();
+    for m in info
+        .lines()
         .filter_map(parse_mountinfo_entry)
         // A bind mount or a btrfs subvolume shows part of a filesystem
         // that is (or could be) listed whole: counting it would count the
         // same data twice.
         .filter(|m| m.root == "/")
         .filter(|m| !is_remote_fs(&m.fstype) && is_storage_fs(&m.fstype))
-        .filter(|m| seen.insert(m.dev))
-        .map(|m| LocalMount {
-            dev: m.dev,
-            mount_point: m.mount_point,
-            fstype: m.fstype,
-            source: m.source,
-        })
-        .collect()
+    {
+        match slots.get(&m.dev) {
+            Some(&i) => out[i].mounts.push(m.mount_point),
+            None => {
+                slots.insert(m.dev, out.len());
+                out.push(LocalMount {
+                    dev: m.dev,
+                    fstype: m.fstype,
+                    source: m.source,
+                    mounts: vec![m.mount_point.clone()],
+                    mount_point: m.mount_point,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Whether `fstype` holds data on local storage: [`REAL_FS`], or a FUSE
@@ -370,6 +388,17 @@ fn is_storage_fs(fstype: &str) -> bool {
 pub fn local_mounts() -> Vec<LocalMount> {
     std::fs::read_to_string("/proc/self/mountinfo")
         .map(|info| local_mounts_from(&info))
+        .unwrap_or_default()
+}
+
+/// Every mount in `/proc/self/mountinfo`, unfiltered — pseudo filesystems,
+/// bind mounts and subvolumes included (the drive tree resolves the device
+/// behind a mount the storage allowlist drops, such as a btrfs `/` on a
+/// subvolume). Empty where the table cannot be read.
+#[cfg(unix)]
+pub fn mount_table() -> Vec<MountEntry> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|info| info.lines().filter_map(parse_mountinfo_entry).collect())
         .unwrap_or_default()
 }
 
@@ -1064,6 +1093,21 @@ mod tests {
         let models = &m[1];
         assert_eq!(models.dev, makedev(259, 10));
         assert_eq!(models.source, "/dev/nvme0n1p10");
+        // The same filesystem mounted at two places stays one volume — but
+        // keeps every mountpoint, in mount-table order (`/srv/models` is a
+        // second whole mount of 259:10; `/nix/var/nix/big-builds` is a bind
+        // of a subtree and still does not count).
+        assert_eq!(
+            models.mounts,
+            [PathBuf::from("/d/store2"), PathBuf::from("/srv/models")]
+        );
+        assert_eq!(models.mount_point, PathBuf::from("/d/store2"));
+        for other in &m {
+            if other.dev == models.dev {
+                continue;
+            }
+            assert_eq!(other.mounts, [other.mount_point.as_path()]);
+        }
     }
 
     #[test]

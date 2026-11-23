@@ -809,6 +809,24 @@ struct Drive {
     media: String,
     total: u64,
     free: u64,
+    /// What was mounted (`/dev/nvme0n1p5`, a ZFS dataset, a share), empty
+    /// where it is unknown — the sidebar names the volume by it.
+    source: String,
+    /// Kernel name of the physical device the volume sits on (`nvme0n1`,
+    /// `sda`), empty where it cannot be told — the UI then groups the
+    /// volume under a virtual device instead.
+    device: String,
+    /// The physical device's model string, if sysfs reports one.
+    device_model: String,
+    /// The physical device's size in bytes (`/sys/block/<dev>/size` × 512);
+    /// 0 where unknown — the UI then sums the volumes under it.
+    device_size: u64,
+    /// The bus the device hangs on (`nvme`, `sata`, `usb`, `virtio`, …),
+    /// empty where unknown.
+    transport: String,
+    /// Every place this filesystem is mounted, mount-table order — `path`
+    /// is always the first.
+    mounts: Vec<String>,
 }
 
 /// Every drive with a readable filesystem, in drive-letter / mount order.
@@ -887,9 +905,17 @@ fn drives() -> Vec<Drive> {
             } else {
                 drive_media(diskghost_core::is_rotational(Path::new(&path))).into()
             },
+            mounts: vec![path.clone()],
             path,
             total,
             free,
+            // Windows has no sysfs: each drive is its own device level —
+            // the sidebar degrades to a one-level tree.
+            source: String::new(),
+            device: String::new(),
+            device_model: String::new(),
+            device_size: 0,
+            transport: String::new(),
         });
     }
     out
@@ -901,6 +927,10 @@ fn drives() -> Vec<Drive> {
     // `/home`, …). Where the mount table cannot be read (macOS), the
     // folders volumes are usually mounted in.
     let mounts = diskghost_core::local_mounts();
+    let by_point: HashMap<&Path, &diskghost_core::LocalMount> = mounts
+        .iter()
+        .map(|m| (m.mount_point.as_path(), m))
+        .collect();
     let list = if mounts.is_empty() {
         mount_folder_drives()
             .into_iter()
@@ -920,9 +950,25 @@ fn drives() -> Vec<Drive> {
     } else {
         drive_list(&mounts, &diskghost_core::is_rotational)
     };
+    // The unfiltered mount table, once: a drive `local_mounts` dropped (a
+    // btrfs `/` on a subvolume) still has a device the tree wants.
+    let table = diskghost_core::mount_table();
     list.into_iter()
         .map(|(p, fs, kind, media)| {
             let (total, free) = disk_space(&p);
+            let m = by_point.get(p.as_path());
+            let (source, dev, points) = match m {
+                Some(m) => (m.source.clone(), m.dev, m.mounts.clone()),
+                None => {
+                    let (source, dev) = table
+                        .iter()
+                        .find(|m| m.mount_point == p)
+                        .map(|m| (m.source.clone(), m.dev))
+                        .unwrap_or_default();
+                    (source, dev, vec![p.clone()])
+                }
+            };
+            let info = device_info(&source, dev);
             Drive {
                 label: p
                     .file_name()
@@ -931,12 +977,207 @@ fn drives() -> Vec<Drive> {
                 fs,
                 kind: kind.into(),
                 media: media.into(),
+                mounts: points
+                    .into_iter()
+                    .map(|m| m.to_string_lossy().into_owned())
+                    .collect(),
                 path: p.to_string_lossy().into_owned(),
                 total,
                 free,
+                source,
+                device: info.name,
+                device_model: info.model,
+                device_size: info.size,
+                transport: info.transport,
             }
         })
         .collect()
+}
+
+/// The physical device a volume sits on, for the sidebar's hardware tree —
+/// name, model, size and bus. Empty fields where sysfs cannot tell
+/// (macOS, or a source that is no block device at all).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Default)]
+struct DeviceInfo {
+    name: String,
+    model: String,
+    size: u64,
+    transport: String,
+}
+
+/// [`DeviceInfo`] of the disk behind a mount (`source` + `st_dev` from the
+/// mount table). Off Linux there is no sysfs to ask: the frontend then
+/// builds a one-level tree, the drive is its own device.
+#[cfg(target_os = "linux")]
+fn device_info(source: &str, dev: u64) -> DeviceInfo {
+    let Some(part) = block_device(Path::new("/sys"), source, dev) else {
+        return DeviceInfo::default();
+    };
+    let Some(disk) = disk_of(Path::new("/sys"), &part) else {
+        return DeviceInfo::default();
+    };
+    let (model, size, transport) = disk_facts(Path::new("/sys"), &disk);
+    DeviceInfo {
+        name: disk,
+        model,
+        size,
+        transport,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn device_info(_source: &str, _dev: u64) -> DeviceInfo {
+    DeviceInfo::default()
+}
+
+/// glibc's `major()` — the inverse of the `makedev` encoding mountinfo's
+/// `major:minor` fields go through.
+#[cfg(target_os = "linux")]
+fn dev_major(dev: u64) -> u64 {
+    ((dev >> 8) & 0x0000_0fff) | ((dev >> 32) & 0xffff_f000)
+}
+
+/// glibc's `minor()`.
+#[cfg(target_os = "linux")]
+fn dev_minor(dev: u64) -> u64 {
+    (dev & 0x0000_00ff) | ((dev >> 12) & 0xffff_ff00)
+}
+
+/// Kernel name of the block device behind a mount (`nvme0n1p5`, `dm-0`):
+/// the node `source` resolves to, else `major:minor` under `sys/dev/block`.
+/// `None` for pseudo filesystems — a ZFS dataset, fuse, overlay, tmpfs has
+/// no block device. `sys` is the sysfs root (tests build a fake one).
+#[cfg(target_os = "linux")]
+fn block_device(sys: &Path, source: &str, dev: u64) -> Option<String> {
+    let name_of = |p: &Path| {
+        std::fs::canonicalize(p)
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    };
+    if source.starts_with("/dev/") {
+        if let Some(n) = name_of(Path::new(source)) {
+            return Some(n);
+        }
+    }
+    let (major, minor) = (dev_major(dev), dev_minor(dev));
+    // Anonymous devices (major 0: tmpfs, btrfs subvolumes, FUSE…) are no
+    // block device at all.
+    if major == 0 {
+        return None;
+    }
+    name_of(&sys.join("dev/block").join(format!("{major}:{minor}")))
+}
+
+/// The disk a block device belongs to in the hardware tree: a partition's
+/// sysfs parent (`nvme0n1p5` → `nvme0n1`, `mmcblk0p2` → `mmcblk0`,
+/// `sda2` → `sda`); a stacked device (`dm-0`, `md0`) the disk below it when
+/// every slave shares one — else itself, a device spanning disks or having
+/// none is its own group. `None` when `name` is no block device.
+#[cfg(target_os = "linux")]
+fn disk_of(sys: &Path, name: &str) -> Option<String> {
+    // A partition's class entry resolves inside its disk's device dir.
+    let parent_of = |d: &Path| -> Option<String> {
+        if !d.join("partition").is_file() {
+            return None;
+        }
+        d.parent()?.file_name()?.to_str().map(String::from)
+    };
+    let dev = std::fs::canonicalize(sys.join("class/block").join(name)).ok()?;
+    if let Some(p) = parent_of(&dev) {
+        return Some(p);
+    }
+    // A stacked device: the disks below it, from sysfs `slaves`.
+    if let Ok(slaves) = std::fs::read_dir(dev.join("slaves")) {
+        let mut disks: Vec<String> = slaves
+            .filter_map(Result::ok)
+            .filter_map(|e| std::fs::canonicalize(e.path()).ok())
+            .map(|d| {
+                parent_of(&d).unwrap_or_else(|| {
+                    d.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        disks.sort_unstable();
+        disks.dedup();
+        // One disk below: the stack belongs to it. Several (a RAID, a
+        // span): no honest single parent — the device groups itself.
+        return Some(if disks.len() == 1 {
+            disks.remove(0)
+        } else {
+            name.to_string()
+        });
+    }
+    Some(name.to_string())
+}
+
+/// What sysfs knows about a whole disk: its model string (or `device/name`
+/// for the buses that use that), its size in bytes (`size` × 512) and the
+/// bus it hangs on. `("", 0, "")` where nothing can be told.
+#[cfg(target_os = "linux")]
+fn disk_facts(sys: &Path, disk: &str) -> (String, u64, String) {
+    let Ok(dev) = std::fs::canonicalize(sys.join("class/block").join(disk)) else {
+        return (String::new(), 0, String::new());
+    };
+    let read = |f: &str| {
+        std::fs::read_to_string(dev.join(f))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let model = ["device/model", "device/name", "name"]
+        .into_iter()
+        .map(read)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    let size = read("size").parse::<u64>().unwrap_or(0).saturating_mul(512);
+    (model, size, transport_of(disk, &dev))
+}
+
+/// The bus `disk` hangs on: from the kernel name first (nvme, mmc, virtio,
+/// the stacked/virtual devices), then the sysfs path — a USB stick's path
+/// passes a `usb` component, a SATA disk's an `ata` host bridge.
+#[cfg(target_os = "linux")]
+fn transport_of(disk: &str, dev: &Path) -> String {
+    for (prefix, t) in [
+        ("nvme", "nvme"),
+        ("mmcblk", "mmc"),
+        ("vd", "virtio"),
+        ("xvd", "xen"),
+        ("hd", "ide"),
+        ("dm-", "dm"),
+        ("md", "md"),
+        ("loop", "loop"),
+        ("nbd", "nbd"),
+        ("pmem", "pmem"),
+        ("zd", "zram"),
+        ("sr", "optical"),
+    ] {
+        if disk.starts_with(prefix) {
+            return t.to_string();
+        }
+    }
+    for c in dev.components() {
+        let c = c.as_os_str().to_string_lossy();
+        // Bus directories carry a number: `usb3`, `ata1`, `virtio2`.
+        if c.strip_prefix("usb")
+            .is_some_and(|r| r.chars().all(|c| c.is_ascii_digit()))
+        {
+            return "usb".into();
+        }
+        if c.strip_prefix("ata")
+            .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()))
+        {
+            return "sata".into();
+        }
+        if c.starts_with("virtio") {
+            return "virtio".into();
+        }
+    }
+    String::new()
 }
 
 /// `/` plus the mount points directly in the folders volumes are usually
@@ -1416,6 +1657,7 @@ mod tests {
             mount_point: PathBuf::from(at),
             fstype: fstype.into(),
             source: format!("/dev/x{dev}"),
+            mounts: vec![PathBuf::from(at)],
         }
     }
 
@@ -1475,5 +1717,162 @@ mod tests {
             drive_list(&[], &ssd),
             [(PathBuf::from("/"), String::new(), "fixed", "ssd")]
         );
+    }
+
+    /// A fake `/sys`: `devices/<bus path>/block/<disk>[/<part>]` directories
+    /// with the `/sys/class/block/<name>` symlinks the kernel makes.
+    #[cfg(target_os = "linux")]
+    struct FakeSys(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl FakeSys {
+        fn new(label: &str) -> FakeSys {
+            let mut d = std::env::temp_dir();
+            d.push(format!("diskghost-sys-{}-{label}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join("class/block")).unwrap();
+            std::fs::create_dir_all(d.join("dev/block")).unwrap();
+            FakeSys(d)
+        }
+
+        /// A whole disk under `bus` (part of the sysfs device path:
+        /// "pci0/ata1/host0" for SATA, "pci0/usb1/1-2" for USB), with a
+        /// model string and a sector count.
+        fn disk(&self, name: &str, bus: &str, model: &str, sectors: u64) -> PathBuf {
+            let dir = self.0.join("devices").join(bus).join("block").join(name);
+            std::fs::create_dir_all(dir.join("device")).unwrap();
+            std::fs::write(dir.join("device/model"), format!("{model}\n")).unwrap();
+            std::fs::write(dir.join("size"), format!("{sectors}\n")).unwrap();
+            std::os::unix::fs::symlink(&dir, self.0.join("class/block").join(name)).unwrap();
+            dir
+        }
+
+        /// A partition inside `disk`'s dir, as sysfs lays it out.
+        fn partition(&self, disk: &Path, name: &str) {
+            let dir = disk.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("partition"), "2\n").unwrap();
+            std::os::unix::fs::symlink(&dir, self.0.join("class/block").join(name)).unwrap();
+        }
+
+        /// A stacked device (dm/md) over `slaves`.
+        fn stacked(&self, name: &str, slaves: &[&str]) {
+            let dir = self.0.join("devices/virtual/block").join(name);
+            std::fs::create_dir_all(dir.join("slaves")).unwrap();
+            for s in slaves {
+                std::os::unix::fs::symlink(
+                    self.0.join("class/block").join(s),
+                    dir.join("slaves").join(s),
+                )
+                .unwrap();
+            }
+            std::os::unix::fs::symlink(&dir, self.0.join("class/block").join(name)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partitions_group_under_their_disk() {
+        let sys = FakeSys::new("parts");
+        let nvme = sys.disk(
+            "nvme0n1",
+            "pci0/nvme/nvme0",
+            "Lexar NM790 4TB",
+            7_814_168_576,
+        );
+        sys.partition(&nvme, "nvme0n1p5");
+        let sda = sys.disk(
+            "sda",
+            "pci0/ata1/host0/target0:0:0/0:0:0:0",
+            "CT4000",
+            7_814_168_576,
+        );
+        sys.partition(&sda, "sda2");
+        let mmc = sys.disk("mmcblk0", "platform/mmc", "SD64G", 125_000_000);
+        sys.partition(&mmc, "mmcblk0p2");
+
+        assert_eq!(disk_of(&sys.0, "nvme0n1p5").as_deref(), Some("nvme0n1"));
+        assert_eq!(disk_of(&sys.0, "sda2").as_deref(), Some("sda"));
+        assert_eq!(disk_of(&sys.0, "mmcblk0p2").as_deref(), Some("mmcblk0"));
+        // Whole disks answer themselves; unknown names answer nothing.
+        assert_eq!(disk_of(&sys.0, "nvme0n1").as_deref(), Some("nvme0n1"));
+        assert_eq!(disk_of(&sys.0, "sdz"), None);
+        std::fs::remove_dir_all(&sys.0).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stacked_devices_group_under_the_disk_below() {
+        let sys = FakeSys::new("stacked");
+        let sdb = sys.disk("sdb", "pci0/usb1/1-2/host2", "stick", 1_000);
+        sys.partition(&sdb, "sdb1");
+        let sdc = sys.disk("sdc", "pci0/ata2/host1", "other", 2_000);
+        sys.partition(&sdc, "sdc1");
+        sys.stacked("dm-0", &["sdb1"]); // LUKS/LVM on one disk
+        sys.stacked("md0", &["sdb1", "sdc1"]); // a span across two disks
+        sys.stacked("dm-9", &[]); // no slaves at all
+
+        assert_eq!(disk_of(&sys.0, "dm-0").as_deref(), Some("sdb"));
+        // A RAID over several disks has no single parent: its own group.
+        assert_eq!(disk_of(&sys.0, "md0").as_deref(), Some("md0"));
+        assert_eq!(disk_of(&sys.0, "dm-9").as_deref(), Some("dm-9"));
+        std::fs::remove_dir_all(&sys.0).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_facts_reads_model_size_and_bus() {
+        let sys = FakeSys::new("facts");
+        sys.disk("nvme0n1", "pci0/nvme/nvme0", "Lexar NM790 4TB", 2_000_000);
+        sys.disk("sda", "pci0/ata1/host0", "CT4000X9PROSSD9", 4_000);
+        sys.disk("sdc", "pci0/usb3/3-2/3-2:1.0/host4", "TerraMaster", 8_000);
+        sys.disk("vda", "pci0/virtio2", "", 512);
+        sys.disk("loop0", "virtual", "", 0);
+
+        let (model, size, transport) = disk_facts(&sys.0, "nvme0n1");
+        assert_eq!(model, "Lexar NM790 4TB");
+        assert_eq!(size, 2_000_000 * 512);
+        assert_eq!(transport, "nvme");
+        assert_eq!(disk_facts(&sys.0, "sda").2, "sata");
+        assert_eq!(disk_facts(&sys.0, "sdc").2, "usb");
+        assert_eq!(disk_facts(&sys.0, "vda").2, "virtio");
+        assert_eq!(disk_facts(&sys.0, "loop0").2, "loop");
+        assert_eq!(
+            disk_facts(&sys.0, "none"),
+            (String::new(), 0, String::new())
+        );
+        std::fs::remove_dir_all(&sys.0).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn block_device_resolves_the_node_or_the_device_number() {
+        let sys = FakeSys::new("blockdev");
+        let sdc = sys.disk("sdc", "pci0/usb3/3-2/host4", "TerraMaster", 8_000);
+        sys.partition(&sdc, "sdc1");
+        std::os::unix::fs::symlink(sdc.join("sdc1"), sys.0.join("dev/block").join("8:33")).unwrap();
+
+        // No device node: the major:minor lookup names it anyway.
+        assert_eq!(
+            block_device(&sys.0, "whatever", 8 << 8 | 33).as_deref(),
+            Some("sdc1")
+        );
+        // Pseudo filesystems (anonymous st_dev) have no block device.
+        assert_eq!(block_device(&sys.0, "tmpfs", 27), None);
+        assert_eq!(block_device(&sys.0, "tank/data", 0), None);
+        std::fs::remove_dir_all(&sys.0).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_major_minor_invert_makedev() {
+        // glibc's encoding, as mountinfo's major:minor fields go through it.
+        for (major, minor) in [(0, 26), (8, 33), (259, 10), (7, 200)] {
+            let dev = ((major & 0xffff_f000) << 32)
+                | ((major & 0x0000_0fff) << 8)
+                | ((minor & 0xffff_ff00) << 12)
+                | (minor & 0x0000_00ff);
+            assert_eq!((dev_major(dev), dev_minor(dev)), (major, minor));
+        }
     }
 }

@@ -31,6 +31,7 @@
     hdd: "M8 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM8 7a1 1 0 1 0 0 2 1 1 0 0 0 0-2z",
     tree: "M2.75 3.75h4M5.25 3.75v9.5M5.25 8.25h4.5M5.25 12.75h4.5",
     list: "M2.75 4h10.5M2.75 8h10.5M2.75 12h10.5",
+    chevron: "M5.75 3.75l4.5 4.25-4.5 4.25",
   };
   const NS = "http://www.w3.org/2000/svg";
   function icon(name, label) {

@@ -430,20 +430,124 @@ function driveRow(d) {
   return b;
 }
 
+// Device nodes the user folded shut in the drive tree, by device key.
+const collapsedDevs = new Set();
+
+// The disk's header: chevron, media icon, model (or device name) over
+// "nvme0n1 · nvme", the disk's own size and the space its volumes report
+// free in aggregate. One click folds the whole device away.
+function deviceHead(node) {
+  const open = !collapsedDevs.has(node.key);
+  const used = Math.max(0, node.total - node.free);
+  const b = el("button", {
+    type: "button", class: "dev-head", "aria-expanded": String(open),
+    title: t(open ? "devCollapse" : "devExpand"),
+    "aria-label": `${t(open ? "devCollapse" : "devExpand")}: ${node.model || node.name}`,
+    onclick: () => {
+      if (collapsedDevs.has(node.key)) collapsedDevs.delete(node.key);
+      else collapsedDevs.add(node.key);
+      renderDrives();
+    },
+  },
+    icon("chevron"),
+    icon(mediaIcon(node.media)),
+    el("span", { class: "drive-id" },
+      el("span", { class: "drive-name", text: node.model || node.name }),
+      el("span", { class: "drive-path", text: [node.name, node.transport].filter(Boolean).join(" · ") })),
+    el("span", { class: "dev-figs num" },
+      node.size ? el("span", { class: "dev-size", text: human(node.size) }) : null,
+      el("span", { class: "drive-free", text: node.total ? `${human(node.free)} ${t("free")}` : "" })),
+    node.total ? bar(used / node.total, used / node.total > 0.9 ? "is-hot" : "") : null);
+  return b;
+}
+
+// A volume's header line: the partition name and what it holds.
+function volHead(v) {
+  const d = v.drive;
+  return el("div", { class: "vol-head" },
+    el("span", { class: "vol-name", text: v.name }),
+    el("span", { class: "vol-meta num", text: [d.fs, d.total ? human(d.total) : ""].filter(Boolean).join(" · ") }));
+}
+
+// One mount of a volume: the primary row scans its canonical path; a
+// second mountpoint of the same filesystem is a slim sibling "↳ path",
+// never another volume.
+function mountRow(d, m) {
+  if (!m.alias) {
+    const r = driveRow(d);
+    r.classList.add("mount");
+    return r;
+  }
+  const b = el("button", { type: "button", class: "drive mount mount-alias", onclick: () => enqueue("scan", m.path), "aria-label": `${t("scan")} ${m.path}` },
+    el("span", { class: "mount-mark", text: "↳" }),
+    el("span", { class: "drive-id" },
+      el("span", { class: "drive-name", text: baseName(m.path) || m.path }),
+      el("span", { class: "drive-path", text: m.path })),
+    el("span", { class: "drive-free num", text: d.total ? `${human(d.free)} ${t("free")}` : d.fs }));
+  tip(b, driveTip(d));
+  return b;
+}
+
+// A whole physical device: header plus, while open, its volumes and every
+// mount each volume carries.
+function deviceNode(node) {
+  const open = !collapsedDevs.has(node.key);
+  return el("div", { class: "dev", "data-dev": node.key },
+    deviceHead(node),
+    open ? el("div", { class: "dev-body" },
+      node.volumes.map((v) => el("div", { class: "vol", "data-vol": v.name },
+        volHead(v), v.mounts.map((m) => mountRow(v.drive, m))))) : null);
+}
+
+// A section heading line (network, virtual filesystems): the same shape
+// the media groups used.
+function groupHead(iconName, name, n) {
+  return el("div", { class: "drive-group", role: "heading", "aria-level": "3" },
+    icon(iconName),
+    el("span", { class: "drive-group-name", text: name }),
+    el("span", { class: "drive-group-n num", text: String(n) }));
+}
+
 function renderDrives() {
   const box = $("drives");
   if (settings.drive_view === "tree") {
-    const out = [];
-    for (const g of groupDrives(drives)) {
-      out.push(
-        el("div", { class: "drive-group", role: "heading", "aria-level": "3" },
-          icon(mediaIcon(g.key)),
-          el("span", { class: "drive-group-name", text: t(g.labelKey) }),
-          el("span", { class: "drive-group-n num", text: String(g.items.length) })),
-      );
-      for (const d of g.items) out.push(driveRow(d));
+    const tree = deviceTree(drives);
+    const physical = tree.disks.filter((n) => !n.virtual);
+    const virtual = tree.disks.filter((n) => n.virtual);
+    if (!physical.length && !tree.network.length) {
+      // No device metadata at all (Windows/macOS, an older backend): keep
+      // the previous media grouping — a tree of one-drive nodes is noise.
+      const out = [];
+      for (const g of groupDrives(drives)) {
+        out.push(
+          el("div", { class: "drive-group", role: "heading", "aria-level": "3" },
+            icon(mediaIcon(g.key)),
+            el("span", { class: "drive-group-name", text: t(g.labelKey) }),
+            el("span", { class: "drive-group-n num", text: String(g.items.length) })),
+        );
+        for (const d of g.items) out.push(driveRow(d));
+      }
+      box.replaceChildren(...out);
+    } else {
+      const out = [];
+      for (const n of physical) out.push(deviceNode(n));
+      // Volumes no disk could be found for (ZFS datasets, FUSE): a group
+      // by filesystem; a drive with no source at all stays a plain row.
+      for (const n of virtual) {
+        if (n.key.startsWith("self:") && n.volumes.length === 1 && n.volumes[0].mounts.length === 1) {
+          out.push(driveRow(n.volumes[0].drive));
+        } else {
+          out.push(groupHead("drive", n.name, n.volumes.length));
+          for (const v of n.volumes) for (const m of v.mounts) out.push(mountRow(v.drive, m));
+        }
+      }
+      if (tree.network.length) {
+        // Remote locations are never part of the hardware tree.
+        out.push(groupHead("network", t("grpNet"), tree.network.length));
+        for (const d of tree.network) out.push(driveRow(d));
+      }
+      box.replaceChildren(...out);
     }
-    box.replaceChildren(...out);
   } else {
     box.replaceChildren(...drives.map(driveRow));
   }
