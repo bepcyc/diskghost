@@ -35,11 +35,16 @@ this first. Extend it here; never improvise a value in a rule.
 - Type: platform UI sans and platform mono. The CSP (`default-src 'self'`)
   allows no web fonts.
   - Mono is for paths, the wordmark and keyboard keys.
-  - Scale ≈1.2 from a 14 px base: `--text-2xs` … `--text-2xl`.
+  - Scale ≈1.2 over a viewport-tracking root: `html` clamps the root
+    16 → 19 px between ~1k and ~2.5k widths, and every rem follows it.
+    Token floors at 16 px: `--text-2xs` 12 (charts/tooltip paths),
+    `--text-xs` 13 (meta), `--text-sm` 15 (controls, tables), `--text-md`
+    16 (body) … `--text-2xl` 30 (figures).
   - All numbers use `font-variant-numeric: tabular-nums`.
 - Space: 4 pt scale, `--space-3xs` (2) … `--space-2xl` (64).
 - Radius: `--radius-xs` 3 · `sm` 5 · `md` 8 · `lg` 12.
-  Controls share one height, `--control-h`.
+  Controls share one height, `--control-h` (the small voice is
+  `--control-h-sm`; no click target goes under ~28 px).
 - Motion: `--ease-out`, `--ease-in`, `--ease-in-out`; `--dur-micro` 120 ms,
   `--dur-short` 220 ms.
   - Only functional motion: the progress sweep and the 1 px button press.
@@ -57,7 +62,8 @@ this first. Extend it here; never improvise a value in a rule.
   
   Size modifiers are `small` and `icon-btn`. An icon-only button always has
   an `aria-label`.
-- Icons come only from `icons.js`: a 16 px line set in `currentColor`. No emoji
+- Icons come only from `icons.js`: a line set drawn on a 16-unit grid in
+  `currentColor`, rendered at `--icon` (≥20 px). No emoji
   anywhere in the UI (a unit test enforces this).
 - Every share and meter is the one `.bar` primitive, with its width in
   `--w`. `.is-hot` marks danger, `.is-indeterminate` marks unknown totals.

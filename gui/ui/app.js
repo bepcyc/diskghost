@@ -975,9 +975,14 @@ function banner(kind, text, ...actions) {
 function welcomeView() {
   const rows = drives.map((d) => {
     const used = d.total - d.free;
+    // Same two-line name cell as the sidebar and the folders table: the
+    // distinguishing title stays readable while the path truncates on line two.
+    const name = driveLines(d);
     return el("tr", {},
-      el("td", { class: "cell-name" }, el("span", { class: "with-ic" }, icon(driveIcon(d)), el("span", { text: driveName(d) }))),
-      el("td", { class: "muted", text: kindLabel(d.kind) }),
+      el("td", { class: "cell-name" },
+        el("span", { class: "with-ic" }, icon(driveIcon(d)), el("span", { class: "cell-title", text: name.title })),
+        el("span", { class: "cell-path", text: name.sub })),
+      el("td", { class: "muted cell-kind", text: kindLabel(d.kind) }),
       el("td", { class: "cell-bar" }, bar(used / d.total, used / d.total > 0.9 ? "is-hot" : "")),
       el("td", { class: "num", text: `${human(d.free)} ${t("free")}` }),
       el("td", { class: "num muted", text: human(d.total) }),
@@ -1341,7 +1346,9 @@ function drawTreemap(container, j) {
   const rects = squarify(items, 0, 0, W, H);
   const maxL1 = Math.max(1, ...items.filter((i) => i.path).map((i) => i.size));
   const maxL2 = Math.max(1, ...kids.flatMap((k) => k.nested.map((n) => n.size)));
-  const GAP = 2, HEAD = 24;
+  // Tile chrome tracks the root font like every other rem: the framed
+  // header reserve is a label line plus its padding at the current size.
+  const GAP = 2, HEAD = 1.75 * parseFloat(getComputedStyle(document.documentElement).fontSize);
 
   const place = (node, x, y, w, h) => {
     node.style.left = `${x}px`;
@@ -1351,9 +1358,9 @@ function drawTreemap(container, j) {
     container.append(node);
   };
   const label = (name, item, share, w, h, stacked) => {
-    if (w < 46 || h < 18) return [];
+    if (w < 56 || h < 24) return [];
     const out = [el("span", { class: "tile-name", text: name })];
-    if (stacked ? h > 34 : w > 150) out.push(el("span", { class: "tile-size", text: `${sizeText(item, t("notMeasured"))}${share ? ` · ${share}` : ""}` }));
+    if (stacked ? h > 40 : w > 170) out.push(el("span", { class: "tile-size", text: `${sizeText(item, t("notMeasured"))}${share ? ` · ${share}` : ""}` }));
     return out;
   };
   const decorate = (node, path) => {
@@ -1524,7 +1531,7 @@ function filesTab(j, v, body, tools) {
       box.replaceChildren(head, el("p", { class: "empty", text: f ? t("noMatch") : t("noFiles") }));
       return;
     }
-    virtualList(box, head, items, 44, (x) => {
+    virtualList(box, head, items, vRowH, (x) => {
       const ext = (String(x.path).match(/\.([^.\\/]+)$/) || [])[1] || "";
       return el("div", { class: "vrow" },
         el("div", { class: "cell-name" },
@@ -1540,20 +1547,29 @@ function filesTab(j, v, body, tools) {
   draw();
 }
 
+// The .vrow height lives in styles.css (--vrow-h, in rem): the same token
+// drives the spacing math so a viewport-tracked root font never misaligns
+// rows. Re-read on every draw.
+function vRowH() {
+  const cs = getComputedStyle(document.documentElement);
+  return (parseFloat(cs.getPropertyValue("--vrow-h")) || 2.75) * parseFloat(cs.fontSize);
+}
+
 // Windowed list: only rows in view are built.
 function virtualList(container, head, items, rowH, renderRow) {
   const inner = el("div", { class: "vlist-inner" });
-  inner.style.height = `${items.length * rowH}px`;
   container.replaceChildren(head, inner);
   const draw = () => {
+    const rh = typeof rowH === "function" ? rowH() : rowH;
+    inner.style.height = `${items.length * rh}px`;
     const top = Math.max(0, container.scrollTop - head.offsetHeight);
     const vh = container.clientHeight || 400;
-    const start = Math.max(0, Math.floor(top / rowH) - 6);
-    const end = Math.min(items.length, Math.ceil((top + vh) / rowH) + 6);
+    const start = Math.max(0, Math.floor(top / rh) - 6);
+    const end = Math.min(items.length, Math.ceil((top + vh) / rh) + 6);
     const frag = document.createDocumentFragment();
     for (let k = start; k < end; k++) {
       const row = renderRow(items[k], k);
-      row.style.top = `${k * rowH}px`;
+      row.style.top = `${k * rh}px`;
       frag.append(row);
     }
     inner.replaceChildren(frag);
