@@ -856,6 +856,7 @@ fn policy(min: u64) -> Policy {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn plan_marks_remote_copies_and_apply_skips_them_explicitly() {
     let e = Estate::new("remote-apply");
