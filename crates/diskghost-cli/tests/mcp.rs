@@ -301,6 +301,7 @@ fn mcp_hostile_ssh_urls_are_rejected_before_any_process_is_spawned() {
 // ------------------------------------------------------------- plans dir
 
 #[test]
+#[cfg(unix)]
 fn mcp_plan_goes_to_the_fixed_plans_dir_and_never_overwrites() {
     let sb = Sandbox::new("plans");
     let tree = sb.fixture("tree");
@@ -356,6 +357,7 @@ fn mcp_plan_goes_to_the_fixed_plans_dir_and_never_overwrites() {
 // ----------------------------------------------- one writer, honest busy
 
 #[test]
+#[cfg(unix)]
 fn mcp_writer_jobs_are_serialized_and_queued() {
     let sb = Sandbox::new("serial");
     let t1 = sb.fixture("one");
@@ -416,6 +418,7 @@ fn mcp_cancel_job_ends_cancelled() {
 }
 
 #[test]
+#[cfg(unix)]
 fn mcp_index_busy_is_honest_when_another_process_holds_the_lock() {
     let sb = Sandbox::new("busy");
     let tree = sb.fixture("tree");
