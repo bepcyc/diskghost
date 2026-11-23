@@ -35,6 +35,7 @@ mod remote_tests;
 mod rotational;
 mod snapshot;
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 mod testkit;
 mod tree;
 mod walk;
