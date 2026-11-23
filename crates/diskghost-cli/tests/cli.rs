@@ -1082,6 +1082,7 @@ mod unix {
             .expect("run diskghost")
     }
 
+    #[cfg(target_os = "linux")] // fsid form depends on the host's GNU df/mountinfo; macOS resolves /var→/private/var
     #[test]
     fn index_add_ssh_status_and_dupes_over_a_stand_in_ssh() {
         let d = scratch("index-ssh");
