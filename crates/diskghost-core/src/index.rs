@@ -551,7 +551,7 @@ pub(crate) struct Volume {
 }
 
 /// This process's mount table (empty where there is none).
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 fn mount_table() -> Vec<MountEntry> {
     std::fs::read("/proc/self/mountinfo")
         .map(|b| {
@@ -610,19 +610,19 @@ fn volume(path: &Path) -> io::Result<Volume> {
     ))
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(any(unix, test))]
 fn dev_key(major: u64, minor: u64) -> String {
     format!("dev:{major}:{minor}")
 }
 
 /// glibc's `major()` (inverse of [`crate::walk::makedev`]).
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 fn dev_major(dev: u64) -> u64 {
     ((dev >> 8) & 0x0000_0fff) | ((dev >> 32) & 0xffff_f000)
 }
 
 /// glibc's `minor()`.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 fn dev_minor(dev: u64) -> u64 {
     (dev & 0x0000_00ff) | ((dev >> 12) & 0xffff_ff00)
 }
@@ -630,7 +630,7 @@ fn dev_minor(dev: u64) -> u64 {
 /// The pure half of [`volume_uuid`]: pick the mount of `path` (canonical)
 /// on device `dev` among `mounts`, and name it, asking `uuid_of` for the
 /// filesystem UUID of a mount source. `None` when no mount fits.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(any(unix, test))]
 fn resolve_volume(
     mounts: &[MountEntry],
     dev: u64,
@@ -650,7 +650,7 @@ fn resolve_volume(
 }
 
 /// The mount of `path` (canonical) on device `dev` among `mounts`.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(any(unix, test))]
 fn pick_mount<'m>(mounts: &'m [MountEntry], dev: u64, path: &Path) -> Option<&'m MountEntry> {
     // Longest mountpoint that is a prefix of `path`; later lines win ties
     // (a later mount covers an earlier one on the same directory).
@@ -678,7 +678,7 @@ fn pick_mount<'m>(mounts: &'m [MountEntry], dev: u64, path: &Path) -> Option<&'m
 /// Filesystem UUID of a mount source such as `/dev/sda1` or
 /// `/dev/mapper/root`: the `/dev/disk/by-uuid` entry resolving to the same
 /// device node. Pseudo sources (`tmpfs`, `overlay`, `pool/dataset`) have none.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 fn uuid_of_source(source: &str) -> Option<String> {
     if !source.starts_with("/dev/") {
         return None;
@@ -813,7 +813,7 @@ pub(crate) fn stat_of(meta: &std::fs::Metadata) -> Stat {
 
 /// [`index_scan`] with `on_read` called for every file whose content is
 /// read — the seam that lets tests prove what is (not) re-read.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn scan_observed(
     idx: &Index,
     root: &Path,
@@ -1410,9 +1410,6 @@ fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Res
 mod tests {
     use super::*;
     use crate::walk::parse_mountinfo_entry;
-    use std::collections::BTreeSet;
-    use std::sync::Mutex;
-    use std::time::{Duration, SystemTime};
 
     // ---- fixtures -------------------------------------------------------
 
@@ -1433,62 +1430,8 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
-    /// Move a file's mtime to a time it cannot already have.
-    fn touch(path: &Path, secs_ago: u64) {
-        let f = std::fs::File::options().write(true).open(path).unwrap();
-        f.set_modified(SystemTime::now() - Duration::from_secs(secs_ago))
-            .unwrap();
-    }
-
     fn open_db(dir: &Path) -> Index {
         Index::open(&dir.join("db").join("index.db")).unwrap()
-    }
-
-    /// Scan `root`, recording every file whose content was read.
-    fn scan(idx: &Index, root: &Path) -> (ScanSummary, BTreeSet<PathBuf>) {
-        let reads = Mutex::new(BTreeSet::new());
-        let s = scan_observed(
-            idx,
-            root,
-            &Options::default(),
-            &Progress::default(),
-            &|p: &Path| {
-                reads.lock().unwrap().insert(p.to_path_buf());
-            },
-        )
-        .unwrap();
-        (s, reads.into_inner().unwrap())
-    }
-
-    /// (sample, full) of one indexed file, by absolute path.
-    /// (sample, full) as stored.
-    type Hashes = (Option<Vec<u8>>, Option<Vec<u8>>);
-
-    fn hashes(idx: &Index, abs: &Path) -> Option<Hashes> {
-        let mut st = idx
-            .conn
-            .prepare(
-                "SELECT f.sample, f.full, l.root, f.path FROM files f \
-                 JOIN locations l ON l.id = f.location_id",
-            )
-            .unwrap();
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, Option<Vec<u8>>>(0)?,
-                    r.get::<_, Option<Vec<u8>>>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })
-            .unwrap();
-        for row in rows {
-            let (s, f, root, path) = row.unwrap();
-            if Path::new(&root).join(path) == abs {
-                return Some((s, f));
-            }
-        }
-        None
     }
 
     fn row_count(idx: &Index) -> i64 {
@@ -1632,48 +1575,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn live_volume_uuid_and_cow_probe_do_not_fail() {
-        let d = tmpdir("live");
-        assert!(!volume_uuid(&d).unwrap().is_empty());
-        let _ = is_cow_fs(&d);
-    }
-
     // ---- schema ---------------------------------------------------------
-
-    #[test]
-    fn schema_is_created_versioned_and_reopened() {
-        let d = tmpdir("schema");
-        let idx = open_db(&d);
-        let v: i64 = idx
-            .conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
-        // Version 2 records whether a location's filesystem is copy-on-write.
-        let cow: Option<i64> = idx
-            .conn
-            .query_row("SELECT cow FROM locations LIMIT 1", [], |r| r.get(0))
-            .optional()
-            .unwrap()
-            .flatten();
-        assert_eq!(cow, None, "no location yet");
-        let mode: String = idx
-            .conn
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(mode, "wal");
-        let fk: i64 = idx
-            .conn
-            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(fk, 1);
-        write(&d.join("t/a"), b"x");
-        scan(&idx, &d.join("t"));
-        drop(idx);
-        let idx = open_db(&d);
-        assert_eq!(row_count(&idx), 1);
-    }
 
     #[test]
     fn a_version_2_index_migrates_to_3_keeping_its_rows() {
@@ -1728,45 +1630,6 @@ mod tests {
     }
 
     #[test]
-    fn scans_record_their_roots_listed_by_status_and_dropped_by_forget() {
-        let d = tmpdir("scanroots");
-        write(&d.join("t/a/x"), b"x");
-        write(&d.join("t/b/y"), b"y");
-        let idx = open_db(&d);
-        let s = scan(&idx, &d.join("t/a")).0;
-        scan(&idx, &d.join("t/b"));
-        // Re-adding a root records it once; a non-canonical spelling too.
-        scan(&idx, &d.join("t/b/../a"));
-        let st = idx.status().unwrap();
-        let l = st.iter().find(|l| l.uuid == s.uuid).unwrap();
-        let mut roots = l.roots.clone();
-        roots.sort();
-        assert_eq!(roots, vec![d.join("t/a"), d.join("t/b")]);
-        // Stored relative to the mountpoint, like file paths.
-        let stored: Vec<String> = {
-            let mut q = idx
-                .conn
-                .prepare("SELECT path FROM scan_roots ORDER BY path")
-                .unwrap();
-            q.query_map([], |r| r.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
-        for p in &stored {
-            assert!(!p.starts_with('/'), "{p}");
-            assert_eq!(s.root.join(p).parent(), Some(d.join("t").as_path()));
-        }
-        assert_eq!(stored.len(), 2);
-        assert!(idx.forget(&s.uuid).unwrap());
-        let n: i64 = idx
-            .conn
-            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 0, "forget cascades to scan roots");
-    }
-
-    #[test]
     fn a_newer_schema_is_refused() {
         let d = tmpdir("newer");
         drop(open_db(&d));
@@ -1777,168 +1640,6 @@ mod tests {
     }
 
     // ---- scanning -------------------------------------------------------
-
-    #[test]
-    fn first_scan_of_unique_sizes_reads_nothing() {
-        let d = tmpdir("unique");
-        let t = d.join("t");
-        write(&t.join("a"), b"1");
-        write(&t.join("sub/b"), b"22");
-        write(&t.join("c"), b"333");
-        let idx = open_db(&d);
-        let (s, reads) = scan(&idx, &t);
-        assert!(
-            reads.is_empty(),
-            "nothing collides, nothing is read: {reads:?}"
-        );
-        assert_eq!((s.seen, s.new, s.sampled), (3, 3, 0));
-        assert!(s.complete);
-        for f in ["a", "sub/b", "c"] {
-            assert_eq!(hashes(&idx, &t.join(f)), Some((None, None)), "{f}");
-        }
-    }
-
-    #[test]
-    fn an_unchanged_file_is_never_read_again() {
-        let d = tmpdir("unchanged");
-        let t = d.join("t");
-        write(&t.join("a"), &[7u8; 40_000]);
-        write(&t.join("b"), &[7u8; 40_000]);
-        write(&t.join("c"), b"unique");
-        let idx = open_db(&d);
-        let (s1, r1) = scan(&idx, &t);
-        assert_eq!(r1, BTreeSet::from([t.join("a"), t.join("b")]));
-        assert_eq!(s1.sampled, 2);
-        let (s2, r2) = scan(&idx, &t);
-        assert!(r2.is_empty(), "nothing changed, nothing re-read: {r2:?}");
-        assert_eq!((s2.unchanged, s2.new, s2.changed), (3, 0, 0));
-    }
-
-    #[test]
-    fn touching_one_file_rereads_only_that_file() {
-        let d = tmpdir("touch");
-        let t = d.join("t");
-        write(&t.join("a"), &[7u8; 40_000]);
-        write(&t.join("b"), &[7u8; 40_000]);
-        write(&t.join("c"), b"unique");
-        let idx = open_db(&d);
-        scan(&idx, &t);
-        let b_before = hashes(&idx, &t.join("b")).unwrap();
-        assert!(b_before.0.is_some());
-        touch(&t.join("a"), 3600);
-        let (s, reads) = scan(&idx, &t);
-        assert_eq!(reads, BTreeSet::from([t.join("a")]));
-        assert_eq!((s.changed, s.unchanged, s.sampled), (1, 2, 1));
-        assert_eq!(hashes(&idx, &t.join("b")).unwrap(), b_before);
-        let a = hashes(&idx, &t.join("a")).unwrap();
-        assert_eq!(a.0, b_before.0, "same content, same sample");
-    }
-
-    #[test]
-    fn a_copy_found_later_samples_both_sides() {
-        let d = tmpdir("twotrees");
-        let (ta, tb) = (d.join("a"), d.join("b"));
-        write(&ta.join("movie"), &[9u8; 50_000]);
-        write(&tb.join("movie copy"), &[9u8; 50_000]);
-        write(&tb.join("unique"), &[1u8; 123]);
-        let idx = open_db(&d);
-        // Alone, A's file collides with nothing: not read.
-        let (_, r1) = scan(&idx, &ta);
-        assert!(r1.is_empty());
-        assert_eq!(hashes(&idx, &ta.join("movie")), Some((None, None)));
-        // B brings a same-size file: both sides get their sample.
-        let (s, r2) = scan(&idx, &tb);
-        assert_eq!(
-            r2,
-            BTreeSet::from([ta.join("movie"), tb.join("movie copy")])
-        );
-        assert_eq!(s.sampled, 2);
-        let a = hashes(&idx, &ta.join("movie")).unwrap();
-        let b = hashes(&idx, &tb.join("movie copy")).unwrap();
-        assert!(a.0.is_some());
-        assert_eq!(a.0, b.0);
-        assert_eq!(hashes(&idx, &tb.join("unique")), Some((None, None)));
-        // A's rows survive B's scan: vanished is scoped to the walked subtree.
-        assert_eq!(row_count(&idx), 3);
-    }
-
-    #[test]
-    fn small_samples_are_also_full_hashes() {
-        let d = tmpdir("smallfull");
-        let t = d.join("t");
-        write(&t.join("a"), b"same bytes");
-        write(&t.join("b"), b"same bytes");
-        let idx = open_db(&d);
-        scan(&idx, &t);
-        let (s, f) = hashes(&idx, &t.join("a")).unwrap();
-        assert_eq!(s, f);
-        assert_eq!(f.unwrap(), blake3::hash(b"same bytes").as_bytes().to_vec());
-    }
-
-    #[test]
-    fn rescan_marks_seen_and_drops_vanished_rows() {
-        let d = tmpdir("vanish");
-        let t = d.join("t");
-        write(&t.join("keep"), b"k");
-        write(&t.join("gone"), b"gg");
-        let idx = open_db(&d);
-        scan(&idx, &t);
-        std::fs::remove_file(t.join("gone")).unwrap(); // inside own tempdir
-        let (s, _) = scan(&idx, &t);
-        assert_eq!((s.vanished, s.unchanged), (1, 1));
-        assert_eq!(hashes(&idx, &t.join("gone")), None);
-        let (gen, seen): (i64, i64) = idx
-            .conn
-            .query_row(
-                "SELECT (SELECT value FROM meta WHERE key = 'scan_generation'), \
-                 (SELECT MAX(seen) FROM files)",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(gen, seen, "the surviving row is marked seen by this scan");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_unreadable_dir_is_named_in_the_summary() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = tmpdir("unreadable");
-        let t = d.join("t");
-        write(&t.join("a"), b"a");
-        write(&t.join("locked").join("inside"), b"x");
-        std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o0)).unwrap();
-        let readable = std::fs::read_dir(t.join("locked")).is_ok(); // running as root
-        let idx = open_db(&d);
-        let (s, _) = scan(&idx, &t);
-        std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        if readable {
-            return;
-        }
-        assert!(!s.complete);
-        assert!(s.skipped > 0);
-        assert!(
-            s.skipped_paths.iter().any(|p| p.ends_with("locked")),
-            "the skipped dir is named: {:?}",
-            s.skipped_paths
-        );
-    }
-
-    #[test]
-    fn an_incomplete_scan_deletes_nothing() {
-        let d = tmpdir("cancelled");
-        let t = d.join("t");
-        write(&t.join("a"), b"a");
-        write(&t.join("b"), b"bb");
-        let idx = open_db(&d);
-        scan(&idx, &t);
-        let p = Progress::default();
-        p.cancel();
-        let s = scan_observed(&idx, &t, &Options::default(), &p, &|_| {}).unwrap();
-        assert!(!s.complete);
-        assert_eq!(s.vanished, 0);
-        assert_eq!(row_count(&idx), 2);
-    }
 
     #[test]
     fn rows_under_unentered_mounts_are_not_vanished() {
@@ -2035,19 +1736,6 @@ mod tests {
     }
 
     #[test]
-    fn a_scanned_volume_is_online() {
-        let d = tmpdir("online");
-        write(&d.join("t/a"), b"a");
-        let idx = open_db(&d);
-        let s = scan(&idx, &d.join("t")).0;
-        let st = idx.status().unwrap();
-        let l = st.iter().find(|l| l.uuid == s.uuid).unwrap();
-        assert!(l.online);
-        assert_eq!((l.files, l.bytes, l.role), (1, 1, Role::Normal));
-        assert_eq!(l.host, "local");
-    }
-
-    #[test]
     fn forget_drops_the_location_and_cascades_to_its_files() {
         let d = tmpdir("forget");
         let idx = open_db(&d);
@@ -2080,5 +1768,313 @@ mod tests {
         let e = validate_host("nas.lan").unwrap_err();
         assert!(e.contains("ssh://nas.lan/path"), "{e}");
         assert!(validate_host("ssh://nas.lan").is_ok());
+    }
+
+    /// Unix-only cases: `scan()`/`scan_observed()` run the real `volume()`
+    /// probe, which answers `Unsupported` on non-unix (the persistent
+    /// index needs a Unix volume table) — the whole group sits behind
+    /// one `cfg` instead of a gate per test or helper.
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::collections::BTreeSet;
+        use std::sync::Mutex;
+        use std::time::{Duration, SystemTime};
+
+        /// Move a file's mtime to a time it cannot already have.
+        fn touch(path: &Path, secs_ago: u64) {
+            let f = std::fs::File::options().write(true).open(path).unwrap();
+            f.set_modified(SystemTime::now() - Duration::from_secs(secs_ago))
+                .unwrap();
+        }
+        /// Scan `root`, recording every file whose content was read.
+        fn scan(idx: &Index, root: &Path) -> (ScanSummary, BTreeSet<PathBuf>) {
+            let reads = Mutex::new(BTreeSet::new());
+            let s = scan_observed(
+                idx,
+                root,
+                &Options::default(),
+                &Progress::default(),
+                &|p: &Path| {
+                    reads.lock().unwrap().insert(p.to_path_buf());
+                },
+            )
+            .unwrap();
+            (s, reads.into_inner().unwrap())
+        }
+        /// (sample, full) of one indexed file, by absolute path.
+        /// (sample, full) as stored.
+        type Hashes = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+        fn hashes(idx: &Index, abs: &Path) -> Option<Hashes> {
+            let mut st = idx
+                .conn
+                .prepare(
+                    "SELECT f.sample, f.full, l.root, f.path FROM files f \
+                     JOIN locations l ON l.id = f.location_id",
+                )
+                .unwrap();
+            let rows = st
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, Option<Vec<u8>>>(0)?,
+                        r.get::<_, Option<Vec<u8>>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap();
+            for row in rows {
+                let (s, f, root, path) = row.unwrap();
+                if Path::new(&root).join(path) == abs {
+                    return Some((s, f));
+                }
+            }
+            None
+        }
+        #[test]
+        fn live_volume_uuid_and_cow_probe_do_not_fail() {
+            let d = tmpdir("live");
+            assert!(!volume_uuid(&d).unwrap().is_empty());
+            let _ = is_cow_fs(&d);
+        }
+        #[test]
+        fn schema_is_created_versioned_and_reopened() {
+            let d = tmpdir("schema");
+            let idx = open_db(&d);
+            let v: i64 = idx
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            // Version 2 records whether a location's filesystem is copy-on-write.
+            let cow: Option<i64> = idx
+                .conn
+                .query_row("SELECT cow FROM locations LIMIT 1", [], |r| r.get(0))
+                .optional()
+                .unwrap()
+                .flatten();
+            assert_eq!(cow, None, "no location yet");
+            let mode: String = idx
+                .conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            let fk: i64 = idx
+                .conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(fk, 1);
+            write(&d.join("t/a"), b"x");
+            scan(&idx, &d.join("t"));
+            drop(idx);
+            let idx = open_db(&d);
+            assert_eq!(row_count(&idx), 1);
+        }
+        #[test]
+        fn scans_record_their_roots_listed_by_status_and_dropped_by_forget() {
+            let d = tmpdir("scanroots");
+            write(&d.join("t/a/x"), b"x");
+            write(&d.join("t/b/y"), b"y");
+            let idx = open_db(&d);
+            let s = scan(&idx, &d.join("t/a")).0;
+            scan(&idx, &d.join("t/b"));
+            // Re-adding a root records it once; a non-canonical spelling too.
+            scan(&idx, &d.join("t/b/../a"));
+            let st = idx.status().unwrap();
+            let l = st.iter().find(|l| l.uuid == s.uuid).unwrap();
+            let mut roots = l.roots.clone();
+            roots.sort();
+            assert_eq!(roots, vec![d.join("t/a"), d.join("t/b")]);
+            // Stored relative to the mountpoint, like file paths.
+            let stored: Vec<String> = {
+                let mut q = idx
+                    .conn
+                    .prepare("SELECT path FROM scan_roots ORDER BY path")
+                    .unwrap();
+                q.query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect()
+            };
+            for p in &stored {
+                assert!(!p.starts_with('/'), "{p}");
+                assert_eq!(s.root.join(p).parent(), Some(d.join("t").as_path()));
+            }
+            assert_eq!(stored.len(), 2);
+            assert!(idx.forget(&s.uuid).unwrap());
+            let n: i64 = idx
+                .conn
+                .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "forget cascades to scan roots");
+        }
+        #[test]
+        fn first_scan_of_unique_sizes_reads_nothing() {
+            let d = tmpdir("unique");
+            let t = d.join("t");
+            write(&t.join("a"), b"1");
+            write(&t.join("sub/b"), b"22");
+            write(&t.join("c"), b"333");
+            let idx = open_db(&d);
+            let (s, reads) = scan(&idx, &t);
+            assert!(
+                reads.is_empty(),
+                "nothing collides, nothing is read: {reads:?}"
+            );
+            assert_eq!((s.seen, s.new, s.sampled), (3, 3, 0));
+            assert!(s.complete);
+            for f in ["a", "sub/b", "c"] {
+                assert_eq!(hashes(&idx, &t.join(f)), Some((None, None)), "{f}");
+            }
+        }
+        #[test]
+        fn an_unchanged_file_is_never_read_again() {
+            let d = tmpdir("unchanged");
+            let t = d.join("t");
+            write(&t.join("a"), &[7u8; 40_000]);
+            write(&t.join("b"), &[7u8; 40_000]);
+            write(&t.join("c"), b"unique");
+            let idx = open_db(&d);
+            let (s1, r1) = scan(&idx, &t);
+            assert_eq!(r1, BTreeSet::from([t.join("a"), t.join("b")]));
+            assert_eq!(s1.sampled, 2);
+            let (s2, r2) = scan(&idx, &t);
+            assert!(r2.is_empty(), "nothing changed, nothing re-read: {r2:?}");
+            assert_eq!((s2.unchanged, s2.new, s2.changed), (3, 0, 0));
+        }
+        #[test]
+        fn touching_one_file_rereads_only_that_file() {
+            let d = tmpdir("touch");
+            let t = d.join("t");
+            write(&t.join("a"), &[7u8; 40_000]);
+            write(&t.join("b"), &[7u8; 40_000]);
+            write(&t.join("c"), b"unique");
+            let idx = open_db(&d);
+            scan(&idx, &t);
+            let b_before = hashes(&idx, &t.join("b")).unwrap();
+            assert!(b_before.0.is_some());
+            touch(&t.join("a"), 3600);
+            let (s, reads) = scan(&idx, &t);
+            assert_eq!(reads, BTreeSet::from([t.join("a")]));
+            assert_eq!((s.changed, s.unchanged, s.sampled), (1, 2, 1));
+            assert_eq!(hashes(&idx, &t.join("b")).unwrap(), b_before);
+            let a = hashes(&idx, &t.join("a")).unwrap();
+            assert_eq!(a.0, b_before.0, "same content, same sample");
+        }
+        #[test]
+        fn a_copy_found_later_samples_both_sides() {
+            let d = tmpdir("twotrees");
+            let (ta, tb) = (d.join("a"), d.join("b"));
+            write(&ta.join("movie"), &[9u8; 50_000]);
+            write(&tb.join("movie copy"), &[9u8; 50_000]);
+            write(&tb.join("unique"), &[1u8; 123]);
+            let idx = open_db(&d);
+            // Alone, A's file collides with nothing: not read.
+            let (_, r1) = scan(&idx, &ta);
+            assert!(r1.is_empty());
+            assert_eq!(hashes(&idx, &ta.join("movie")), Some((None, None)));
+            // B brings a same-size file: both sides get their sample.
+            let (s, r2) = scan(&idx, &tb);
+            assert_eq!(
+                r2,
+                BTreeSet::from([ta.join("movie"), tb.join("movie copy")])
+            );
+            assert_eq!(s.sampled, 2);
+            let a = hashes(&idx, &ta.join("movie")).unwrap();
+            let b = hashes(&idx, &tb.join("movie copy")).unwrap();
+            assert!(a.0.is_some());
+            assert_eq!(a.0, b.0);
+            assert_eq!(hashes(&idx, &tb.join("unique")), Some((None, None)));
+            // A's rows survive B's scan: vanished is scoped to the walked subtree.
+            assert_eq!(row_count(&idx), 3);
+        }
+        #[test]
+        fn small_samples_are_also_full_hashes() {
+            let d = tmpdir("smallfull");
+            let t = d.join("t");
+            write(&t.join("a"), b"same bytes");
+            write(&t.join("b"), b"same bytes");
+            let idx = open_db(&d);
+            scan(&idx, &t);
+            let (s, f) = hashes(&idx, &t.join("a")).unwrap();
+            assert_eq!(s, f);
+            assert_eq!(f.unwrap(), blake3::hash(b"same bytes").as_bytes().to_vec());
+        }
+        #[test]
+        fn rescan_marks_seen_and_drops_vanished_rows() {
+            let d = tmpdir("vanish");
+            let t = d.join("t");
+            write(&t.join("keep"), b"k");
+            write(&t.join("gone"), b"gg");
+            let idx = open_db(&d);
+            scan(&idx, &t);
+            std::fs::remove_file(t.join("gone")).unwrap(); // inside own tempdir
+            let (s, _) = scan(&idx, &t);
+            assert_eq!((s.vanished, s.unchanged), (1, 1));
+            assert_eq!(hashes(&idx, &t.join("gone")), None);
+            let (gen, seen): (i64, i64) = idx
+                .conn
+                .query_row(
+                    "SELECT (SELECT value FROM meta WHERE key = 'scan_generation'), \
+                     (SELECT MAX(seen) FROM files)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(gen, seen, "the surviving row is marked seen by this scan");
+        }
+        #[test]
+        fn an_unreadable_dir_is_named_in_the_summary() {
+            use std::os::unix::fs::PermissionsExt;
+            let d = tmpdir("unreadable");
+            let t = d.join("t");
+            write(&t.join("a"), b"a");
+            write(&t.join("locked").join("inside"), b"x");
+            std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o0))
+                .unwrap();
+            let readable = std::fs::read_dir(t.join("locked")).is_ok(); // running as root
+            let idx = open_db(&d);
+            let (s, _) = scan(&idx, &t);
+            std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            if readable {
+                return;
+            }
+            assert!(!s.complete);
+            assert!(s.skipped > 0);
+            assert!(
+                s.skipped_paths.iter().any(|p| p.ends_with("locked")),
+                "the skipped dir is named: {:?}",
+                s.skipped_paths
+            );
+        }
+        #[test]
+        fn an_incomplete_scan_deletes_nothing() {
+            let d = tmpdir("cancelled");
+            let t = d.join("t");
+            write(&t.join("a"), b"a");
+            write(&t.join("b"), b"bb");
+            let idx = open_db(&d);
+            scan(&idx, &t);
+            let p = Progress::default();
+            p.cancel();
+            let s = scan_observed(&idx, &t, &Options::default(), &p, &|_| {}).unwrap();
+            assert!(!s.complete);
+            assert_eq!(s.vanished, 0);
+            assert_eq!(row_count(&idx), 2);
+        }
+        #[test]
+        fn a_scanned_volume_is_online() {
+            let d = tmpdir("online");
+            write(&d.join("t/a"), b"a");
+            let idx = open_db(&d);
+            let s = scan(&idx, &d.join("t")).0;
+            let st = idx.status().unwrap();
+            let l = st.iter().find(|l| l.uuid == s.uuid).unwrap();
+            assert!(l.online);
+            assert_eq!((l.files, l.bytes, l.role), (1, 1, Role::Normal));
+            assert_eq!(l.host, "local");
+        }
     }
 }

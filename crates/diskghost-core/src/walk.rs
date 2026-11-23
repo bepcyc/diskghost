@@ -8,7 +8,9 @@
 //! cost. The listing of one directory is handed to the caller as a [`Batch`]
 //! while the walk goes on, so building a tree overlaps with the I/O.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(any(unix, test))]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex};
@@ -225,6 +227,7 @@ fn remote_devices() -> HashSet<u64> {
 /// local disk. Every other FUSE filesystem (`gvfsd-fuse`, `sshfs`, `rclone`,
 /// `s3fs`, the document portal, …) counts as remote — its daemon may answer
 /// from the network, block, or loop.
+#[cfg(any(unix, test))]
 const LOCAL_FUSE: &[&str] = &[
     "mergerfs",
     "bindfs",
@@ -243,8 +246,9 @@ const LOCAL_FUSE: &[&str] = &[
 
 /// Whether a filesystem type (as in `/proc/self/mountinfo`) is reached over
 /// the network or through a non-local FUSE daemon. `fuseblk` (ntfs-3g and
-/// exFAT on a local block device) is local.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// exFAT on a local block device) is local. Compiled everywhere tests run:
+/// the fixture mountinfo tables below are platform-independent.
+#[cfg(any(unix, test))]
 pub(crate) fn is_remote_fs(fstype: &str) -> bool {
     match fstype {
         "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "ncpfs" | "afs" | "ceph" | "glusterfs"
@@ -257,7 +261,7 @@ pub(crate) fn is_remote_fs(fstype: &str) -> bool {
 
 /// Device id and filesystem type of one `/proc/self/mountinfo` line
 /// (`id parent major:minor root mountpoint options [tags] - fstype ...`).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 fn parse_mountinfo_line(line: &str) -> Option<(u64, &str)> {
     let (head, tail) = line.split_once(" - ")?;
     let (major, minor) = head.split_whitespace().nth(2)?.split_once(':')?;
@@ -287,7 +291,9 @@ pub struct MountEntry {
 
 /// Parse one `/proc/self/mountinfo` line in full. The kernel escapes space,
 /// tab, newline and backslash in paths as `\ooo` octal; those are decoded.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Compiled everywhere tests run: it is a pure parse, and the fixture-table
+/// tests exercise it on every platform.
+#[cfg(any(unix, test))]
 pub(crate) fn parse_mountinfo_entry(line: &str) -> Option<MountEntry> {
     let (head, tail) = line.split_once(" - ")?;
     let mut head = head.split_whitespace();
@@ -330,7 +336,7 @@ pub struct LocalMount {
 /// Filesystem types that hold data on local storage. An explicit allowlist:
 /// anything else (`tmpfs`, `proc`, `overlay`, `squashfs`, `autofs`, …) is
 /// never a drive.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(any(unix, test))]
 const REAL_FS: &[&str] = &[
     "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "reiserfs", "jfs", "nilfs2", "bcachefs", "zfs",
     "ufs", "ffs", "hfs", "hfsplus", "apfs", "ntfs", "ntfs3", "fuseblk", "exfat", "vfat", "msdos",
@@ -342,7 +348,7 @@ const REAL_FS: &[&str] = &[
 /// whole-filesystem mount of an already seen device is remembered on its
 /// `mounts` — a filesystem mounted twice is still one volume, with both
 /// mountpoints.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(any(unix, test))]
 pub(crate) fn local_mounts_from(info: &str) -> Vec<LocalMount> {
     let mut slots: HashMap<u64, usize> = HashMap::new();
     let mut out: Vec<LocalMount> = Vec::new();
@@ -374,7 +380,7 @@ pub(crate) fn local_mounts_from(info: &str) -> Vec<LocalMount> {
 
 /// Whether `fstype` holds data on local storage: [`REAL_FS`], or a FUSE
 /// filesystem that only re-presents local storage ([`LOCAL_FUSE`]).
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(any(unix, test))]
 fn is_storage_fs(fstype: &str) -> bool {
     REAL_FS.contains(&fstype)
         || fstype
@@ -403,7 +409,7 @@ pub fn mount_table() -> Vec<MountEntry> {
 }
 
 /// Decode the kernel's `\ooo` octal escapes in a mountinfo field.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(unix, test))]
 fn unescape_mountinfo(field: &str) -> String {
     let b = field.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -427,7 +433,7 @@ fn unescape_mountinfo(field: &str) -> String {
 }
 
 /// glibc's `makedev`: the `st_dev` value of device `major:minor`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(unix, test))]
 pub(crate) fn makedev(major: u64, minor: u64) -> u64 {
     ((major & 0xffff_f000) << 32)
         | ((major & 0x0000_0fff) << 8)
