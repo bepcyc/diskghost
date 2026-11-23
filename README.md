@@ -155,6 +155,61 @@ read at all. Complete entries carry no `complete` field.
 
 Perfect for wiring into an automation/agent that decides what to clean.
 
+### MCP server
+
+`diskghost mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server on stdio, so an AI agent can see your drives, choose what to index
+(local folders and `ssh://host//path` remotes), run scans as background jobs,
+find duplicates across every indexed volume — offline ones included — and
+write a dedup **plan** under a policy you state in chat.
+
+**It never touches your files.** No tool can move, delete, rename or write a
+user file: `apply`, `undo`, `rm`, `dupes --reclaim` and `index forget` are not
+exposed, and a test fails the build if the MCP module so much as names them.
+Carrying a plan out stays a manual step you run yourself
+(`diskghost apply <plan> --dry-run`). The server writes exactly three things:
+
+- the index database (hashes and rows, like `index add` and `dupes --index`);
+- plan files, created with `create_new` (never overwritten) in one fixed
+  directory, `$XDG_STATE_HOME/diskghost/plans/` (`~/.local/state/diskghost/plans/`),
+  named `plan-<UTC time>-<random>.json` — a tool cannot choose the path;
+- on an `ssh://` host with `agent: "auto"`, a copy of this program in
+  `~/.cache/diskghost/` there (`mv -n`, once per version — not a user file;
+  `agent: "never"` forbids it and uses the host's shell tools).
+
+| Tool | What it does |
+|---|---|
+| `list_drives` | Local filesystems (mount, type, device, total/free, `hdd`/`ssd`, copy-on-write, uuid, indexed?) and remembered ssh locations |
+| `list_locations` | Indexed locations: role, root, scanned folders, files, bytes, last scan, online now |
+| `add_location` | Validate a local folder or `ssh://` URL, then start a scan **job** |
+| `set_location_role` | `master` (keep) / `scratch` (expendable) / `normal` — index only |
+| `start_scan` | Rescan an indexed location or a folder inside it (**job**) |
+| `job_status`, `list_jobs`, `cancel_job` | Phase, live counters and result/error of a job; stop one |
+| `dupes_report` | Duplicate groups biggest-first with copies, keep/reclaimable hints, copy-on-write warning, single-copy counts, paging |
+| `plan_dedup` | Write a plan for a policy (`min_copies`, `distinct`, per-location roles); returns its path and the literal next step |
+
+Long work is a **job**: the tool returns a `job_id` immediately and you poll
+`job_status`. Scans, `dupes_report` and `plan_dedup` write the index, which
+takes one writer at a time, so they run one after another (later ones show
+`queued`). If another process — say a long `diskghost index add` — holds the
+index, the tool answers `index_busy` naming the database instead of hanging.
+Jobs live in the server process: stop the server and they end, and a local
+scan stopped mid-way records nothing — run it again.
+
+Register it with your agent (use the absolute path of your `diskghost`):
+
+```bash
+claude mcp add --scope user diskghost -- /path/to/diskghost mcp
+codex mcp add diskghost -- /path/to/diskghost mcp
+devin mcp add diskghost -- /path/to/diskghost mcp
+agy mcp add diskghost /path/to/diskghost mcp          # Antigravity CLI
+```
+
+`diskghost mcp --db FILE` uses another index; `DISKGHOST_MCP_LOG=FILE` (or `-`
+for stderr) logs the protocol version and method sequence of each session.
+Protocol versions `2025-06-18` and `2025-11-25` (through `initialize`) and the
+stateless `2026-07-28` (`server/discover`) are supported.
+
 ## Desktop app (GUI)
 
 A modern Tauri UI lives in `gui/`:
