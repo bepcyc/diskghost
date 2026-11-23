@@ -39,6 +39,9 @@ pub(crate) struct Batch {
     pub(crate) others: Vec<PathBuf>,
     /// Entries (or this directory itself) that could not be read.
     pub(crate) skipped: u64,
+    /// Bounded (path, reason) pairs behind `skipped`: enough to point a
+    /// report at what was missed without copying a whole tree of names.
+    pub(crate) skips: Vec<(PathBuf, &'static str)>,
 }
 
 /// Threads for a walk with `Options::threads == None`: directory listing is
@@ -464,11 +467,13 @@ fn visit<'s, 'c: 's>(
         aliases: Vec::new(),
         others: Vec::new(),
         skipped: 0,
+        skips: Vec::new(),
     };
     let entries = match std::fs::read_dir(&b.dir) {
         Ok(rd) => rd,
         Err(_) => {
             b.skipped = 1;
+            b.skips.push((b.dir.clone(), "unreadable directory"));
             let _ = ctx.tx.send(b);
             return;
         }
@@ -484,6 +489,9 @@ fn visit<'s, 'c: 's>(
         }
         let Ok(entry) = entry else {
             b.skipped += 1;
+            if b.skips.len() < 64 {
+                b.skips.push((b.dir.clone(), "an entry could not be read"));
+            }
             continue;
         };
         let path = entry.path();
@@ -492,6 +500,9 @@ fn visit<'s, 'c: 's>(
         }
         let Ok(mut ft) = entry.file_type() else {
             b.skipped += 1;
+            if b.skips.len() < 64 {
+                b.skips.push((path, "unreadable file type"));
+            }
             continue;
         };
         // Metadata straight from the listing (free on Windows), or of the
@@ -509,6 +520,9 @@ fn visit<'s, 'c: 's>(
                 }
                 Err(_) => {
                     b.skipped += 1;
+                    if b.skips.len() < 64 {
+                        b.skips.push((path, "unreadable metadata"));
+                    }
                     continue;
                 }
             }
@@ -553,6 +567,9 @@ fn visit<'s, 'c: 's>(
                 Ok(m) => m,
                 Err(_) => {
                     b.skipped += 1;
+                    if b.skips.len() < 64 {
+                        b.skips.push((path, "unreadable metadata"));
+                    }
                     continue;
                 }
             };

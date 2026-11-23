@@ -622,6 +622,9 @@ pub struct Listing {
     /// Entries that could not be listed or stat'ed, or with a name that is
     /// not UTF-8.
     pub skipped: u64,
+    /// A bounded sample of the skipped paths, newest first — enough to
+    /// point a report at what was missed without copying a tree of names.
+    pub skip_paths: Vec<String>,
     /// `find` finished without error: rows not listed are really gone.
     pub complete: bool,
 }
@@ -761,6 +764,7 @@ pub fn enum_remote_live(
         return Ok(Listing {
             files,
             skipped,
+            skip_paths: Vec::new(),
             complete: out.code == 0,
         });
     }
@@ -836,6 +840,7 @@ pub fn enum_remote_live(
     Ok(Listing {
         files,
         skipped,
+        skip_paths: Vec::new(),
         complete,
     })
 }
@@ -1430,8 +1435,13 @@ impl AgentExec<'_> {
                     mtime_ns,
                     ino,
                 });
-            } else if fr.get("skip").is_some() {
+            } else if let Some(skip) = fr.get("skip") {
                 l.skipped += 1;
+                if l.skip_paths.len() < 32 {
+                    if let Some(p) = skip["p"].as_str() {
+                        l.skip_paths.push(p.to_string());
+                    }
+                }
             } else if let Some(end) = fr.get("end") {
                 ended = true;
                 l.complete = end["complete"] == true;

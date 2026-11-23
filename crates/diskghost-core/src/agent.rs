@@ -153,6 +153,17 @@ fn enumerate(req: &Value, out: &mut dyn Write) -> io::Result<()> {
         if failed.is_some() {
             return;
         }
+        for (p, why) in &b.skips {
+            skipped += 1;
+            if let Err(e) = emit(
+                out,
+                &json!({"skip": {"p": p.to_string_lossy(), "why": why}}),
+            ) {
+                failed = Some(e);
+                progress.cancel();
+                return;
+            }
+        }
         for p in b.files.iter().map(|f| &f.path).chain(&b.aliases) {
             let frame = match (std::fs::symlink_metadata(p), p.strip_prefix(root)) {
                 (Ok(m), Ok(rel)) => match rel.to_str() {

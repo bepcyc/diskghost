@@ -777,7 +777,10 @@ fn two_folders_of_one_remote_filesystem_share_one_location_like_a_volume() {
     assert_eq!(sb.root, PathBuf::from("/storage"));
     assert_eq!(location_count(&e), 1);
     let (host, root, _) = loc_row(&e, uuid);
-    assert_eq!((host.as_str(), root.as_str()), ("ssh://dg-test", "/storage"));
+    assert_eq!(
+        (host.as_str(), root.as_str()),
+        ("ssh://dg-test", "/storage")
+    );
     assert_eq!(scan_roots_of(&e, uuid), ["a", "b"]);
     let rows = remote_rows(&e, uuid);
     let paths: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
@@ -830,7 +833,11 @@ fn without_a_usable_filesystem_id_the_uuid_is_host_and_folder() {
         assert_eq!(s.uuid, "ssh://dg-test:/storage", "host {i}");
         let (_, root, _) = loc_row(&e, "ssh://dg-test:/storage");
         assert_eq!(root, "/storage", "host {i}");
-        assert_eq!(scan_roots_of(&e, "ssh://dg-test:/storage"), [""], "host {i}");
+        assert_eq!(
+            scan_roots_of(&e, "ssh://dg-test:/storage"),
+            [""],
+            "host {i}"
+        );
         assert_eq!(remote_rows(&e, "ssh://dg-test:/storage")[0].0, "sub/f.bin");
     }
 }

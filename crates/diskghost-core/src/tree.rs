@@ -1251,6 +1251,7 @@ mod tests {
             aliases: Vec::new(),
             others: Vec::new(),
             skipped: 0,
+            skips: Vec::new(),
         };
         let mut b = Builder {
             tree: ScanTree {

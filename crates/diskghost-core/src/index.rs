@@ -221,6 +221,10 @@ pub struct ScanSummary {
     /// Entries not indexed: unreadable, a path that is not UTF-8, or on
     /// another device than the scanned folder.
     pub skipped: u64,
+    /// A bounded sample of the skipped paths — enough to point a report at
+    /// what coverage was missed, never a whole tree of names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_paths: Vec<String>,
     /// The walk covered the whole subtree. Vanished rows are only dropped
     /// after a complete walk: unreadable or cut-off is not gone.
     pub complete: bool,
@@ -893,6 +897,7 @@ pub(crate) fn remote_scan_with(
         uuid: uuid.clone(),
         root: PathBuf::from(&base),
         skipped: listing.skipped,
+        skipped_paths: listing.skip_paths.clone(),
         algo: Some(algo.as_str().to_string()),
         transport: Some(transport.to_string()),
         agent_note,
@@ -1139,6 +1144,12 @@ pub(crate) fn scan_with(
             )
             .map_err(db_err)?;
         let follow = walk_opts.follow_symlinks;
+        let note_skip = |sum: &mut ScanSummary, path: &Path| {
+            sum.skipped += 1;
+            if sum.skipped_paths.len() < 32 {
+                sum.skipped_paths.push(path.to_string_lossy().into_owned());
+            }
+        };
         let mut record = |path: &Path, sum: &mut ScanSummary| -> rusqlite::Result<()> {
             let meta = if follow {
                 std::fs::metadata(path)
@@ -1146,7 +1157,7 @@ pub(crate) fn scan_with(
                 std::fs::symlink_metadata(path)
             };
             let Ok(meta) = meta else {
-                sum.skipped += 1;
+                note_skip(sum, path);
                 return Ok(());
             };
             let st = stat_of(&meta);
@@ -1157,7 +1168,7 @@ pub(crate) fn scan_with(
             // A followed link may lead off the volume; a non-UTF-8 name cannot
             // be stored losslessly in a TEXT column. Neither is indexed.
             let (Some(rel), true) = (rel, st.dev == root_dev) else {
-                sum.skipped += 1;
+                note_skip(sum, path);
                 return Ok(());
             };
             sum.seen += 1;
@@ -1189,6 +1200,11 @@ pub(crate) fn scan_with(
         let mut unreadable = 0u64;
         let _ = walk(&root, &walk_opts, progress, |b| {
             unreadable += b.skipped;
+            for (p, _) in &b.skips {
+                if sum.skipped_paths.len() < 32 {
+                    sum.skipped_paths.push(p.to_string_lossy().into_owned());
+                }
+            }
             for dir in &b.bound {
                 match dir
                     .strip_prefix(&vol.mount_point)
@@ -1876,6 +1892,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(gen, seen, "the surviving row is marked seen by this scan");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_dir_is_named_in_the_summary() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("unreadable");
+        let t = d.join("t");
+        write(&t.join("a"), b"a");
+        write(&t.join("locked").join("inside"), b"x");
+        std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o0)).unwrap();
+        let idx = open_db(&d);
+        let (s, _) = scan(&idx, &t);
+        std::fs::set_permissions(t.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!s.complete);
+        assert!(s.skipped > 0);
+        assert!(
+            s.skipped_paths.iter().any(|p| p.ends_with("locked")),
+            "the skipped dir is named: {:?}",
+            s.skipped_paths
+        );
     }
 
     #[test]
