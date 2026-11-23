@@ -333,6 +333,11 @@ fn parse_target(s: &str) -> Result<Target, ToolError> {
                 "{s:?}: the remote path must be absolute — write ssh://{host}//absolute/path"
             )));
         }
+        if !diskghost_core::remote::shell_safe(&path) {
+            return Err(ToolError::invalid(format!(
+                "{s:?}: a backslash in a remote path cannot be passed safely to the remote shell"
+            )));
+        }
         return Ok(Target::Remote {
             url: s.to_string(),
             host,
@@ -725,11 +730,21 @@ fn start_scan(ctx: &Arc<Ctx>, args: &Value) -> R {
             }
         }
         (None, Some(t)) => {
+            // "Inside a location" is judged lexically, so a `..` component
+            // (`/indexed/../elsewhere`) must not pass it; a remote folder,
+            // like a local one, must lie under that location's root.
+            let inside = |p: &Path, root: &Path| {
+                !p.components().any(|c| c == std::path::Component::ParentDir) && p.starts_with(root)
+            };
             let known = status.iter().any(|l| match t {
                 Target::Local(p) => {
-                    !diskghost_core::remote::is_remote_host(&l.host) && p.starts_with(&l.root)
+                    !diskghost_core::remote::is_remote_host(&l.host) && inside(p, &l.root)
                 }
-                Target::Remote { host, .. } => l.host == format!("ssh://{host}"),
+                Target::Remote { url, host } => {
+                    l.host == format!("ssh://{host}")
+                        && parse_ssh_url(url)
+                            .is_ok_and(|(_, path)| inside(Path::new(&path), &l.root))
+                }
             });
             if !known {
                 return Err(ToolError::new(

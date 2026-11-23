@@ -203,11 +203,20 @@ fn walk_with_remote(
     (Engine::Walk, fallback)
 }
 
+/// `/proc/self/mountinfo` as text. Read as bytes and decoded lossily: the
+/// kernel escapes only space, tab, newline and backslash, so one mountpoint
+/// with a non-UTF-8 name would make `read_to_string` fail for the whole
+/// table — and every network mount would silently stop being recognised.
+#[cfg(unix)]
+fn read_mountinfo() -> std::io::Result<String> {
+    std::fs::read("/proc/self/mountinfo").map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 /// Device ids of the mounted network and FUSE filesystems, read from the
 /// kernel's mount table — no call ever reaches the (possibly hung) share.
 #[cfg(target_os = "linux")]
 fn remote_devices() -> HashSet<u64> {
-    std::fs::read_to_string("/proc/self/mountinfo")
+    read_mountinfo()
         .map(|info| {
             info.lines()
                 .filter_map(parse_mountinfo_line)
@@ -392,7 +401,7 @@ fn is_storage_fs(fstype: &str) -> bool {
 /// `/proc/self/mountinfo`; empty where that table cannot be read).
 #[cfg(unix)]
 pub fn local_mounts() -> Vec<LocalMount> {
-    std::fs::read_to_string("/proc/self/mountinfo")
+    read_mountinfo()
         .map(|info| local_mounts_from(&info))
         .unwrap_or_default()
 }
@@ -403,7 +412,7 @@ pub fn local_mounts() -> Vec<LocalMount> {
 /// subvolume). Empty where the table cannot be read.
 #[cfg(unix)]
 pub fn mount_table() -> Vec<MountEntry> {
-    std::fs::read_to_string("/proc/self/mountinfo")
+    read_mountinfo()
         .map(|info| info.lines().filter_map(parse_mountinfo_entry).collect())
         .unwrap_or_default()
 }

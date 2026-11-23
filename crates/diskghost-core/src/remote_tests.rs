@@ -289,6 +289,21 @@ fn the_root_is_resolved_with_its_mountpoint_in_the_same_call() {
     assert_eq!(resolve_root(&o, &caps(&o), "/storage").unwrap().mount, None);
 }
 
+#[test]
+fn a_root_with_a_newline_is_refused_not_cut_short() {
+    // `pwd -P` is line-framed: "/storage/a\nb" must not resolve to the
+    // different folder "/storage/a".
+    let h = FakeHost::linux().with_mount(Some("/storage"));
+    h.put("/storage/a/x", b"x", T0);
+    h.put("/storage/a\nb/y", b"y", T0);
+    let c = caps(&h);
+    assert!(resolve_root(&h, &c, "/storage/a\nb").is_err());
+    assert_eq!(
+        resolve_root(&h, &c, "/storage/a").unwrap().root,
+        "/storage/a"
+    );
+}
+
 // ---- hashing ---------------------------------------------------------
 
 #[test]

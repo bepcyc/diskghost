@@ -269,6 +269,16 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Whether `s` survives [`shell_quote`] under *any* login shell sshd may
+/// hand the command to. POSIX shells take single quotes literally, but fish
+/// reads `\'` and `\\` as escapes inside them, so a name with a backslash
+/// could end the quoting early and run the rest as a command. The shell
+/// tier never sends such a path (it is skipped / unhashed); the agent tier
+/// frames paths as JSON and is unaffected.
+pub fn shell_safe(s: &str) -> bool {
+    !s.contains('\\')
+}
+
 /// Split `ssh://host/path` into (host, path). The path is everything after
 /// the host's `/`: `ssh://h//storage` is `/storage`, `ssh://h/data` is
 /// `data` relative to the remote home, `ssh://h` and `ssh://h/` are the
@@ -545,10 +555,31 @@ pub fn resolve_root(x: &dyn RemoteExec, caps: &Capabilities, path: &str) -> io::
         StatFlavor::Bsd => "bsd",
         StatFlavor::None => "none",
     };
+    if !shell_safe(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("remote folder {path:?}: a backslash cannot reach the remote shell safely"),
+        ));
+    }
     let out = run(x, &["sh", "-c", RESOLVE_SCRIPT, "sh", path, flavor])?;
     let text = String::from_utf8(out.stdout)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "remote path is not UTF-8"))?;
-    let mut lines = text.lines();
+    // The answer is line-framed, so a canonical path with a newline in it
+    // would come back cut at that newline — a different folder. The script
+    // always prints exactly three lines and the third always starts with
+    // `mount ` or `df `; anything else means the root spilled over lines.
+    let all: Vec<&str> = text.lines().collect();
+    if out.code == 0
+        && !all
+            .get(2)
+            .is_some_and(|l| l.starts_with("mount ") || l.starts_with("df "))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("remote folder {path:?}: its canonical path contains a newline"),
+        ));
+    }
+    let mut lines = all.into_iter();
     let root = lines.next().unwrap_or("").to_string();
     if out.code != 0 || !root.starts_with('/') {
         return Err(io::Error::new(
@@ -787,7 +818,13 @@ pub fn enum_remote_live(
             .ok()
             .and_then(|p| relative(p, root).map(|r| (p.to_string(), r)))
         {
-            Some(n) => names.push(n),
+            Some(n) if shell_safe(&n.0) => names.push(n),
+            Some(_) => {
+                // Cannot be stat'ed through the shell (see `shell_safe`):
+                // not listed, so nothing may count as vanished.
+                skipped += 1;
+                complete = false;
+            }
             None => skipped += 1,
         }
     }
@@ -883,18 +920,24 @@ pub fn hash_remote(
     paths: &[String],
 ) -> io::Result<Vec<Option<Vec<u8>>>> {
     let tool = caps.hash.tool();
-    let mut out = Vec::with_capacity(paths.len());
-    for range in batches(paths) {
+    // Only shell-safe paths are sent; the rest stay `None` (unreadable).
+    let send: Vec<usize> = (0..paths.len())
+        .filter(|&i| shell_safe(&paths[i]))
+        .collect();
+    let sent: Vec<&str> = send.iter().map(|&i| paths[i].as_str()).collect();
+    let mut out = vec![None; paths.len()];
+    for range in batches(&sent) {
         let mut argv = vec!["sh", "-c", HASH_SCRIPT, "sh", tool];
-        argv.extend(paths[range.clone()].iter().map(String::as_str));
+        argv.extend(&sent[range.clone()]);
         let res = run(x, &argv)?;
         let recs = records(&res.stdout);
         if recs.len() != range.len() {
             // Misaligned output: trust none of it.
-            out.extend(range.map(|_| None));
             continue;
         }
-        out.extend(recs.iter().map(|r| parse_digest(r, caps.hash)));
+        for (r, &i) in recs.iter().zip(&send[range]) {
+            out[i] = parse_digest(r, caps.hash);
+        }
     }
     Ok(out)
 }
@@ -915,7 +958,7 @@ fn parse_digest(rec: &[u8], algo: HashAlgo) -> Option<Vec<u8>> {
 /// Whether `root` is reachable now: the host answers and the folder exists.
 /// Never panics; any failure is "offline".
 pub fn remote_online(x: &dyn RemoteExec, root: &str) -> bool {
-    run(x, &["test", "-d", root]).is_ok_and(|o| o.code == 0)
+    shell_safe(root) && run(x, &["test", "-d", root]).is_ok_and(|o| o.code == 0)
 }
 
 /// [`remote_online`] over real ssh, for a `host` column (`ssh://h`).

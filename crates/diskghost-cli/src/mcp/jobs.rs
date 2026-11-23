@@ -204,49 +204,48 @@ impl Jobs {
         work: Box<dyn FnOnce(&Progress) -> JobResult + Send>,
     ) {
         // Wait for the writer turn; a cancel while queued ends the job there.
-        {
-            let mut g = self.lock();
-            loop {
-                if progress.cancelled() {
-                    g.queue.retain(|&i| i != idx);
-                    let job = &mut g.jobs[idx];
-                    job.state = State::Cancelled;
-                    job.finished = Some(Instant::now());
-                    if let Some(reg) = &self.registry {
-                        let _ = reg.finish(
-                            &job.id,
-                            "cancelled",
-                            "queued",
-                            0,
-                            0,
-                            0,
-                            0,
-                            None,
-                            None,
-                            now_ms(),
-                        );
-                    }
-                    self.changed.notify_all();
-                    return;
+        // Registry writes happen outside the jobs lock (a write can wait out
+        // SQLite's busy timeout) and *before* the in-memory state changes, so
+        // a client that saw a transition here never reads the older state
+        // from another process. This thread alone writes this job's
+        // transitions, so their order holds.
+        let id = self.lock().jobs[idx].id.clone();
+        let mut g = self.lock();
+        loop {
+            if progress.cancelled() {
+                drop(g);
+                if let Some(reg) = &self.registry {
+                    let _ =
+                        reg.finish(&id, "cancelled", "queued", 0, 0, 0, 0, None, None, now_ms());
                 }
-                if g.active.is_none() && g.queue.front() == Some(&idx) {
-                    g.queue.pop_front();
-                    g.active = Some(idx);
-                    let job = &mut g.jobs[idx];
-                    job.state = State::Running;
-                    job.started = Some(Instant::now());
-                    if let Some(reg) = &self.registry {
-                        let _ = reg.mark_running(&job.id, now_ms());
-                    }
-                    self.changed.notify_all();
-                    break;
-                }
-                g = self
-                    .changed
-                    .wait_timeout(g, Duration::from_millis(100))
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
+                let mut g = self.lock();
+                g.queue.retain(|&i| i != idx);
+                let job = &mut g.jobs[idx];
+                job.state = State::Cancelled;
+                job.finished = Some(Instant::now());
+                self.changed.notify_all();
+                return;
             }
+            if g.active.is_none() && g.queue.front() == Some(&idx) {
+                // Take the turn now; publish `running` once the registry has it.
+                g.queue.pop_front();
+                g.active = Some(idx);
+                drop(g);
+                if let Some(reg) = &self.registry {
+                    let _ = reg.mark_running(&id, now_ms());
+                }
+                let mut g = self.lock();
+                let job = &mut g.jobs[idx];
+                job.state = State::Running;
+                job.started = Some(Instant::now());
+                self.changed.notify_all();
+                break;
+            }
+            g = self
+                .changed
+                .wait_timeout(g, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
         let end = Instant::now() + hold;
         while Instant::now() < end && !progress.cancelled() {
@@ -260,42 +259,47 @@ impl Jobs {
                     .unwrap_or_else(|_| Err(ToolError::new("internal", "the job panicked"))),
             )
         };
-        let mut g = self.lock();
-        let job = &mut g.jobs[idx];
-        job.finished = Some(Instant::now());
-        match out {
-            None => job.state = State::Cancelled,
-            Some(Ok(v)) => {
-                job.state = if progress.cancelled() {
+        let (state, result, error) = match out {
+            None => (State::Cancelled, None, None),
+            Some(Ok(v)) => (
+                if progress.cancelled() {
                     State::Cancelled
                 } else {
                     State::Done
-                };
-                job.result = Some(v);
-            }
-            Some(Err(e)) if e.code == "cancelled" => job.state = State::Cancelled,
-            Some(Err(e)) => {
-                job.state = State::Failed;
-                job.error = Some(e);
-            }
-        }
+                },
+                Some(v),
+                None,
+            ),
+            Some(Err(e)) if e.code == "cancelled" => (State::Cancelled, None, None),
+            Some(Err(e)) => (State::Failed, None, Some(e)),
+        };
+        let finished = Instant::now();
+        // The registry row is finished *before* the in-memory state turns
+        // final, so a client that saw this job end here never reads it
+        // still live from another process; and it is written outside the
+        // jobs lock (a write can wait out SQLite's busy timeout). A beat
+        // collected while the job ran cannot overwrite it: `beat` only
+        // updates rows still in state 'running'.
         if let Some(reg) = &self.registry {
             let _ = reg.finish(
-                &job.id,
-                job.state.name(),
-                phase_name(&job.progress),
-                job.progress.files(),
-                job.progress.bytes(),
-                job.progress.total_files(),
-                job.progress.total_bytes(),
-                job.result.as_ref().map(Value::to_string).as_deref(),
-                job.error
-                    .as_ref()
-                    .map(|e| e.to_json().to_string())
-                    .as_deref(),
+                &id,
+                state.name(),
+                phase_name(progress),
+                progress.files(),
+                progress.bytes(),
+                progress.total_files(),
+                progress.total_bytes(),
+                result.as_ref().map(Value::to_string).as_deref(),
+                error.as_ref().map(|e| e.to_json().to_string()).as_deref(),
                 now_ms(),
             );
         }
+        let mut g = self.lock();
+        let job = &mut g.jobs[idx];
+        job.finished = Some(finished);
+        job.state = state;
+        job.result = result;
+        job.error = error;
         g.active = None;
         self.changed.notify_all();
     }
@@ -346,13 +350,21 @@ impl Jobs {
     }
 
     pub fn list(&self) -> Vec<Value> {
-        let g = self.lock();
-        let mut out: Vec<Value> = g.jobs.iter().map(Jobs::snapshot).collect();
+        // Snapshot own jobs under the lock, then read the registry without
+        // it: a registry read can wait out SQLite's busy timeout, and the
+        // drivers and `job_status` must never stall on that.
+        let (mut out, own): (Vec<Value>, std::collections::HashSet<String>) = {
+            let g = self.lock();
+            (
+                g.jobs.iter().map(Jobs::snapshot).collect(),
+                g.jobs.iter().map(|j| j.id.clone()).collect(),
+            )
+        };
         if let Some(reg) = &self.registry {
             if let Ok(rows) = reg.list(now_ms()) {
                 for row in rows {
                     // This process's own rows are fresher in memory.
-                    if g.jobs.iter().any(|j| j.id == row.job_id) {
+                    if own.contains(&row.job_id) {
                         continue;
                     }
                     if let Ok(v) = serde_json::to_value(row) {
@@ -367,7 +379,8 @@ impl Jobs {
     /// Whether `id` names another process's job (visible in the registry but
     /// not started by this server — e.g. for an honest `cancel_job` answer).
     pub fn foreign(&self, id: &str) -> bool {
-        if self.lock().jobs.iter().any(|j| j.id == id) {
+        let own = self.lock().jobs.iter().any(|j| j.id == id);
+        if own {
             return false;
         }
         self.registry

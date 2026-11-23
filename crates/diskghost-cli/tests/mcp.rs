@@ -402,6 +402,7 @@ fn mcp_writer_jobs_are_serialized_and_queued() {
 
 // ------------------------------------------------ shared job registry
 
+#[cfg(unix)]
 #[test]
 fn mcp_jobs_are_visible_across_server_processes() {
     // The shared job registry (index-jobs.db): a job queued on server A is
