@@ -9,10 +9,13 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(unix)]
+use serde_json::Value;
 
 // ---------------------------------------------------------------- protocol
 
