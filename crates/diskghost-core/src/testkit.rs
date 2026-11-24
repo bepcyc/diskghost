@@ -3,7 +3,7 @@
 //! Tests create and delete files only inside their own temp directory —
 //! never anywhere else (owner's hard safety rule).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -67,6 +67,51 @@ pub(crate) struct Estate {
     /// Locations that pretend to be ZFS datasets (name → dataset), and
     /// what the fake `zfs` answers for them.
     pub(crate) zfs: Mutex<FakeZfs>,
+    /// Locations that pretend to be XFS, and what the fake BULKSTAT does.
+    pub(crate) xfs: Mutex<FakeXfs>,
+}
+
+/// BULKSTAT in memory: every inode under the fake volume as `lstat` sees
+/// it now (real inode change times), unless a stale snapshot or an error
+/// is set; and whether the process "has" CAP_SYS_ADMIN.
+#[derive(Default)]
+pub(crate) struct FakeXfs {
+    pub(crate) volumes: HashSet<String>,
+    pub(crate) cap: bool,
+    pub(crate) errno: Option<i32>,
+    /// Answer with this (taken earlier by [`Estate::bulkstat_now`]).
+    pub(crate) stale: Option<HashMap<u64, crate::xfs::InodeInfo>>,
+    pub(crate) calls: usize,
+}
+
+/// Every inode under `root` (and `root` itself), as BULKSTAT would give.
+pub(crate) fn inodes_under(root: &Path) -> HashMap<u64, crate::xfs::InodeInfo> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = HashMap::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(p) = todo.pop() {
+        let Ok(m) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        let st = crate::index::stat_of(&m);
+        out.insert(
+            m.ino(),
+            crate::xfs::InodeInfo {
+                ino: m.ino(),
+                size: m.len(),
+                mtime_ns: st.mtime_ns,
+                ctime_ns: st.ctime_ns,
+                mode: m.mode(),
+                nlink: m.nlink() as u32,
+            },
+        );
+        if m.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                todo.extend(rd.flatten().map(|e| e.path()));
+            }
+        }
+    }
+    out
 }
 
 /// A `zfs` command in memory: snapshots and guid of each dataset, the
@@ -96,6 +141,7 @@ impl Estate {
             hosts_down: Mutex::new(HashSet::new()),
             ino_unstable: Mutex::new(HashSet::new()),
             zfs: Mutex::new(FakeZfs::default()),
+            xfs: Mutex::new(FakeXfs::default()),
         }
     }
 
@@ -111,6 +157,7 @@ impl Estate {
         let base = self.dir.clone();
         let unstable = &self.ino_unstable;
         let zfs_state = &self.zfs;
+        let xfs_state = &self.xfs;
         let volume = move |p: &Path| -> io::Result<Volume> {
             let rel = p.strip_prefix(&base).map_err(io::Error::other)?;
             let top = rel
@@ -123,6 +170,11 @@ impl Estate {
                 mount_point: base.join(&name),
                 ino_stable: !unstable.lock().unwrap().contains(&name),
                 zfs_dataset: zfs_state.lock().unwrap().datasets.get(&name).cloned(),
+                fstype: if xfs_state.lock().unwrap().volumes.contains(&name) {
+                    "xfs".into()
+                } else {
+                    String::new()
+                },
             })
         };
         // Like the real check: the folder is there *and* holds this
@@ -174,9 +226,23 @@ impl Estate {
                 .copied()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not in the snapshot"))
         };
+        let cap = || self.xfs.lock().unwrap().cap;
+        let bulkstat = |mount: &Path,
+                        keep: &dyn Fn(&crate::xfs::InodeInfo) -> bool|
+         -> io::Result<HashMap<u64, crate::xfs::InodeInfo>> {
+            let mut x = self.xfs.lock().unwrap();
+            x.calls += 1;
+            if let Some(e) = x.errno {
+                return Err(io::Error::from_raw_os_error(e));
+            }
+            let all = x.stale.clone().unwrap_or_else(|| inodes_under(mount));
+            Ok(all.into_iter().filter(|(_, i)| keep(i)).collect())
+        };
         let probe = Probe {
             zfs: &zfs,
             snap_nlink: &snap_nlink,
+            cap_sys_admin: &cap,
+            bulkstat: &bulkstat,
             remote_online: &remote_online,
             volume: &volume,
             online: &online,

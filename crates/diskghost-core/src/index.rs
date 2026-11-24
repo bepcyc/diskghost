@@ -96,7 +96,7 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
@@ -191,6 +191,19 @@ ALTER TABLE locations ADD COLUMN zfs_ref_guid TEXT;
 ALTER TABLE locations ADD COLUMN zfs_ref_creation INTEGER;
 ALTER TABLE locations ADD COLUMN zfs_ds_guid TEXT;
 ALTER TABLE locations ADD COLUMN zfs_ref_root TEXT;
+",
+    // v8: the XFS inode delta — every folder under the scan folder of the
+    // last complete scan (`inode_ref_root`) with its inode and its inode
+    // change time from the BULKSTAT pass taken before that scan listed it.
+    r"
+CREATE TABLE dirs (
+    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    ino         INTEGER NOT NULL,
+    ctime_ns    INTEGER,
+    PRIMARY KEY (location_id, path)
+) WITHOUT ROWID;
+ALTER TABLE locations ADD COLUMN inode_ref_root TEXT;
 ",
 ];
 
@@ -724,6 +737,9 @@ pub(crate) struct Volume {
     pub(crate) ino_stable: bool,
     /// The dataset name when the volume is a ZFS filesystem.
     pub(crate) zfs_dataset: Option<String>,
+    /// Filesystem type as the mount table names it (`xfs`, `ext4`, …);
+    /// empty when unknown.
+    pub(crate) fstype: String,
 }
 
 /// This process's mount table (empty where there is none).
@@ -776,6 +792,7 @@ fn volume(path: &Path) -> io::Result<Volume> {
         mount_point: top.to_path_buf(),
         ino_stable: true,
         zfs_dataset: None,
+        fstype: String::new(),
     })
 }
 
@@ -826,6 +843,7 @@ fn resolve_volume(
         mount_point: m.mount_point.clone(),
         ino_stable: inode_numbers_stable(&m.fstype),
         zfs_dataset: (m.fstype == "zfs").then(|| m.source.clone()),
+        fstype: m.fstype.clone(),
     })
 }
 
@@ -957,7 +975,19 @@ pub(crate) struct Probe<'a> {
     pub(crate) zfs: &'a dyn Fn(&[String]) -> io::Result<String>,
     /// Link count of a file inside a snapshot (`<mnt>/.zfs/snapshot/…`).
     pub(crate) snap_nlink: &'a dyn Fn(&Path) -> io::Result<u64>,
+    /// Whether this process has CAP_SYS_ADMIN (XFS BULKSTAT needs it).
+    pub(crate) cap_sys_admin: &'a dyn Fn() -> bool,
+    /// The inodes of the XFS filesystem mounted at a path that `keep`
+    /// accepts, from BULKSTAT (see [`crate::xfs`]).
+    pub(crate) bulkstat: &'a BulkstatFn<'a>,
 }
+
+/// [`Probe::bulkstat`].
+pub(crate) type BulkstatFn<'a> = dyn Fn(
+        &Path,
+        &dyn Fn(&crate::xfs::InodeInfo) -> bool,
+    ) -> io::Result<HashMap<u64, crate::xfs::InodeInfo>>
+    + 'a;
 
 fn no_read(_: &Path) {}
 
@@ -972,6 +1002,8 @@ impl Probe<'static> {
         remote_online: &crate::remote::ssh_online,
         zfs: &crate::zfs::run_zfs,
         snap_nlink: &snap_nlink,
+        cap_sys_admin: &crate::xfs::has_cap_sys_admin,
+        bulkstat: &crate::xfs::bulkstat,
     };
 }
 
@@ -1337,6 +1369,12 @@ pub(crate) fn scan_with(
     if let ZfsPlan::Walk(why) = &plan {
         sum.delta_note = Some(why.clone());
     }
+    // XFS inode delta (only with CAP_SYS_ADMIN already held): the BULKSTAT
+    // pass runs here, before anything is listed.
+    let iplan = inode_plan(&tx, loc, &vol, &prefix, opts, probe)?;
+    if let InodePlan::Walk(why) | InodePlan::Establish { why, .. } = &iplan {
+        add_note(&mut sum, why.clone());
+    }
     // A location is one volume: never cross into another mount. The MFT
     // engine is Windows-only and yields no inode identity.
     let walk_opts = Options {
@@ -1346,6 +1384,8 @@ pub(crate) fn scan_with(
     };
     // Folders listed but not entered: other filesystems below the root.
     let mut bound: Vec<String> = Vec::new();
+    // Every folder a walk listed (the XFS folder table is made from them).
+    let mut dirs_seen: Vec<PathBuf> = Vec::new();
     // Racy rows re-read by this scan, with the sample they had: compared
     // after sampling, so a change `stat` missed is counted, not guessed.
     let mut racy_before: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1484,6 +1524,25 @@ pub(crate) fn scan_with(
                     &mut sum,
                 )?;
             }
+            _ if matches!(iplan, InodePlan::Delta { .. }) => {
+                sum.delta = Some("xfs bulkstat: listed only folders whose inode changed".into());
+                unreadable += apply_inode_delta(
+                    &tx,
+                    &iplan,
+                    &DeltaCtx {
+                        loc,
+                        gen,
+                        prefix: &prefix,
+                        vol: &vol,
+                        walk_opts: &walk_opts,
+                        progress,
+                    },
+                    root_dev,
+                    &mut record,
+                    &mut sum,
+                    &mut dirs_seen,
+                )?;
+            }
             _ => {
                 unreadable += walk_into(
                     &root,
@@ -1493,6 +1552,7 @@ pub(crate) fn scan_with(
                     &mut record,
                     &mut sum,
                     &mut bound,
+                    &mut dirs_seen,
                 )?;
             }
         }
@@ -1505,7 +1565,7 @@ pub(crate) fn scan_with(
     // and never under a mount the walk listed without entering (a nested
     // btrfs subvolume shares this location but is not walked from here).
     // (A delta drops what it saw removed itself; this is the walk's rule.)
-    let delta = matches!(plan, ZfsPlan::Delta { .. });
+    let delta = matches!(plan, ZfsPlan::Delta { .. }) || matches!(iplan, InodePlan::Delta { .. });
     if sum.complete && !delta {
         sum.vanished = drop_vanished(&tx, loc, gen, &prefix, &bound).map_err(db_err)? as u64;
     }
@@ -1528,6 +1588,15 @@ pub(crate) fn scan_with(
         start_ns,
         probe,
         &mut sum,
+    )?;
+    record_inode_ref(
+        &tx,
+        loc,
+        &prefix,
+        &iplan,
+        sum.complete,
+        &dirs_seen,
+        root_dev,
     )?;
     tx.commit().map_err(db_err)?;
 
@@ -1956,6 +2025,7 @@ fn apply_zfs_delta(
                     record,
                     sum,
                     &mut bound,
+                    &mut Vec::new(),
                 )?;
                 if unreadable == before && !cx.progress.cancelled() {
                     sum.vanished +=
@@ -2088,6 +2158,7 @@ fn add_note(sum: &mut ScanSummary, note: String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Walk `dir` (on the scan's volume) into `record`: every name of every
 /// file; folders listed but not entered go to `bound`. Returns how many
 /// entries could not be read.
@@ -2099,11 +2170,13 @@ fn walk_into(
     record: &mut Recorder,
     sum: &mut ScanSummary,
     bound: &mut Vec<String>,
+    dirs: &mut Vec<PathBuf>,
 ) -> io::Result<u64> {
     let mut unreadable = 0u64;
     let mut failed: Option<rusqlite::Error> = None;
     let _ = walk(dir, walk_opts, progress, |b| {
         unreadable += b.skipped;
+        dirs.push(b.dir.clone());
         for (p, _) in &b.skips {
             if sum.skipped_paths.len() < 32 {
                 sum.skipped_paths.push(p.to_string_lossy().into_owned());
@@ -2137,6 +2210,490 @@ fn walk_into(
     match failed {
         Some(e) => Err(db_err(e)), // the transaction rolls back on drop
         None => Ok(unreadable),
+    }
+}
+
+/// How an XFS scan learns what changed under its folder.
+enum InodePlan {
+    /// Not XFS: nothing to say.
+    Off,
+    /// Walk, and say why (no capability, BULKSTAT failed, options).
+    Walk(String),
+    /// Walk, then record the folder table: `inodes` holds every folder of
+    /// the filesystem as BULKSTAT saw it before the walk.
+    Establish {
+        why: String,
+        inodes: HashMap<u64, crate::xfs::InodeInfo>,
+    },
+    /// List only folders whose inode changed: `inodes` holds every folder
+    /// and every inode a row under the scan folder names.
+    Delta {
+        inodes: HashMap<u64, crate::xfs::InodeInfo>,
+    },
+}
+
+/// Decide whether this scan may use the XFS inode delta.
+fn inode_plan(
+    tx: &Connection,
+    loc: i64,
+    vol: &Volume,
+    prefix: &str,
+    opts: &Options,
+    probe: &Probe,
+) -> io::Result<InodePlan> {
+    if vol.fstype != "xfs" {
+        return Ok(InodePlan::Off);
+    }
+    if !opts.exclude.is_empty() || opts.max_depth.is_some() || opts.follow_symlinks {
+        return Ok(InodePlan::Walk(
+            "xfs: the inode delta works without --exclude, --max-depth and --follow-symlinks; \
+             walked"
+                .into(),
+        ));
+    }
+    if !(probe.cap_sys_admin)() {
+        return Ok(InodePlan::Walk(
+            "xfs: the inode delta reads BULKSTAT, which needs CAP_SYS_ADMIN; this process has \
+             none (diskghost is never given it), so it walked"
+                .into(),
+        ));
+    }
+    let ref_root: Option<String> = tx
+        .query_row(
+            "SELECT inode_ref_root FROM locations WHERE id = ?1",
+            [loc],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let have_table = ref_root.as_deref() == Some(prefix);
+    let mut want: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    if have_table {
+        for sql in [
+            "SELECT path, ino FROM files WHERE location_id = ?1 AND ino <> 0",
+            "SELECT path, ino FROM dirs WHERE location_id = ?1",
+        ] {
+            let mut st = tx.prepare(sql).map_err(db_err)?;
+            let rows = st
+                .query_map([loc], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(db_err)?;
+            for r in rows {
+                let (path, ino) = r.map_err(db_err)?;
+                if in_prefix(&path, prefix) {
+                    want.insert(ino as u64);
+                }
+            }
+        }
+    }
+    let keep = |i: &crate::xfs::InodeInfo| i.is_dir() || want.contains(&i.ino);
+    let inodes = match (probe.bulkstat)(&vol.mount_point, &keep) {
+        Ok(m) => m,
+        // EPERM in a user namespace, ENOTTY/EINVAL on an old kernel: walk.
+        Err(e) => {
+            return Ok(InodePlan::Walk(format!(
+                "xfs: BULKSTAT failed ({e}); walked"
+            )))
+        }
+    };
+    Ok(if have_table {
+        InodePlan::Delta { inodes }
+    } else {
+        InodePlan::Establish {
+            why: "xfs: no folder table from a complete scan of this folder yet; walked, and \
+                  recorded one"
+                .into(),
+            inodes,
+        }
+    })
+}
+
+/// Rows of `rel` and everything under it, files and folders. Index rows only.
+fn delete_under(tx: &Connection, loc: i64, rel: &str) -> rusqlite::Result<usize> {
+    let mut n = 0;
+    for t in ["files", "dirs"] {
+        let sql = format!(
+            "DELETE FROM {t} WHERE location_id = ?1 AND (?2 = '' OR path = ?2 \
+             OR substr(path, 1, length(?2) + 1) = ?2 || '/')"
+        );
+        let k = tx.execute(&sql, params![loc, rel])?;
+        if t == "files" {
+            n += k;
+        }
+    }
+    Ok(n)
+}
+
+/// The folder part of a relative path ('' for the mountpoint's own entries).
+fn parent_rel(rel: &str) -> &str {
+    rel.rfind('/').map_or("", |i| &rel[..i])
+}
+
+/// The `Stat` a BULKSTAT record stands for, as `stat_of` would make it.
+fn stat_of_inode(i: &crate::xfs::InodeInfo, dev: u64) -> Stat {
+    Stat {
+        size: i.size,
+        mtime_ns: i.mtime_ns,
+        dev,
+        ino: i.ino,
+        ctime_ns: i.ctime_ns,
+    }
+}
+
+/// Bring rows under the scan folder up to date from BULKSTAT: a folder
+/// whose inode is gone or whose inode change time differs from the folder
+/// table was changed (an entry was added, removed or renamed in it) and is
+/// listed again — its files through the scan's own `record`, a subfolder
+/// that is new or another inode walked whole, entries gone dropped. Every
+/// other row is compared with its inode's BULKSTAT record through the same
+/// `record` (the walk's predicate). Returns entries that could not be read.
+#[allow(clippy::too_many_arguments)]
+fn apply_inode_delta(
+    tx: &Connection,
+    plan: &InodePlan,
+    cx: &DeltaCtx,
+    root_dev: u64,
+    record: &mut Recorder,
+    sum: &mut ScanSummary,
+    dirs_seen: &mut Vec<PathBuf>,
+) -> io::Result<u64> {
+    let InodePlan::Delta { inodes } = plan else {
+        return Ok(0);
+    };
+    let mount = &cx.vol.mount_point;
+    let mut unreadable = 0u64;
+    let skip = |sum: &mut ScanSummary, p: &Path| {
+        if sum.skipped_paths.len() < 32 {
+            sum.skipped_paths.push(p.to_string_lossy().into_owned());
+        }
+    };
+    // The folder table under the scan folder.
+    let mut table: HashMap<String, (i64, Option<i64>)> = HashMap::new();
+    {
+        let mut st = tx
+            .prepare("SELECT path, ino, ctime_ns FROM dirs WHERE location_id = ?1")
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([cx.loc], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get(2)?)))
+            })
+            .map_err(db_err)?;
+        for r in rows {
+            let (path, v) = r.map_err(db_err)?;
+            if in_prefix(&path, cx.prefix) {
+                table.insert(path, v);
+            }
+        }
+    }
+    let changed = |ino: i64, ctime: Option<i64>| match inodes.get(&(ino as u64)) {
+        Some(i) if i.is_dir() => i.ctime_ns.map(to_sql) != ctime || ctime.is_none(),
+        _ => true,
+    };
+    let mut dirty: Vec<String> = table
+        .iter()
+        .filter(|(_, (ino, ct))| changed(*ino, *ct))
+        .map(|(p, _)| p.clone())
+        .collect();
+    dirty.sort();
+    let dirty_set: std::collections::HashSet<String> = dirty.iter().cloned().collect();
+    // Subtrees walked whole (new or replaced folders): nothing below needs
+    // another look.
+    let mut walked: Vec<String> = Vec::new();
+    let under_walked = |walked: &[String], rel: &str| walked.iter().any(|w| in_prefix(rel, w));
+    let mut set_ctime = tx
+        .prepare("UPDATE dirs SET ctime_ns = ?3 WHERE location_id = ?1 AND path = ?2")
+        .map_err(db_err)?;
+    for d in &dirty {
+        if cx.progress.cancelled() {
+            break;
+        }
+        if under_walked(&walked, d) {
+            continue;
+        }
+        let abs = mount.join(d);
+        let (stored_ino, _) = table[d];
+        let meta = match std::fs::symlink_metadata(&abs) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                sum.vanished += delete_under(tx, cx.loc, d).map_err(db_err)? as u64;
+                continue;
+            }
+            Err(_) => {
+                unreadable += 1;
+                skip(sum, &abs);
+                continue;
+            }
+        };
+        let st = stat_of(&meta);
+        if !meta.is_dir() || st.dev != root_dev {
+            sum.vanished += delete_under(tx, cx.loc, d).map_err(db_err)? as u64;
+            if meta.is_file() {
+                record(&abs, Some(&st), sum).map_err(db_err)?;
+            }
+            continue;
+        }
+        if to_sql(st.ino) != stored_ino {
+            // Another folder under the same name: walk it whole.
+            sum.vanished += delete_under(tx, cx.loc, d).map_err(db_err)? as u64;
+            unreadable += walk_into(
+                &abs,
+                cx.walk_opts,
+                cx.progress,
+                mount,
+                record,
+                sum,
+                &mut Vec::new(),
+                dirs_seen,
+            )?;
+            walked.push(d.clone());
+            continue;
+        }
+        // List it again (one folder, not its subfolders).
+        let entries = match std::fs::read_dir(&abs) {
+            Ok(rd) => rd,
+            Err(_) => {
+                unreadable += 1;
+                skip(sum, &abs);
+                continue;
+            }
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut listed_ok = true;
+        for e in entries {
+            let Ok(e) = e else {
+                unreadable += 1;
+                listed_ok = false;
+                continue;
+            };
+            let p = e.path();
+            let Some(rel) = p
+                .strip_prefix(mount)
+                .ok()
+                .and_then(Path::to_str)
+                .map(str::to_string)
+            else {
+                unreadable += 1;
+                skip(sum, &p);
+                continue;
+            };
+            let m = match std::fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    unreadable += 1;
+                    skip(sum, &p);
+                    listed_ok = false;
+                    seen.insert(rel);
+                    continue;
+                }
+            };
+            let es = stat_of(&m);
+            if m.is_file() {
+                record(&p, Some(&es), sum).map_err(db_err)?;
+                seen.insert(rel);
+            } else if m.is_dir() {
+                seen.insert(rel.clone());
+                if es.dev != root_dev {
+                    continue; // another mount below: not this location's
+                }
+                if table.get(&rel).map(|(i, _)| *i) == Some(to_sql(es.ino)) {
+                    continue; // known: its own inode says whether it changed
+                }
+                sum.vanished += delete_under(tx, cx.loc, &rel).map_err(db_err)? as u64;
+                let mut bound = Vec::new();
+                let before = unreadable;
+                unreadable += walk_into(
+                    &p,
+                    cx.walk_opts,
+                    cx.progress,
+                    mount,
+                    record,
+                    sum,
+                    &mut bound,
+                    dirs_seen,
+                )?;
+                if unreadable == before {
+                    sum.vanished +=
+                        drop_vanished(tx, cx.loc, cx.gen, &rel, &bound).map_err(db_err)? as u64;
+                }
+                walked.push(rel);
+            }
+        }
+        if listed_ok {
+            // Entries of this folder that are gone: file rows directly in
+            // it, and folders (with all below) the table has under it.
+            let mut gone: Vec<String> = Vec::new();
+            {
+                let mut st = tx
+                    .prepare(
+                        "SELECT path FROM files WHERE location_id = ?1 AND (?2 = '' OR \
+                         substr(path, 1, length(?2) + 1) = ?2 || '/')",
+                    )
+                    .map_err(db_err)?;
+                let rows = st
+                    .query_map(params![cx.loc, d], |r| r.get::<_, String>(0))
+                    .map_err(db_err)?;
+                for r in rows {
+                    let path = r.map_err(db_err)?;
+                    if parent_rel(&path) == d && !seen.contains(&path) {
+                        gone.push(path);
+                    }
+                }
+            }
+            for path in table.keys() {
+                if path != d && parent_rel(path) == d && !seen.contains(path) {
+                    gone.push(path.clone());
+                }
+            }
+            for g in gone {
+                sum.vanished += delete_under(tx, cx.loc, &g).map_err(db_err)? as u64;
+            }
+            let ct = inodes.get(&st.ino).and_then(|i| i.ctime_ns).map(to_sql);
+            set_ctime.execute(params![cx.loc, d, ct]).map_err(db_err)?;
+        } else {
+            // Not fully listed: the next scan must list it again.
+            set_ctime
+                .execute(params![cx.loc, d, Option::<i64>::None])
+                .map_err(db_err)?;
+        }
+    }
+    // Rows in folders that did not change: compared with their inode.
+    let mut rows: Vec<(String, i64, i64, i64, Option<i64>, bool)> = Vec::new();
+    {
+        let mut st = tx
+            .prepare(
+                "SELECT path, ino, size, mtime_ns, ctime_ns, racy FROM files WHERE location_id = ?1",
+            )
+            .map_err(db_err)?;
+        let it = st
+            .query_map([cx.loc], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .map_err(db_err)?;
+        for r in it {
+            let r: (String, i64, i64, i64, Option<i64>, bool) = r.map_err(db_err)?;
+            if in_prefix(&r.0, cx.prefix)
+                && !dirty_set.contains(parent_rel(&r.0))
+                && !under_walked(&walked, &r.0)
+            {
+                rows.push(r);
+            }
+        }
+    }
+    for (path, ino, size, mtime, ctime, racy) in rows {
+        if cx.progress.cancelled() {
+            break;
+        }
+        let abs = mount.join(&path);
+        match inodes.get(&(ino as u64)) {
+            Some(i) if i.is_file() => {
+                let same = (to_sql(i.size), to_sql(i.mtime_ns), i.ctime_ns.map(to_sql))
+                    == (size, mtime, ctime);
+                if !same || racy {
+                    record(&abs, Some(&stat_of_inode(i, root_dev)), sum).map_err(db_err)?;
+                }
+            }
+            // Gone or not a file any more although its folder did not
+            // change (an inode number reused?): ask the path itself.
+            _ => match std::fs::symlink_metadata(&abs) {
+                Ok(m) if m.is_file() => record(&abs, Some(&stat_of(&m)), sum).map_err(db_err)?,
+                Ok(_) => {
+                    sum.vanished += delete_under(tx, cx.loc, &path).map_err(db_err)? as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    sum.vanished += delete_under(tx, cx.loc, &path).map_err(db_err)? as u64;
+                }
+                Err(_) => {
+                    unreadable += 1;
+                    skip(sum, &abs);
+                }
+            },
+        }
+    }
+    // Folders walked whole join the table (their times from BULKSTAT).
+    add_dirs(tx, cx.loc, mount, dirs_seen, inodes, root_dev).map_err(db_err)?;
+    Ok(unreadable)
+}
+
+/// Add (or replace) folder-table rows for `dirs`, with their inode change
+/// time from the pre-scan BULKSTAT pass (`NULL` when it did not see the
+/// folder: the next scan lists it again).
+fn add_dirs(
+    tx: &Connection,
+    loc: i64,
+    mount: &Path,
+    dirs: &[PathBuf],
+    inodes: &HashMap<u64, crate::xfs::InodeInfo>,
+    root_dev: u64,
+) -> rusqlite::Result<()> {
+    let mut put = tx.prepare(
+        "INSERT OR REPLACE INTO dirs (location_id, path, ino, ctime_ns) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for d in dirs {
+        let Some(rel) = d.strip_prefix(mount).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        let Ok(m) = std::fs::symlink_metadata(d) else {
+            continue;
+        };
+        let st = stat_of(&m);
+        if !m.is_dir() || st.dev != root_dev {
+            continue;
+        }
+        let ct = inodes
+            .get(&st.ino)
+            .filter(|i| i.is_dir())
+            .and_then(|i| i.ctime_ns)
+            .map(to_sql);
+        put.execute(params![loc, rel, to_sql(st.ino), ct])?;
+    }
+    Ok(())
+}
+
+/// After every scan: keep the folder table only after a complete scan that
+/// read BULKSTAT first; any other scan of the location forgets it.
+fn record_inode_ref(
+    tx: &Connection,
+    loc: i64,
+    prefix: &str,
+    plan: &InodePlan,
+    complete: bool,
+    dirs_seen: &[PathBuf],
+    root_dev: u64,
+) -> io::Result<()> {
+    let forget = || -> io::Result<()> {
+        tx.execute("DELETE FROM dirs WHERE location_id = ?1", [loc])
+            .map_err(db_err)?;
+        tx.execute(
+            "UPDATE locations SET inode_ref_root = NULL WHERE id = ?1",
+            [loc],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    };
+    match plan {
+        InodePlan::Establish { inodes, .. } if complete => {
+            forget()?;
+            let mount = tx
+                .query_row("SELECT root FROM locations WHERE id = ?1", [loc], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(db_err)?;
+            add_dirs(tx, loc, Path::new(&mount), dirs_seen, inodes, root_dev).map_err(db_err)?;
+            tx.execute(
+                "UPDATE locations SET inode_ref_root = ?2 WHERE id = ?1",
+                params![loc, prefix],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        }
+        InodePlan::Delta { .. } if complete => Ok(()),
+        _ => forget(),
     }
 }
 
@@ -2560,7 +3117,9 @@ mod tests {
                  ALTER TABLE locations DROP COLUMN zfs_ref_guid; \
                  ALTER TABLE locations DROP COLUMN zfs_ref_creation; \
                  ALTER TABLE locations DROP COLUMN zfs_ds_guid; \
-                 ALTER TABLE locations DROP COLUMN zfs_ref_root;",
+                 ALTER TABLE locations DROP COLUMN zfs_ref_root; \
+                 ALTER TABLE locations DROP COLUMN inode_ref_root; \
+                 DROP TABLE dirs;",
             )
             .unwrap();
             c.pragma_update(None, "user_version", 2).unwrap();

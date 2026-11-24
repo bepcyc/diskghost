@@ -496,7 +496,7 @@ fn schema_4_adds_the_digest_algorithm_and_migrates_v3_rows() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 7);
+    assert_eq!(v, 8);
     let rows = remote_rows(&e, &Estate::uuid("A"));
     assert_eq!(rows[0].3, "blake3", "default for local rows");
     // An md5 digest is 16 bytes; blake3 must stay 32.
@@ -1311,7 +1311,7 @@ fn a_v4_index_migrates_to_v5_keeping_its_rows_as_shell_locations() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 7);
+    assert_eq!(v, 8);
     let row: (Vec<u8>, String, String, String) = idx
         .conn
         .query_row(

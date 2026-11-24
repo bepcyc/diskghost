@@ -43,6 +43,9 @@ pub mod sshfs;
 mod testkit;
 mod tree;
 mod walk;
+mod xfs;
+#[cfg(all(test, unix))]
+mod xfs_tests;
 mod zfs;
 #[cfg(all(test, unix))]
 mod zfs_tests;
