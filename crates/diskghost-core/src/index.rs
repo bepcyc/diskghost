@@ -1858,7 +1858,7 @@ mod tests {
             idx.find_files(pat, loc, limit, offset)
                 .unwrap()
                 .into_iter()
-                .map(|f| f.path.to_string_lossy().into_owned())
+                .map(|f| f.path.to_string_lossy().replace('\\', "/"))
                 .collect()
         };
         // Case-insensitive substring over root/relative.

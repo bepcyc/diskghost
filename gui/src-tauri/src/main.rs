@@ -1773,6 +1773,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
     #[test]
     fn forget_location_drops_index_rows_and_never_touches_files() {
         // `forget_location` → `forget_in` on a scratch index: the location
@@ -1798,6 +1799,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
     #[test]
     fn find_indexed_files_pages_through_the_index() {
         // `find_indexed_files` → `find_in` on a scratch index.
