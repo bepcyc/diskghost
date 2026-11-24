@@ -116,6 +116,9 @@ fn ready(label: &str) -> Estate {
             .set_modified(hour_ago)
             .unwrap();
     }
+    // Their change times must be older than the fake's 20 ms coarse-clock
+    // margin (testkit), or the next delta looks at them again.
+    std::thread::sleep(std::time::Duration::from_millis(50));
     let s = scan(&e, &Options::default());
     assert!(s.complete && s.delta.is_none(), "{s:?}");
     assert!(

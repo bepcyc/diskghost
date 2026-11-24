@@ -268,6 +268,12 @@ impl Estate {
                 if let Some(e) = x.btrfs_errno {
                     return Err(io::Error::from_raw_os_error(e));
                 }
+                // The kernel stamps ctime from its coarse clock, which can
+                // lag the fine clock the fake generation is read from by a
+                // tick: a change right after G was read could get a ctime
+                // below G. Real transids are a counter and never lag; widen
+                // by 20 ms here (over-inclusion only).
+                let since = since.saturating_sub(20_000_000);
                 Ok(inodes_under(p)
                     .into_iter()
                     .filter(|(_, i)| i.ctime_ns.is_some_and(|c| c > since))
