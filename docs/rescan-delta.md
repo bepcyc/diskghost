@@ -16,6 +16,21 @@ that keeps size and inode and then restores the old mtime (`touch -r`,
 `utimes`) is invisible. Only ctime (not settable by users) or reading the
 content would close it. No shortcut below may be weaker than this predicate.
 
+## 0. Reusing a saved snapshot as the rescan baseline — no gain, rejected
+
+Snapshots (`snapshot.rs`, the GUI store read by the MCP tools
+`list_snapshots` / `diff_since`) record, per entry, only the kind, the
+front-coded path and the size (plus a file count for folders) —
+`snapshot.rs` writer: `put_varint(shared)`, `put_varint(len)`, name,
+`put_varint(size)`. No mtime, no inode. As a change baseline that is
+strictly weaker than an index row `(size, mtime_ns, inode)`: a same-size
+rewrite is invisible to it. And `diff_since` compares two snapshots that
+were *each* produced by a complete walk; it reports a delta, it does not
+avoid the walk that produces the newer side. The index rows are already
+the stronger baseline, so a snapshot adds nothing a rescan could skip on.
+Folder entries of a snapshot carry subtree totals, not times, so they
+cannot prune either (and §1 shows times would not suffice).
+
 ## 1. Folder mtime / "subtree max mtime" pruning — UNSOUND, rejected
 
 A folder's mtime (POSIX, and NTFS/SMB LastWriteTime alike) changes when an
