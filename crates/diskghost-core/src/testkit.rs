@@ -82,6 +82,8 @@ pub(crate) struct FakeXfs {
     /// Answer with this (taken earlier by [`Estate::bulkstat_now`]).
     pub(crate) stale: Option<HashMap<u64, crate::xfs::InodeInfo>>,
     pub(crate) calls: usize,
+    /// The mount table the scan sees (empty: none below the tree).
+    pub(crate) mounts: Vec<crate::walk::MountEntry>,
 }
 
 /// Every inode under `root` (and `root` itself), as BULKSTAT would give.
@@ -238,7 +240,9 @@ impl Estate {
             let all = x.stale.clone().unwrap_or_else(|| inodes_under(mount));
             Ok(all.into_iter().filter(|(_, i)| keep(i)).collect())
         };
+        let mounts = || self.xfs.lock().unwrap().mounts.clone();
         let probe = Probe {
+            mounts: &mounts,
             zfs: &zfs,
             snap_nlink: &snap_nlink,
             cap_sys_admin: &cap,

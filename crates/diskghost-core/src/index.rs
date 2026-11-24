@@ -743,6 +743,11 @@ pub(crate) struct Volume {
 }
 
 /// This process's mount table (empty where there is none).
+#[cfg(not(unix))]
+fn mount_table() -> Vec<MountEntry> {
+    Vec::new()
+}
+
 #[cfg(unix)]
 fn mount_table() -> Vec<MountEntry> {
     std::fs::read("/proc/self/mountinfo")
@@ -980,6 +985,8 @@ pub(crate) struct Probe<'a> {
     /// The inodes of the XFS filesystem mounted at a path that `keep`
     /// accepts, from BULKSTAT (see [`crate::xfs`]).
     pub(crate) bulkstat: &'a BulkstatFn<'a>,
+    /// This process's mount table (empty where there is none).
+    pub(crate) mounts: &'a dyn Fn() -> Vec<MountEntry>,
 }
 
 /// [`Probe::bulkstat`].
@@ -1004,6 +1011,7 @@ impl Probe<'static> {
         snap_nlink: &snap_nlink,
         cap_sys_admin: &crate::xfs::has_cap_sys_admin,
         bulkstat: &crate::xfs::bulkstat,
+        mounts: &mount_table,
     };
 }
 
@@ -1371,7 +1379,7 @@ pub(crate) fn scan_with(
     }
     // XFS inode delta (only with CAP_SYS_ADMIN already held): the BULKSTAT
     // pass runs here, before anything is listed.
-    let iplan = inode_plan(&tx, loc, &vol, &prefix, opts, probe)?;
+    let iplan = inode_plan(&tx, loc, &vol, &root, root_dev, &prefix, opts, probe)?;
     if let InodePlan::Walk(why) | InodePlan::Establish { why, .. } = &iplan {
         add_note(&mut sum, why.clone());
     }
@@ -2239,16 +2247,30 @@ enum InodePlan {
 }
 
 /// Decide whether this scan may use the XFS inode delta.
+#[allow(clippy::too_many_arguments)]
 fn inode_plan(
     tx: &Connection,
     loc: i64,
     vol: &Volume,
+    root: &Path,
+    root_dev: u64,
     prefix: &str,
     opts: &Options,
     probe: &Probe,
 ) -> io::Result<InodePlan> {
     if vol.fstype != "xfs" {
         return Ok(InodePlan::Off);
+    }
+    // A bind mount of this same filesystem below the scan folder: the walk
+    // enters it (same device), but mounting changes no folder's inode or
+    // time, so the delta could not see it. Walk.
+    if let Some(m) = (probe.mounts)().iter().find(|m| {
+        m.dev == root_dev && m.mount_point != vol.mount_point && m.mount_point.starts_with(root)
+    }) {
+        return Ok(InodePlan::Walk(format!(
+            "xfs: {} is a second mount of this filesystem below the scan folder; walked",
+            m.mount_point.display()
+        )));
     }
     if !opts.exclude.is_empty() || opts.max_depth.is_some() || opts.follow_symlinks {
         return Ok(InodePlan::Walk(

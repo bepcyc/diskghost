@@ -454,3 +454,32 @@ fn nested_mounts_under_clean_and_changed_folders_keep_the_walks_rows() {
         .unwrap();
     assert_eq!(ino, -1);
 }
+
+#[test]
+fn a_second_mount_of_the_same_filesystem_below_means_a_walk() {
+    // A bind mount on the same device: the walk enters it, the delta
+    // would not see it (no folder inode or time changes on mount).
+    use std::os::unix::fs::MetadataExt;
+    let e = ready("xfs-bind");
+    let a = e.loc("A");
+    let dev = std::fs::metadata(&a).unwrap().dev();
+    e.xfs.lock().unwrap().mounts = vec![crate::walk::MountEntry {
+        dev,
+        major: 0,
+        minor: 0,
+        root: "/m".into(),
+        mount_point: a.join("x/bound"),
+        fstype: "xfs".into(),
+        source: "/dev/fake".into(),
+    }];
+    let s = scan(&e, &Options::default());
+    assert!(s.delta.is_none() && s.complete, "{s:?}");
+    assert!(
+        s.delta_note
+            .as_deref()
+            .unwrap()
+            .contains("second mount of this filesystem"),
+        "{s:?}"
+    );
+    assert!(!has_table(&e), "forgotten");
+}
