@@ -1714,6 +1714,69 @@ fn zfs_plan(
             p.display()
         ));
     }
+    // A file that had several names and lost all of them is listed once
+    // ("-" with one name, no link-count line: it has no links left to
+    // count). Its other names are only known from the index: rows of a
+    // removed or renamed-away path that share their inode with another row.
+    {
+        let mut ino_of = tx
+            .prepare("SELECT ino FROM files WHERE location_id = ?1 AND path = ?2 AND ino <> 0")
+            .map_err(db_err)?;
+        let mut gone_inos: Vec<i64> = Vec::new();
+        for c in changes.iter().filter(|c| {
+            matches!(
+                c.kind,
+                crate::zfs::Kind::Removed | crate::zfs::Kind::Renamed
+            )
+        }) {
+            let Some(rel) = c
+                .path
+                .strip_prefix(&vol.mount_point)
+                .ok()
+                .and_then(Path::to_str)
+            else {
+                continue;
+            };
+            if let Some(ino) = ino_of
+                .query_row(params![loc, rel], |r| r.get::<_, i64>(0))
+                .optional()
+                .map_err(db_err)?
+            {
+                gone_inos.push(ino);
+            }
+        }
+        if !gone_inos.is_empty() {
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS gone_ino (i INTEGER PRIMARY KEY); \
+                 DELETE FROM temp.gone_ino;",
+            )
+            .map_err(db_err)?;
+            {
+                let mut add = tx
+                    .prepare("INSERT OR IGNORE INTO temp.gone_ino (i) VALUES (?1)")
+                    .map_err(db_err)?;
+                for i in &gone_inos {
+                    add.execute([i]).map_err(db_err)?;
+                }
+            }
+            let linked: Option<String> = tx
+                .query_row(
+                    "SELECT path FROM files WHERE location_id = ?1 AND ino IN \
+                     (SELECT f.ino FROM files f JOIN temp.gone_ino g ON g.i = f.ino \
+                      WHERE f.location_id = ?1 GROUP BY f.ino HAVING COUNT(*) > 1) LIMIT 1",
+                    [loc],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some(p) = linked {
+                return walk(format!(
+                    "--zfs-diff: {p} is one of several names of a file the diff removed or \
+                     renamed, and zfs diff names one path per file; walked"
+                ));
+            }
+        }
+    }
     let outside = changes.iter().find(|c| {
         !c.path.starts_with(&vol.mount_point)
             || c.new_path

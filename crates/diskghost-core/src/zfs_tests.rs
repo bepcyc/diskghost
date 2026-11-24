@@ -470,3 +470,20 @@ fn a_link_count_change_means_a_walk() {
     set_diff(&e, &[format!("M\tF\t{}\t(+1)", esc(&a.join("f.bin")))]);
     fallback(&e, "hard link was added or removed");
 }
+
+#[test]
+fn a_file_that_lost_all_its_names_means_a_walk() {
+    // Both names gone: zfs prints one `-` line and no link-count line
+    // (no links left to count); the other name is only in the index.
+    let (e, creation) = zfs_estate("zfs-all-names-gone");
+    let a = e.loc("A");
+    write(&a.join("one.bin"), &content(1));
+    std::fs::hard_link(a.join("one.bin"), a.join("two.bin")).unwrap();
+    write(&a.join("keep.bin"), &content(2));
+    scan_into(&e, &e.idx, &opts(true));
+    age_rows(&e, creation);
+    std::fs::remove_file(a.join("one.bin")).unwrap();
+    std::fs::remove_file(a.join("two.bin")).unwrap();
+    set_diff(&e, &[format!("-\tF\t{}", esc(&a.join("one.bin")))]);
+    fallback(&e, "one of several names");
+}
