@@ -434,10 +434,18 @@ impl Run<'_> {
             return None;
         }
         let ino = p.ino.unwrap_or(a.expect.ino);
+        // Inode unknown (0): a rename keeps size and time — match on those.
+        let is_moved = |st: Stat| {
+            if ino == 0 {
+                (st.size, st.mtime_ns) == (a.expect.size, a.expect.mtime_ns)
+            } else {
+                st.ino == ino
+            }
+        };
         let moved =
             p.to.as_ref()
                 .and_then(|t| std::fs::symlink_metadata(t).ok())
-                .is_some_and(|m| m.is_file() && stat_of(&m).ino == ino);
+                .is_some_and(|m| m.is_file() && is_moved(stat_of(&m)));
         Some(if moved {
             Verdict {
                 status: if self.opts.dry_run {
@@ -623,7 +631,9 @@ impl Run<'_> {
         if st.dev != expect.dev {
             diff.push("device".to_string());
         }
-        if st.ino != expect.ino {
+        // Inode 0: not known (no Unix inode, or a filesystem whose inode
+        // numbers change per mount — see `index::inode_numbers_stable`).
+        if expect.ino != 0 && st.ino != expect.ino {
             diff.push("inode".to_string());
         }
         if diff.is_empty() {
@@ -871,7 +881,8 @@ pub fn undo(journal: &Path, dry_run: bool) -> io::Result<RunReport> {
                 continue;
             }
         };
-        if !meta.is_file() || e.ino.is_some_and(|i| i != stat_of(&meta).ino) {
+        // Inode 0 is "not known" (see `stat_matches`): not compared.
+        if !meta.is_file() || e.ino.is_some_and(|i| i != 0 && i != stat_of(&meta).ino) {
             outcomes.push(report(
                 Status::Conflict,
                 Some(format!("{} is not the moved file", to.display())),

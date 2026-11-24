@@ -149,6 +149,18 @@ impl Sandbox {
         std::fs::write(t.join("b/two.bin"), &big).unwrap();
         std::fs::write(t.join("b/three.bin"), &big).unwrap();
         std::fs::write(t.join("a/unique.bin"), vec![9u8; 70 * 1024]).unwrap();
+        // Written an hour ago, as files usually are: a rescan right after
+        // the first scan must find them unchanged, not racy (written within
+        // the index's 2 s trust window of the scan) and re-read.
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in ["a/one.bin", "b/two.bin", "b/three.bin", "a/unique.bin"] {
+            std::fs::File::options()
+                .write(true)
+                .open(t.join(f))
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        }
         t
     }
 }

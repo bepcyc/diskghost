@@ -1218,6 +1218,13 @@ fn print_index_add(path: &Path, s: &ScanSummary) {
             s.seen, s.new, s.changed, s.unchanged, s.vanished, s.sampled
         ),
     }
+    if s.racy_rechecked > 0 {
+        println!(
+            "  {} re-read although their size and time are unchanged: written within 2 s \
+             of the last scan, too close to trust",
+            s.racy_rechecked
+        );
+    }
     if s.algo.as_deref().is_some_and(|a| a != "blake3") {
         println!(
             "  note: no b3sum on the host — its digests are compared only with each other; \

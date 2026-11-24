@@ -61,6 +61,9 @@ pub(crate) struct Estate {
     pub(crate) reads: Mutex<Vec<PathBuf>>,
     /// Remote hosts (`ssh://h`) that do not answer.
     pub(crate) hosts_down: Mutex<HashSet<String>>,
+    /// Locations whose filesystem pretends to hand out new inode numbers
+    /// per mount, like exFAT/FAT (`Volume::ino_stable == false`).
+    pub(crate) ino_unstable: Mutex<HashSet<String>>,
 }
 
 impl Estate {
@@ -74,6 +77,7 @@ impl Estate {
             rotational: false,
             reads: Mutex::new(Vec::new()),
             hosts_down: Mutex::new(HashSet::new()),
+            ino_unstable: Mutex::new(HashSet::new()),
         }
     }
 
@@ -87,6 +91,7 @@ impl Estate {
 
     pub(crate) fn with_probe<T>(&self, f: impl FnOnce(&Probe) -> T) -> T {
         let base = self.dir.clone();
+        let unstable = &self.ino_unstable;
         let volume = move |p: &Path| -> io::Result<Volume> {
             let rel = p.strip_prefix(&base).map_err(io::Error::other)?;
             let top = rel
@@ -97,6 +102,7 @@ impl Estate {
             Ok(Volume {
                 key: Estate::uuid(&name),
                 mount_point: base.join(&name),
+                ino_stable: !unstable.lock().unwrap().contains(&name),
             })
         };
         // Like the real check: the folder is there *and* holds this
@@ -148,6 +154,23 @@ impl Estate {
             })
             .unwrap();
         assert!(s.complete, "{s:?}");
+    }
+
+    /// `index add` of a whole fake volume, returning what the scan did.
+    pub(crate) fn scan(&self, name: &str) -> ScanSummary {
+        let root = self.loc(name);
+        std::fs::create_dir_all(&root).unwrap();
+        self.reads.lock().unwrap().clear();
+        self.with_probe(|p| {
+            scan_with(
+                &self.idx,
+                &root,
+                &Options::default(),
+                &Progress::default(),
+                p,
+            )
+        })
+        .unwrap()
     }
 
     /// `index add ssh://…` through a fake host.

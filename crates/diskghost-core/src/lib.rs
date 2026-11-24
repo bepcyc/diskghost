@@ -33,6 +33,8 @@ pub mod policy;
 pub mod remote;
 #[cfg(test)]
 mod remote_tests;
+#[cfg(all(test, unix))]
+mod rescan_tests;
 mod rotational;
 mod snapshot;
 #[cfg(test)]

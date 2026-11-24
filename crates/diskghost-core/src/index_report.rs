@@ -431,12 +431,18 @@ pub(crate) struct Loc {
     pub(crate) available: bool,
     pub(crate) rotational: bool,
     pub(crate) cow: bool,
+    /// Inode numbers survive a remount here; else rows store 0 and files
+    /// are compared by (size, mtime) — see [`crate::index::inode_numbers_stable`].
+    pub(crate) ino_stable: bool,
 }
 
 fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
     let mut st = idx
         .conn
-        .prepare("SELECT id, uuid, root, role, cow, host FROM locations ORDER BY root, uuid")
+        .prepare(
+            "SELECT id, uuid, root, role, cow, host, ino_stable FROM locations \
+             ORDER BY root, uuid",
+        )
         .map_err(db_err)?;
     let rows = st
         .query_map([], |r| {
@@ -447,12 +453,13 @@ fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<i64>>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, bool>(6)?,
             ))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, uuid, root, role, cow, host) = row.map_err(db_err)?;
+        let (id, uuid, root, role, cow, host, ino_stable) = row.map_err(db_err)?;
         let root = PathBuf::from(root);
         // A remote root is a path on another machine: never stat'ed here.
         let remote = is_remote_host(&host);
@@ -476,6 +483,7 @@ fn load_locations(idx: &Index, probe: &Probe) -> io::Result<Vec<Loc>> {
                 None => true,
             },
             role: Role::parse(&role),
+            ino_stable,
             uuid,
             host,
             root,
@@ -501,6 +509,9 @@ pub(crate) struct Row {
     pub(crate) excluded: bool,
     /// Differs from its stored row.
     pub(crate) dirty: bool,
+    /// Its time was too close to the scan or read that recorded it to trust
+    /// an unchanged `stat` (see [`crate::index::RACY_WINDOW_NS`]).
+    pub(crate) racy: bool,
 }
 
 fn hash32(b: Option<Vec<u8>>) -> Option<[u8; 32]> {
@@ -517,7 +528,8 @@ fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result
     let mut st = idx
         .conn
         .prepare(&format!(
-            "SELECT location_id, path, size, mtime_ns, dev, ino, sample, full, algo FROM files \
+            "SELECT location_id, path, size, mtime_ns, dev, ino, sample, full, algo, racy \
+                 FROM files \
                  WHERE size >= ?1 AND {NOT_QUARANTINED} AND size IN \
                    (SELECT size FROM files WHERE size >= ?1 AND {NOT_QUARANTINED} \
                     GROUP BY size HAVING COUNT(*) > 1) \
@@ -536,12 +548,13 @@ fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result
                 r.get::<_, Option<Vec<u8>>>(6)?,
                 r.get::<_, Option<Vec<u8>>>(7)?,
                 r.get::<_, String>(8)?,
+                r.get::<_, bool>(9)?,
             ))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        let (loc, path, size, mtime, dev, ino, sample, full, algo) = row.map_err(db_err)?;
+        let (loc, path, size, mtime, dev, ino, sample, full, algo, racy) = row.map_err(db_err)?;
         let Some(&loc) = at.get(&loc) else { continue };
         let algo = HashAlgo::parse(&algo).unwrap_or(HashAlgo::Blake3);
         let (full, alt) = match (algo, full) {
@@ -561,6 +574,7 @@ fn load_colliding(idx: &Index, min: u64, at: &HashMap<i64, usize>) -> io::Result
             alt,
             excluded: false,
             dirty: false,
+            racy,
         });
     }
     Ok(out)
@@ -577,6 +591,8 @@ fn refresh(locs: &[Loc], rows: &mut [Row], stats: &Counters, progress: &Progress
     let bytes = online.iter().map(|&i| rows[i].size.min(SAMPLE_READ)).sum();
     progress.enter(phase::SAMPLE, online.len() as u64, bytes);
     let on_read = probe.on_read;
+    // Rows read now are judged racy against this moment.
+    let start_ns = crate::index::now_ns();
     rows.par_iter_mut()
         .filter(|r| here(&locs[r.loc]))
         .for_each(|r| {
@@ -594,14 +610,27 @@ fn refresh(locs: &[Loc], rows: &mut [Row], stats: &Counters, progress: &Progress
                 }
             };
             let st = stat_of(&meta);
-            if (st.size, st.mtime_ns, st.ino) != (r.size, r.mtime_ns, r.ino) {
+            // Inode numbers that do not survive a remount are stored as 0.
+            let ino = if locs[r.loc].ino_stable { st.ino } else { 0 };
+            if (st.size, st.mtime_ns, ino) != (r.size, r.mtime_ns, r.ino) {
                 r.size = st.size;
                 r.mtime_ns = st.mtime_ns;
-                r.ino = st.ino;
+                r.ino = ino;
                 r.sample = None;
                 r.full = None;
                 r.dirty = true;
                 stats.changed.fetch_add(1, Ordering::Relaxed);
+            } else if r.racy {
+                // Unchanged stat, untrusted: its hashes may predate a write
+                // in the same timestamp tick. Read it again.
+                r.sample = None;
+                r.full = None;
+                r.dirty = true;
+            }
+            let racy = crate::index::is_racy(r.mtime_ns, start_ns);
+            if racy != r.racy {
+                r.racy = racy;
+                r.dirty = true;
             }
             if st.dev != r.dev {
                 r.dev = st.dev; // device numbers move across reboots
@@ -645,7 +674,8 @@ fn persist(idx: &Index, locs: &[Loc], rows: &[Row]) -> io::Result<()> {
         let mut set = tx
             .prepare_cached(
                 "UPDATE files SET size = ?3, mtime_ns = ?4, dev = ?5, ino = ?6, \
-                 sample = ?7, full = ?8, algo = 'blake3' WHERE location_id = ?1 AND path = ?2",
+                 sample = ?7, full = ?8, algo = 'blake3', racy = ?9 \
+                 WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
         for r in rows.iter().filter(writable) {
@@ -658,6 +688,7 @@ fn persist(idx: &Index, locs: &[Loc], rows: &[Row]) -> io::Result<()> {
                 to_sql(r.ino),
                 r.sample.as_ref().map(|h| &h[..]),
                 r.full.as_ref().map(|h| &h[..]),
+                r.racy,
             ])
             .map_err(db_err)?;
         }
@@ -1252,6 +1283,20 @@ mod tests {
         write(&a.join("decoy.bin"), &same_ends(1));
         write(&a.join("unique.bin"), &content(2)[..1000]);
         write(&b.join("copy/dup.bin"), &content(1));
+        // Written long before the scan: not racy (see RACY_WINDOW_NS).
+        for f in [
+            a.join("dup.bin"),
+            a.join("decoy.bin"),
+            a.join("unique.bin"),
+            b.join("copy/dup.bin"),
+        ] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(7200))
+                .unwrap();
+        }
         e.add("A");
         e.add("B");
         e

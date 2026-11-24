@@ -12,7 +12,7 @@
 //! disk fills one location, and each scan only answers for the subtree it
 //! walked.
 //!
-//! # Schema (version 5, `PRAGMA user_version`)
+//! # Schema (version 6, `PRAGMA user_version`)
 //!
 //! ```sql
 //! meta      (key TEXT PRIMARY KEY, value INTEGER NOT NULL)
@@ -25,8 +25,10 @@
 //!            online INTEGER NOT NULL,     -- reachable at its last scan
 //!            last_seen INTEGER NOT NULL,  -- unix seconds of that scan
 //!            cow INTEGER,                 -- v2: copy-on-write fs at that scan
-//!            transport TEXT)              -- v5: shell | agent (remote: how its
+//!            transport TEXT,              -- v5: shell | agent (remote: how its
 //!                                         -- last scan listed and hashed; local: 'shell')
+//!            ino_stable INTEGER)          -- v6: 0 = inode numbers change per mount
+//!                                         -- (exFAT/FAT): rows store ino 0
 //! files     (location_id → locations(id) ON DELETE CASCADE,
 //!            path TEXT,                   -- relative to locations.root
 //!            size, mtime_ns, dev, ino INTEGER,
@@ -34,6 +36,8 @@
 //!            algo TEXT,    -- v4: algorithm of `full`: blake3 | md5 | sha1
 //!            full BLOB,    -- whole-file digest (32/16/20 bytes); NULL = not computed
 //!            seen INTEGER, -- scan generation that last saw the row
+//!            racy INTEGER, -- v6: mtime within RACY_WINDOW_NS of the scan
+//!                          -- that recorded it: re-read at the next scan
 //!            PRIMARY KEY (location_id, path)) WITHOUT ROWID
 //! INDEX files_size ON files(size); INDEX files_full ON files(full)
 //! scan_roots (location_id → locations(id) ON DELETE CASCADE,  -- v3
@@ -88,7 +92,7 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
@@ -164,7 +168,45 @@ CREATE INDEX files_full ON files(full) WHERE full IS NOT NULL;
 ALTER TABLE locations ADD COLUMN transport TEXT NOT NULL DEFAULT 'shell'
     CHECK (transport IN ('shell', 'agent'));
 ",
+    // v6: whether a location's filesystem keeps inode numbers (exFAT/FAT
+    // hand out new ones per mount and per inode-cache eviction), and rows
+    // whose time is too close to their scan to trust (see `RACY_WINDOW_NS`).
+    r"
+ALTER TABLE locations ADD COLUMN ino_stable INTEGER NOT NULL DEFAULT 1
+    CHECK (ino_stable IN (0, 1));
+ALTER TABLE files ADD COLUMN racy INTEGER NOT NULL DEFAULT 0 CHECK (racy IN (0, 1));
+",
 ];
+
+/// How close to the start of the scan that recorded it a file's mtime may
+/// be before the row is not trusted at the next scan ("racy", as in git).
+/// A write in the same timestamp tick as the scan's `stat`, keeping the
+/// size, leaves `(size, mtime)` unchanged. 2 s covers FAT (2 s), exFAT
+/// (10 ms), SMB and the kernel's coarse clock tick.
+pub(crate) const RACY_WINDOW_NS: u64 = 2_000_000_000;
+
+/// Whether a file with `mtime_ns`, observed by a scan that started at
+/// `start_ns`, is racy (also: an mtime in the future).
+pub(crate) fn is_racy(mtime_ns: u64, start_ns: u64) -> bool {
+    mtime_ns >= start_ns.saturating_sub(RACY_WINDOW_NS)
+}
+
+/// Now, in nanoseconds since the Unix epoch.
+pub(crate) fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// Whether filesystem type `fstype` keeps a file's inode number. The Linux
+/// exFAT and FAT drivers assign `iunique()` numbers to every in-core inode
+/// (`fs/exfat/inode.c` `exfat_build_inode`, `fs/fat/inode.c`
+/// `fat_build_inode`): a file gets a new number after a remount or after
+/// its inode was evicted from the cache. On such a location the index
+/// stores inode 0 and compares `(size, mtime)` only.
+pub(crate) fn inode_numbers_stable(fstype: &str) -> bool {
+    !matches!(fstype, "exfat" | "vfat" | "msdos")
+}
 
 /// Role of a location in later copy policies: which copy to keep
 /// (`master`), which copies are expendable (`scratch`).
@@ -214,6 +256,11 @@ pub struct ScanSummary {
     pub changed: u64,
     /// Of those, unchanged: not read, only marked seen.
     pub unchanged: u64,
+    /// Of those, unchanged by `stat` but racy at the last scan (time too
+    /// close to it to trust): hashes reset and re-read like a changed file,
+    /// counted here — not as `changed`, since no change was observed.
+    #[serde(default)]
+    pub racy_rechecked: u64,
     /// Rows dropped because their file is gone (index rows only).
     pub vanished: u64,
     /// Files whose two ends were read because their size collides.
@@ -641,6 +688,8 @@ pub fn volume_uuid(path: &Path) -> io::Result<String> {
 pub(crate) struct Volume {
     pub(crate) key: String,
     pub(crate) mount_point: PathBuf,
+    /// See [`inode_numbers_stable`]; `true` when the type is unknown.
+    pub(crate) ino_stable: bool,
 }
 
 /// This process's mount table (empty where there is none).
@@ -691,6 +740,7 @@ fn volume(path: &Path) -> io::Result<Volume> {
     Ok(Volume {
         key: dev_key(dev_major(dev), dev_minor(dev)),
         mount_point: top.to_path_buf(),
+        ino_stable: true,
     })
 }
 
@@ -739,6 +789,7 @@ fn resolve_volume(
     Some(Volume {
         key,
         mount_point: m.mount_point.clone(),
+        ino_stable: inode_numbers_stable(&m.fstype),
     })
 }
 
@@ -1183,13 +1234,33 @@ pub(crate) fn scan_with(
     let tx = idx.conn.unchecked_transaction().map_err(db_err)?;
     let loc: i64 = tx
         .query_row(
-            "INSERT INTO locations (uuid, root, online, last_seen, cow) VALUES (?1, ?2, 1, ?3, ?4) \
+            "INSERT INTO locations (uuid, root, online, last_seen, cow, ino_stable) \
+             VALUES (?1, ?2, 1, ?3, ?4, ?5) \
              ON CONFLICT(uuid) DO UPDATE SET root = excluded.root, online = 1, \
-             last_seen = excluded.last_seen, cow = excluded.cow RETURNING id",
-            params![vol.key, mount, now_secs(), (probe.cow)(&vol.mount_point)],
+             last_seen = excluded.last_seen, cow = excluded.cow, \
+             ino_stable = excluded.ino_stable RETURNING id",
+            params![
+                vol.key,
+                mount,
+                now_secs(),
+                (probe.cow)(&vol.mount_point),
+                vol.ino_stable
+            ],
             |r| r.get(0),
         )
         .map_err(db_err)?;
+    // Inode numbers that do not survive a remount are not stored: rows
+    // indexed before (or by an older build) lose theirs here once, so the
+    // comparison below is (size, mtime) without resetting every hash.
+    if !vol.ino_stable {
+        tx.execute(
+            "UPDATE files SET ino = 0 WHERE location_id = ?1 AND ino <> 0",
+            [loc],
+        )
+        .map_err(db_err)?;
+    }
+    // Racy rows of this scan are judged against its start.
+    let start_ns = now_ns();
     // The folder given, so `apply` can quarantine inside it.
     tx.execute(
         "INSERT OR IGNORE INTO scan_roots (location_id, path) VALUES (?1, ?2)",
@@ -1217,26 +1288,30 @@ pub(crate) fn scan_with(
     {
         let mut get = tx
             .prepare_cached(
-                "SELECT size, mtime_ns, ino FROM files WHERE location_id = ?1 AND path = ?2",
+                "SELECT size, mtime_ns, ino, racy FROM files \
+                 WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
         let mut insert = tx
             .prepare_cached(
-                "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, seen) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, seen, racy) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .map_err(db_err)?;
         let mut touch = tx
             .prepare_cached(
-                "UPDATE files SET seen = ?3, dev = ?4 WHERE location_id = ?1 AND path = ?2",
+                "UPDATE files SET seen = ?3, dev = ?4, racy = ?5 \
+                 WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
         let mut reset = tx
             .prepare_cached(
                 "UPDATE files SET size = ?3, mtime_ns = ?4, dev = ?5, ino = ?6, \
-                 sample = NULL, full = NULL, seen = ?7 WHERE location_id = ?1 AND path = ?2",
+                 sample = NULL, full = NULL, seen = ?7, racy = ?8 \
+                 WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
+        let ino_stable = vol.ino_stable;
         let follow = walk_opts.follow_symlinks;
         let note_skip = |sum: &mut ScanSummary, path: &Path| {
             sum.skipped += 1;
@@ -1279,26 +1354,35 @@ pub(crate) fn scan_with(
                     return Ok(());
                 };
                 sum.seen += 1;
-                let old: Option<(i64, i64, i64)> = get
-                    .query_row(params![loc, rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                let old: Option<(i64, i64, i64, bool)> = get
+                    .query_row(params![loc, rel], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })
                     .optional()?;
                 let (size, mtime, dev, ino) = (
                     to_sql(st.size),
                     to_sql(st.mtime_ns),
                     to_sql(st.dev),
-                    to_sql(st.ino),
+                    if ino_stable { to_sql(st.ino) } else { 0 },
                 );
+                let racy = is_racy(st.mtime_ns, start_ns);
                 match old {
                     None => {
-                        insert.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
+                        insert.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
                         sum.new += 1;
                     }
-                    Some(o) if o == (size, mtime, ino) => {
-                        touch.execute(params![loc, rel, gen, dev])?;
+                    Some((s, m, i, false)) if (s, m, i) == (size, mtime, ino) => {
+                        touch.execute(params![loc, rel, gen, dev, racy])?;
                         sum.unchanged += 1;
                     }
+                    // Same stat, but recorded too close to its scan: content may
+                    // have changed within that timestamp tick. Read it again.
+                    Some((s, m, i, true)) if (s, m, i) == (size, mtime, ino) => {
+                        reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
+                        sum.racy_rechecked += 1;
+                    }
                     Some(_) => {
-                        reset.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
+                        reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
                         sum.changed += 1;
                     }
                 }
@@ -1400,6 +1484,8 @@ struct Pending {
     size: i64,
     mtime_ns: i64,
     ino: i64,
+    /// The location stores inode 0 (see [`inode_numbers_stable`]).
+    ino_stable: bool,
 }
 
 /// Read the two ends of every indexed file that has no sample yet and whose
@@ -1413,7 +1499,7 @@ fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Res
         let mut st = idx
             .conn
             .prepare(
-                "SELECT l.id, l.uuid, l.root, f.path, f.size, f.mtime_ns, f.ino \
+                "SELECT l.id, l.uuid, l.root, f.path, f.size, f.mtime_ns, f.ino, l.ino_stable \
                  FROM files f JOIN locations l ON l.id = f.location_id \
                  WHERE l.host NOT LIKE 'ssh://%' \
                    AND f.sample IS NULL AND f.size > 0 AND f.size IN \
@@ -1431,12 +1517,14 @@ fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Res
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
+                    r.get::<_, bool>(7)?,
                 ))
             })
             .map_err(db_err)?;
         let mut online: HashMap<i64, bool> = HashMap::new();
         for row in rows {
-            let (location_id, uuid, root, path, size, mtime_ns, ino) = row.map_err(db_err)?;
+            let (location_id, uuid, root, path, size, mtime_ns, ino, ino_stable) =
+                row.map_err(db_err)?;
             let root = PathBuf::from(root);
             if !*online
                 .entry(location_id)
@@ -1451,6 +1539,7 @@ fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Res
                 size,
                 mtime_ns,
                 ino,
+                ino_stable,
             });
         }
     }
@@ -1470,8 +1559,8 @@ fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Res
             }
             // Still the file the row describes? Otherwise leave it NULL.
             let st = stat_of(&std::fs::metadata(&p.abs).ok()?);
-            if (to_sql(st.size), to_sql(st.mtime_ns), to_sql(st.ino)) != (p.size, p.mtime_ns, p.ino)
-            {
+            let ino = if p.ino_stable { to_sql(st.ino) } else { 0 };
+            if (to_sql(st.size), to_sql(st.mtime_ns), ino) != (p.size, p.mtime_ns, p.ino) {
                 return None;
             }
             (probe.on_read)(&p.abs);
@@ -1576,6 +1665,73 @@ mod tests {
         assert_eq!((x9.major, x9.minor), (8, 2));
         assert_eq!(x9.fstype, "exfat");
         assert_eq!(x9.root, "/");
+    }
+
+    #[test]
+    fn exfat_and_fat_mounts_do_not_keep_inode_numbers() {
+        // fs/exfat/inode.c and fs/fat/inode.c assign iunique() numbers.
+        for t in ["exfat", "vfat", "msdos"] {
+            assert!(!inode_numbers_stable(t), "{t}");
+        }
+        for t in ["ext4", "xfs", "btrfs", "f2fs", "ntfs3", "fuseblk", "tmpfs"] {
+            assert!(inode_numbers_stable(t), "{t}");
+        }
+        // Decided from the live mount table's fstype (fixture line: exfat).
+        let x9 = resolve_volume(
+            &mounts(),
+            crate::walk::makedev(8, 2),
+            Path::new("/media/u/Big Disk 1/a.jpg"),
+            &by_uuid,
+        )
+        .unwrap();
+        assert!(!x9.ino_stable);
+        let ext4 = resolve_volume(
+            &mounts(),
+            crate::walk::makedev(8, 3),
+            Path::new("/media/u/usb_stick/a"),
+            &by_uuid,
+        )
+        .unwrap();
+        assert!(ext4.ino_stable);
+    }
+
+    #[test]
+    fn a_version_5_index_migrates_to_6_keeping_its_rows() {
+        let d = tmpdir("v5");
+        let path = d.join("index.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            for m in &MIGRATIONS[..5] {
+                c.execute_batch(m).unwrap();
+            }
+            c.pragma_update(None, "user_version", 5).unwrap();
+            c.execute(
+                "INSERT INTO locations (uuid, root, online, last_seen) VALUES ('v', '/x', 1, 1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, sample, seen) \
+                 VALUES (1, 'a', 5, 7, 1, 42, ?1, 1)",
+                [vec![3u8; 32]],
+            )
+            .unwrap();
+        }
+        let idx = Index::open(&path).unwrap();
+        let row: (i64, bool, bool, Vec<u8>) = idx
+            .conn
+            .query_row(
+                "SELECT f.ino, f.racy, l.ino_stable, f.sample FROM files f \
+                 JOIN locations l ON l.id = f.location_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (42, false, true, vec![3u8; 32]),
+            "rows and hashes kept"
+        );
     }
 
     #[test]
@@ -1698,9 +1854,13 @@ mod tests {
         {
             let c = Connection::open(&path).unwrap();
             c.execute_batch("DROP TABLE IF EXISTS scan_roots").unwrap();
-            // v5 added a column: take it away again, as v2 had none.
-            c.execute_batch("ALTER TABLE locations DROP COLUMN transport")
-                .unwrap();
+            // v5 and v6 added columns: take them away again, as v2 had none.
+            c.execute_batch(
+                "ALTER TABLE locations DROP COLUMN transport; \
+                 ALTER TABLE locations DROP COLUMN ino_stable; \
+                 ALTER TABLE files DROP COLUMN racy;",
+            )
+            .unwrap();
             c.pragma_update(None, "user_version", 2).unwrap();
         }
         let idx = Index::open(&path).unwrap();
@@ -1942,6 +2102,14 @@ mod tests {
             std::fs::write(path, content).unwrap();
         }
 
+        /// Written long before any scan: outside the racy window
+        /// ([`RACY_WINDOW_NS`]), so an unchanged rescan reads nothing.
+        fn age(dir: &Path, names: &[&str]) {
+            for n in names {
+                touch(&dir.join(n), 7200);
+            }
+        }
+
         /// Move a file's mtime to a time it cannot already have.
         fn touch(path: &Path, secs_ago: u64) {
             let f = std::fs::File::options().write(true).open(path).unwrap();
@@ -2034,6 +2202,7 @@ mod tests {
             write(&deep, &[1u8; 4096]);
             // A same-size twin, so both get sampled (size collision).
             write(&t.join("twin.bin"), &[1u8; 4096]);
+            age(&t, &["twin.bin"]);
             let dirs = ["", "a", "a/b", "a/b/c", "a/b/c/d"]
                 .iter()
                 .map(|r| if r.is_empty() { t.clone() } else { t.join(r) })
@@ -2123,6 +2292,7 @@ mod tests {
             let t = d.join("t");
             write(&t.join("x/f.bin"), b"hello");
             std::fs::hard_link(t.join("x/f.bin"), t.join("y.bin")).unwrap();
+            age(&t, &["x/f.bin"]);
             let idx = open_db(&d);
             let (s, _) = scan(&idx, &t);
             assert_eq!(s.new, 2);
@@ -2238,6 +2408,7 @@ mod tests {
             write(&t.join("a"), &[7u8; 40_000]);
             write(&t.join("b"), &[7u8; 40_000]);
             write(&t.join("c"), b"unique");
+            age(&t, &["a", "b", "c"]);
             let idx = open_db(&d);
             let (s1, r1) = scan(&idx, &t);
             assert_eq!(r1, BTreeSet::from([t.join("a"), t.join("b")]));
@@ -2253,6 +2424,7 @@ mod tests {
             write(&t.join("a"), &[7u8; 40_000]);
             write(&t.join("b"), &[7u8; 40_000]);
             write(&t.join("c"), b"unique");
+            age(&t, &["a", "b", "c"]);
             let idx = open_db(&d);
             scan(&idx, &t);
             let b_before = hashes(&idx, &t.join("b")).unwrap();
@@ -2310,6 +2482,7 @@ mod tests {
             let t = d.join("t");
             write(&t.join("keep"), b"k");
             write(&t.join("gone"), b"gg");
+            age(&t, &["keep", "gone"]);
             let idx = open_db(&d);
             scan(&idx, &t);
             std::fs::remove_file(t.join("gone")).unwrap(); // inside own tempdir

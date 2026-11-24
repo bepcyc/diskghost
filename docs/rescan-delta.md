@@ -31,6 +31,18 @@ the stronger baseline, so a snapshot adds nothing a rescan could skip on.
 Folder entries of a snapshot carry subtree totals, not times, so they
 cannot prune either (and §1 shows times would not suffice).
 
+## Racy rows (every local filesystem)
+
+A file written in the same timestamp tick as the scan's `stat`, keeping
+its size, leaves `(size, mtime[, inode])` unchanged — invisible to the next
+scan (git's "racy" case). exFAT ticks are 10 ms (`s_time_gran`), FAT 2 s,
+and the kernel's clock tick is coarse on any filesystem. So a row whose
+mtime is within `RACY_WINDOW_NS` (2 s) of its scan's start, or in the
+future, is stored with `racy = 1`; the next scan re-reads it even when its
+`stat` is unchanged (counted as `racy_rechecked`, not `changed`), and the
+index report re-reads it too. Remote (`ssh://`) rows are not covered: the
+remote clock is not known here.
+
 ## 1. Folder mtime / "subtree max mtime" pruning — UNSOUND, rejected
 
 A folder's mtime (POSIX, and NTFS/SMB LastWriteTime alike) changes when an
@@ -95,6 +107,7 @@ cache already absorbed the second `stat` there is unknown.
 | Local disk | parallel walk, one `stat` per file (§3) | Only via a filesystem change journal (below). Walk is seconds. |
 | `ssh://host/...` | the walk already runs **on the host** (`find -printf` / agent); only the listing crosses the wire | Walk cost is remote CPU already. A smaller wire delta (host diffs against a baseline whose digest the client verifies) is sound but needs protocol + schema work; worth it only if a measurement shows transfer, not the remote `find`, dominates. Not measured. |
 | sshfs mount | local walk over FUSE: per-file round trips | Index the same folder as `ssh://host/path` instead: the walk moves to the host. Sound (same predicate, host-side `stat`). |
+| exFAT / FAT (`exfat`, `vfat`, `msdos`) | walk; no inodes, no ctime, no journal | **No delta shortcut; floor = walk.** The Linux drivers assign `iunique()` inode numbers per in-core inode (`fs/exfat/inode.c` `exfat_build_inode`, `fs/fat/inode.c` `fat_build_inode`): a file gets a new number after a remount *or an inode-cache eviction* (owner's X9 Pro1: 298 of 300 unchanged files had new numbers a day later). Such locations (`locations.ino_stable = 0`, decided from the live mount table's fstype) store inode 0 and compare **(size, mtime) only** — weaker: a different file renamed over one with the same size and mtime (`cp -p` + rename) is not seen. Without this every rescan reset every hash. `apply` treats inode 0 as unknown (size + mtime + device, `--paranoid` byte-compares). |
 | gvfs SMB / MTP (e.g. Shield) | local walk over gvfs FUSE | **No honest shortcut.** No remote exec, no recursive change indicator, folder mtimes do not cover in-place writes, SMB CHANGE_NOTIFY only sees changes while connected. A full listing (+ one `stat` per file, §3) is the floor. Run a host-side indexer (ssh/agent) on the device if it has a shell; otherwise accept the walk. |
 | inotify / fanotify | — | Sound only with a continuity proof: watcher running since the last complete scan, no queue overflow (`IN_Q_OVERFLOW`), volume never mounted elsewhere or written offline. Impossible to prove for removable, offline or network volumes; not implemented. |
 | btrfs / ZFS / NTFS / CephFS | — | Filesystem-maintained journals are sound sources: `btrfs subvolume find-new <gen>` (content changes; deletions need the name list), `zfs diff snap1 snap2`, NTFS USN journal (with journal-id + next-USN continuity check), CephFS `ceph.dir.rctime`. Each is a per-filesystem integration with its own continuity check; none implemented here. |
