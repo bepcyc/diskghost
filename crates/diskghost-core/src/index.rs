@@ -2164,10 +2164,10 @@ fn add_note(sum: &mut ScanSummary, note: String) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Walk `dir` (on the scan's volume) into `record`: every name of every
 /// file; folders listed but not entered go to `bound`. Returns how many
 /// entries could not be read.
+#[allow(clippy::too_many_arguments)]
 fn walk_into(
     dir: &Path,
     walk_opts: &Options,
@@ -2698,9 +2698,9 @@ fn add_dirs(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// After every scan: keep the folder table only after a complete scan that
 /// read BULKSTAT first; any other scan of the location forgets it.
+#[allow(clippy::too_many_arguments)]
 fn record_inode_ref(
     tx: &Connection,
     loc: i64,

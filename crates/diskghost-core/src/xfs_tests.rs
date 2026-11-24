@@ -31,17 +31,28 @@ fn scan(e: &Estate, o: &Options) -> ScanSummary {
         .unwrap()
 }
 
-type Row = (String, i64, i64, i64);
+/// (path, size, mtime, inode, inode change time, racy): everything a
+/// scan records about a file except its hashes and generation.
+type Row = (String, i64, i64, i64, Option<i64>, bool);
 
 fn rows(idx: &Index) -> Vec<Row> {
     let mut st = idx
         .conn
-        .prepare("SELECT path, size, mtime_ns, ino FROM files ORDER BY path")
+        .prepare("SELECT path, size, mtime_ns, ino, ctime_ns, racy FROM files ORDER BY path")
         .unwrap();
-    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+    st.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
 }
 
 /// What a full walk (no capability, so no delta) records, in its own DB.
@@ -406,4 +417,40 @@ fn a_folder_that_cannot_be_listed_keeps_its_rows_and_the_table_is_forgotten() {
     assert!(s.delta.is_some() && !s.complete, "{s:?}");
     assert_eq!(rows(&e.idx), before, "nothing dropped");
     assert!(!has_table(&e), "incomplete: the next scan walks");
+}
+
+#[test]
+fn nested_mounts_under_clean_and_changed_folders_keep_the_walks_rows() {
+    let e = xfs_estate("xfs-nested-mounts", true);
+    let a = e.loc("A");
+    write(&a.join("clean/f.bin"), &content(1));
+    write(&a.join("busy/g.bin"), &content(2));
+    if other_device(&a.join("clean/vol")).is_none() {
+        eprintln!("SKIP: no btrfs subvolume possible here (another st_dev without root)");
+        return;
+    }
+    write(&a.join("clean/vol/in.bin"), &content(3));
+    std::thread::sleep(Duration::from_millis(2100));
+    scan(&e, &Options::default());
+    settle(&e);
+    // A mount under a clean folder: looked at, nothing else listed.
+    let copy = copy_index(&e, 1);
+    let s = scan(&e, &Options::default());
+    assert!(s.delta.is_some() && s.complete, "{s:?}");
+    assert_eq!(rows(&e.idx), walk_rescan_rows(&e, &copy));
+    // A new mount under a changed folder: noted, not entered.
+    assert!(other_device(&a.join("busy/vol2")).is_some());
+    write(&a.join("busy/vol2/x.bin"), &content(4));
+    let copy = copy_index(&e, 2);
+    let s = scan(&e, &Options::default());
+    assert!(s.delta.is_some() && s.complete, "{s:?}");
+    assert_eq!(rows(&e.idx), walk_rescan_rows(&e, &copy));
+    let ino: i64 = e
+        .idx
+        .conn
+        .query_row("SELECT ino FROM dirs WHERE path = 'busy/vol2'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(ino, -1);
 }
