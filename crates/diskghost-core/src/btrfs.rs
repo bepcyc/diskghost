@@ -185,12 +185,28 @@ pub(crate) fn subvol(_path: &Path) -> io::Result<Subvol> {
     ))
 }
 
+/// `syncfs` the filesystem holding `path`: commits the running
+/// transaction, so inode items still held as delayed updates are in the
+/// tree a search reads. No privilege needed.
+#[cfg(target_os = "linux")]
+pub(crate) fn sync_fs(f: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid open fd; syncfs takes nothing else.
+    if unsafe { libc::syncfs(f.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Every inode of the subvolume holding `path` whose item changed in a
-/// transaction after `since` (CAP_SYS_ADMIN).
+/// transaction after `since` (CAP_SYS_ADMIN). The filesystem is synced
+/// first (after G was read by the caller): every change made before the
+/// scan is then committed and in the tree, with a transid above G.
 #[cfg(target_os = "linux")]
 pub(crate) fn changed_since(path: &Path, since: u64) -> io::Result<HashMap<u64, InodeInfo>> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path)?;
+    sync_fs(&f)?;
     let mut buf = vec![0u8; SEARCH_ARGS_V2_SIZE + BUF];
     let mut out = HashMap::new();
     let mut start = (FIRST_FREE_OBJECTID, INODE_ITEM_KEY, 0u64);
@@ -373,6 +389,13 @@ mod tests {
             Ok(s) => assert!(s.generation > 0 && s.treeid >= 5, "{s:?}"),
             Err(e) => assert_ne!(e.raw_os_error(), Some(libc::EPERM), "{e}"),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn syncing_the_filesystem_needs_no_privilege() {
+        let f = std::fs::File::open(std::env::temp_dir()).unwrap();
+        sync_fs(&f).unwrap();
     }
 
     #[test]
