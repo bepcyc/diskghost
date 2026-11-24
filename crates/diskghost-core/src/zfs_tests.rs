@@ -487,3 +487,41 @@ fn a_file_that_lost_all_its_names_means_a_walk() {
     set_diff(&e, &[format!("-\tF\t{}", esc(&a.join("one.bin")))]);
     fallback(&e, "one of several names");
 }
+
+#[test]
+fn a_removal_named_outside_the_scanned_folder_means_a_walk() {
+    // sub/a.bin and other/b.bin are one file; only sub/ is indexed. Both
+    // names go; zfs may print just `- other/b.bin` — the row of sub/a.bin
+    // would stay if the delta were trusted.
+    let (e, creation) = zfs_estate("zfs-outside-name");
+    let a = e.loc("A");
+    write(&a.join("sub/a.bin"), &content(1));
+    write(&a.join("sub/keep.bin"), &content(2));
+    std::fs::create_dir_all(a.join("other")).unwrap();
+    std::fs::hard_link(a.join("sub/a.bin"), a.join("other/b.bin")).unwrap();
+    let sub = a.join("sub");
+    let scan_sub = |e: &Estate| {
+        e.with_probe(|p| scan_with(&e.idx, &sub, &opts(true), &Progress::default(), p))
+            .unwrap()
+    };
+    assert!(scan_sub(&e).complete);
+    age_rows(&e, creation);
+    std::fs::remove_file(a.join("sub/a.bin")).unwrap();
+    std::fs::remove_file(a.join("other/b.bin")).unwrap();
+    set_diff(&e, &[format!("-\tF\t{}", esc(&a.join("other/b.bin")))]);
+    let s = scan_sub(&e);
+    assert!(s.delta.is_none(), "{s:?}");
+    assert!(
+        s.delta_note
+            .as_deref()
+            .unwrap()
+            .contains("outside this folder"),
+        "{s:?}"
+    );
+    let paths: Vec<String> = rows(&e.idx).into_iter().map(|r| r.0).collect();
+    assert_eq!(
+        paths,
+        vec!["sub/keep.bin".to_string()],
+        "the walk dropped sub/a.bin"
+    );
+}

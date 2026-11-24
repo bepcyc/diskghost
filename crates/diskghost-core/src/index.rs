@@ -1737,12 +1737,23 @@ fn zfs_plan(
             else {
                 continue;
             };
-            if let Some(ino) = ino_of
+            match ino_of
                 .query_row(params![loc, rel], |r| r.get::<_, i64>(0))
                 .optional()
                 .map_err(db_err)?
             {
-                gone_inos.push(ino);
+                Some(ino) => gone_inos.push(ino),
+                // Named outside this folder and never indexed: zfs may have
+                // printed that name of an object whose other name is a row
+                // in here — nothing would ever find it.
+                None if !in_prefix(rel, prefix) => {
+                    return walk(format!(
+                        "--zfs-diff: {} was removed or renamed outside this folder and is not \
+                         indexed; a file it named could have another name in here; walked",
+                        c.path.display()
+                    ));
+                }
+                None => {}
             }
         }
         if !gone_inos.is_empty() {
