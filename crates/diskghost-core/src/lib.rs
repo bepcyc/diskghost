@@ -37,6 +37,7 @@ mod remote_tests;
 mod rescan_tests;
 mod rotational;
 mod snapshot;
+pub mod sshfs;
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 mod testkit;
@@ -115,6 +116,11 @@ pub struct Options {
     /// every path, so a remote `/sys` loops forever and every directory
     /// identity check (path or device+inode) sees only new directories.
     pub skip_remote: bool,
+    /// Index a folder on an `sshfs` mount anyway. Without it the persistent
+    /// index refuses such a root and names the `ssh://` location of the
+    /// same folder (see [`sshfs::SshfsRoot`]): listed by the host itself,
+    /// not one network round trip per file. Plain scans ignore it.
+    pub allow_sshfs: bool,
 }
 
 /// Live progress + cancellation shared with a running scan / duplicate search.

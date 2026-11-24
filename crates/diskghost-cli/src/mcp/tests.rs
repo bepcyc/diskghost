@@ -54,3 +54,49 @@ fn plans_dir_is_under_the_state_home() {
         assert!(p.ends_with("diskghost/plans"), "{p:?}");
     }
 }
+
+#[test]
+fn an_sshfs_root_is_a_structured_error_with_its_url() {
+    use diskghost_core::sshfs::SshfsRoot;
+    let abs = SshfsRoot {
+        path: "/mnt/nas/films".into(),
+        source: "nas:/srv/media".into(),
+        url: Some("ssh://nas//srv/media/films".into()),
+        why: None,
+    };
+    let j = super::ToolError::sshfs(&abs).to_json();
+    assert_eq!(j["code"], "sshfs_root");
+    assert_eq!(j["url"], "ssh://nas//srv/media/films");
+    let msg = j["message"].as_str().unwrap();
+    assert!(
+        msg.contains("allow_sshfs=true") && !msg.contains("--allow-sshfs"),
+        "{msg}"
+    );
+    assert!(!msg.contains("relative to the remote home"), "{msg}");
+
+    // A home-relative URL: add_location takes only absolute remote paths.
+    let rel = SshfsRoot {
+        url: Some("ssh://nas/media".into()),
+        ..abs.clone()
+    };
+    let msg = super::ToolError::sshfs(&rel).message;
+    assert!(msg.contains("relative to the remote home"), "{msg}");
+
+    // No URL (IPv6): no url field, the hint is in the message.
+    let v6 = SshfsRoot {
+        url: None,
+        why: Some("add a Host alias".into()),
+        ..abs.clone()
+    };
+    let j = super::ToolError::sshfs(&v6).to_json();
+    assert!(j.get("url").is_none());
+    assert!(j["message"].as_str().unwrap().contains("add a Host alias"));
+
+    // The same error out of a scan job is classified the same way.
+    let io = std::io::Error::new(std::io::ErrorKind::InvalidInput, abs);
+    let e = super::ToolError::from_io(std::path::Path::new("/db"), &io);
+    assert_eq!(
+        (e.code, e.url.as_deref()),
+        ("sshfs_root", Some("ssh://nas//srv/media/films"))
+    );
+}

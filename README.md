@@ -195,6 +195,14 @@ Carrying a plan out stays a manual step you run yourself
 | `dupes_report` | Duplicate groups biggest-first with copies, keep/reclaimable hints, copy-on-write warning, single-copy counts, paging |
 | `plan_dedup` | Write a plan for a policy (`min_copies`, `distinct`, per-location roles); returns its path and the literal next step |
 
+**sshfs folders.** A local folder on an `sshfs` mount is refused by
+`diskghost index add` and by `add_location` / `start_scan` (error code
+`sshfs_root`, with the URL in `url`): indexing through the mount costs a
+network round trip per file, while the same folder as `ssh://host//path` is
+listed by the host itself. The message names that URL (an IPv6 host gets a
+`~/.ssh/config` alias hint instead); `--allow-sshfs` (MCP `allow_sshfs: true`)
+indexes the mount anyway.
+
 Long work is a **job**: the tool returns a `job_id` immediately and you poll
 `job_status`. Scans, `dupes_report` and `plan_dedup` write the index, which
 takes one writer at a time, so they run one after another (later ones show

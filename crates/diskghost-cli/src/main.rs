@@ -298,6 +298,12 @@ enum IndexAction {
         /// run); `never` always uses the shell tools.
         #[arg(long, value_enum, default_value = "auto")]
         agent: AgentArg,
+        /// Index a folder on an sshfs mount anyway. Without it such a folder
+        /// is refused with the ssh://host/path that indexes the same files:
+        /// the host lists them itself instead of one network round trip per
+        /// file through the mount.
+        #[arg(long)]
+        allow_sshfs: bool,
         #[command(flatten)]
         walk: WalkArgs,
     },
@@ -392,6 +398,7 @@ impl WalkArgs {
             mft: self.mft,
             same_file_system: self.one_file_system,
             skip_remote: !self.remote,
+            allow_sshfs: false,
         }
     }
 }
@@ -1124,9 +1131,13 @@ fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
             role,
             host,
             agent,
+            allow_sshfs,
             walk,
         } => {
-            let opts = walk.to_options();
+            let opts = Options {
+                allow_sshfs,
+                ..walk.to_options()
+            };
             let role = role.map(Role::from);
             let mut done = Vec::new();
             for path in &paths {

@@ -899,6 +899,13 @@ pub fn index_scan(
     opts: &Options,
     progress: &Progress,
 ) -> io::Result<ScanSummary> {
+    // An sshfs folder is refused before anything is written: the same
+    // folder as ssh://host/path is listed by the host itself.
+    if !opts.allow_sshfs {
+        if let Some(r) = crate::sshfs::sshfs_root(root) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, r));
+        }
+    }
     scan_with(idx, root, opts, progress, &Probe::REAL)
 }
 

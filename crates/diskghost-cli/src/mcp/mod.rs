@@ -75,6 +75,9 @@ pub(crate) struct ToolError {
     pub message: String,
     /// The index database involved, for `index_busy` and index failures.
     pub db: Option<String>,
+    /// `sshfs_root`: the `ssh://` location of the same folder, when one
+    /// can be written.
+    pub url: Option<String>,
 }
 
 impl ToolError {
@@ -83,6 +86,30 @@ impl ToolError {
             code,
             message: message.into(),
             db: None,
+            url: None,
+        }
+    }
+
+    /// A folder on an sshfs mount, refused: names the `ssh://` location
+    /// of the same folder (see [`diskghost_core::sshfs::SshfsRoot`]).
+    pub fn sshfs(r: &diskghost_core::sshfs::SshfsRoot) -> ToolError {
+        let mut message = r.to_string().replace("--allow-sshfs", "allow_sshfs=true");
+        // add_location takes only ssh://host//absolute/path.
+        if let Some(u) = r.url.as_deref() {
+            if u.strip_prefix("ssh://")
+                .is_some_and(|rest| !rest.contains("//"))
+            {
+                message.push_str(
+                    " That path is relative to the remote home; add_location needs \
+                     ssh://host//absolute/path (the home is what `ssh host pwd` prints).",
+                );
+            }
+        }
+        ToolError {
+            code: "sshfs_root",
+            message,
+            db: None,
+            url: r.url.clone(),
         }
     }
 
@@ -102,15 +129,23 @@ impl ToolError {
                      `diskghost index add`); nothing was changed, retry when it has finished"
                 ),
                 db: Some(db_s),
+                url: None,
             };
         }
         if e.kind() == std::io::ErrorKind::Interrupted {
             return ToolError::new("cancelled", "cancelled");
         }
+        if let Some(r) = e
+            .get_ref()
+            .and_then(|x| x.downcast_ref::<diskghost_core::sshfs::SshfsRoot>())
+        {
+            return ToolError::sshfs(r);
+        }
         ToolError {
             code: "index_error",
             message: e.to_string(),
             db: Some(db_s),
+            url: None,
         }
     }
 
@@ -120,6 +155,9 @@ impl ToolError {
         m.insert("message".into(), json!(self.message));
         if let Some(db) = &self.db {
             m.insert("db".into(), json!(db));
+        }
+        if let Some(url) = &self.url {
+            m.insert("url".into(), json!(url));
         }
         Value::Object(m)
     }

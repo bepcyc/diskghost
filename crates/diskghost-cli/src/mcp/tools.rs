@@ -71,6 +71,8 @@ pub(crate) fn definitions() -> Vec<Value> {
             "description": "Glob patterns to skip (matched on path, component or name), e.g. [\"node_modules\", \"*.tmp\"]. Local folders only."},
         "one_file_system": {"type": "boolean",
             "description": "Stay on the filesystem of the scan root. Local folders only."},
+        "allow_sshfs": {"type": "boolean",
+            "description": "Index a local folder on an sshfs mount anyway. Default false: refused with error code sshfs_root, whose url field is the ssh:// location of the same folder (listed by the host itself, not one network round trip per file)."},
     });
     let agent = json!({"type": "string", "enum": ["auto", "never"],
         "description": "ssh:// only. auto (default): copy this program once to ~/.cache/diskghost/ on the host (mv -n, never overwrites, not a user file) and let it list and hash there; falls back to the host's shell tools and says why in agent_note. never: shell tools only, nothing is uploaded."});
@@ -432,6 +434,7 @@ fn walk_options(m: &Map<String, Value>) -> Result<Options, ToolError> {
         exclude,
         same_file_system: opt_bool(m, "one_file_system")?.unwrap_or(false),
         skip_remote: true,
+        allow_sshfs: opt_bool(m, "allow_sshfs")?.unwrap_or(false),
         ..Options::default()
     })
 }
@@ -647,6 +650,7 @@ fn set_location_role(ctx: &Arc<Ctx>, args: &Value) -> R {
                  hold this change until it ends — retry afterwards"
             ),
             db: Some(ctx.db.display().to_string()),
+            url: None,
         });
     }
     let idx = open_index(&ctx.db, ctx.busy)?;
@@ -675,6 +679,7 @@ fn forget_location(ctx: &Arc<Ctx>, args: &Value) -> R {
                  hold this change until it ends — retry afterwards"
             ),
             db: Some(ctx.db.display().to_string()),
+            url: None,
         });
     }
     let idx = open_index(&ctx.db, ctx.busy)?;
@@ -961,6 +966,18 @@ fn upload_notes(target: &Target, agent: AgentMode) -> Vec<String> {
     }
 }
 
+/// A local folder on an sshfs mount, unless allowed: refused before a job
+/// is queued, with the `ssh://` location of the same folder.
+fn refuse_sshfs(target: &Target, opts: &Options) -> Result<(), ToolError> {
+    match target {
+        Target::Local(p) if !opts.allow_sshfs => match diskghost_core::sshfs::sshfs_root(p) {
+            Some(r) => Err(ToolError::sshfs(&r)),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
 fn job_started(ctx: &Arc<Ctx>, id: &str, target: &str, notes: &[String]) -> Value {
     let state = ctx.jobs.get(id).map_or(Value::Null, |j| j["state"].clone());
     json!({"job_id": id, "kind": "scan", "state": state, "target": target, "notes": notes})
@@ -969,19 +986,30 @@ fn job_started(ctx: &Arc<Ctx>, id: &str, target: &str, notes: &[String]) -> Valu
 fn add_location(ctx: &Arc<Ctx>, args: &Value) -> R {
     let m = args_of(
         args,
-        &["path", "role", "agent", "exclude", "one_file_system"],
+        &[
+            "path",
+            "role",
+            "agent",
+            "exclude",
+            "one_file_system",
+            "allow_sshfs",
+        ],
     )?;
     let target = parse_target(req_str(&m, "path")?)?;
     let role = opt_str(&m, "role")?.map(role_arg).transpose()?;
     let agent = agent_arg(&m)?;
     let opts = walk_options(&m)?;
     if matches!(target, Target::Remote { .. })
-        && (m.contains_key("exclude") || m.contains_key("one_file_system"))
+        && (m.contains_key("exclude")
+            || m.contains_key("one_file_system")
+            || m.contains_key("allow_sshfs"))
     {
         return Err(ToolError::invalid(
-            "exclude and one_file_system apply to local folders only: the host lists its own files",
+            "exclude, one_file_system and allow_sshfs apply to local folders only: the host \
+             lists its own files",
         ));
     }
+    refuse_sshfs(&target, &opts)?;
     preflight_writer(ctx)?;
     let label = target.label();
     let notes = upload_notes(&target, agent);
@@ -1003,7 +1031,14 @@ fn add_location(ctx: &Arc<Ctx>, args: &Value) -> R {
 fn start_scan(ctx: &Arc<Ctx>, args: &Value) -> R {
     let m = args_of(
         args,
-        &["location", "path", "agent", "exclude", "one_file_system"],
+        &[
+            "location",
+            "path",
+            "agent",
+            "exclude",
+            "one_file_system",
+            "allow_sshfs",
+        ],
     )?;
     let agent = agent_arg(&m)?;
     let opts = walk_options(&m)?;
@@ -1075,6 +1110,7 @@ fn start_scan(ctx: &Arc<Ctx>, args: &Value) -> R {
         (None, None) => unreachable!("one of location or path is set"),
     }
     for s in &specs {
+        refuse_sshfs(&s.target, &opts)?;
         if let Target::Local(p) = &s.target {
             if !p.is_dir() {
                 return Err(ToolError::new(
