@@ -603,6 +603,17 @@ fn index_add_then_status_json() {
     std::fs::write(tree.join("a"), b"same").unwrap();
     std::fs::write(tree.join("sub/b"), b"same").unwrap();
     std::fs::write(tree.join("c"), b"unique!").unwrap();
+    // Written long before the scan: outside the index's 2 s racy window,
+    // where every file is sampled whatever its size.
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for f in ["a", "sub/b", "c"] {
+        std::fs::File::options()
+            .write(true)
+            .open(tree.join(f))
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+    }
     let db = d.join("db/index.db");
 
     let out = index_cmd(

@@ -270,7 +270,8 @@ pub struct ScanSummary {
     pub racy_changed: u64,
     /// Rows dropped because their file is gone (index rows only).
     pub vanished: u64,
-    /// Files whose two ends were read because their size collides.
+    /// Files whose two ends were read because their size collides, or
+    /// because they are racy (written within 2 s of the scan).
     pub sampled: u64,
     /// Entries not indexed: unreadable, a path that is not UTF-8, or on
     /// another device than the scanned folder.
@@ -2455,6 +2456,7 @@ mod tests {
             write(&t.join("a"), b"1");
             write(&t.join("sub/b"), b"22");
             write(&t.join("c"), b"333");
+            age(&t, &["a", "sub/b", "c"]);
             let idx = open_db(&d);
             let (s, reads) = scan(&idx, &t);
             assert!(
@@ -2510,6 +2512,8 @@ mod tests {
             write(&ta.join("movie"), &[9u8; 50_000]);
             write(&tb.join("movie copy"), &[9u8; 50_000]);
             write(&tb.join("unique"), &[1u8; 123]);
+            age(&ta, &["movie"]);
+            age(&tb, &["movie copy", "unique"]);
             let idx = open_db(&d);
             // Alone, A's file collides with nothing: not read.
             let (_, r1) = scan(&idx, &ta);

@@ -1458,6 +1458,13 @@ mod tests {
         // A's same-size file arrived later.
         let e = Estate::new("probable-size");
         write(&e.loc("B").join("b.bin"), &content(7));
+        // Written long before the scan: not racy, so not sampled alone.
+        std::fs::File::options()
+            .write(true)
+            .open(e.loc("B").join("b.bin"))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
         e.add("B");
         assert_eq!(e.row("B", "b.bin").2, None);
         e.unplug("B");
