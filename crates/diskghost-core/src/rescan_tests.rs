@@ -356,27 +356,64 @@ fn a_racy_row_with_the_same_bytes_is_rechecked_not_reported_changed() {
 }
 
 #[test]
-fn documented_limit_a_racy_row_of_unique_size_is_reset_but_not_judged() {
-    // Only sizes shared with another file are sampled (a unique size has
-    // no copy to compare with). A racy unique-size row that changed in
-    // place loses its (empty) hashes and is counted in racy_rechecked,
-    // but racy_changed cannot judge it: no sample before or after. Its
-    // bytes are read when a same-size file appears.
+fn a_racy_row_of_unique_size_is_judged_too() {
+    // Racy rows are sampled even when no other file shares their size, so
+    // a same-tick, same-size write is judged by its bytes at the next scan.
     let e = Estate::new("rescan-racy-unique");
     let f = e.loc("A").join("only.bin");
     write(&f, &content(1));
     e.scan("A");
     assert!(stored(&e, "A", "only.bin").1);
+    let before = e.row("A", "only.bin").2;
+    assert!(before.is_some(), "a racy row is sampled whatever its size");
     rewrite_keeping_time(&f, 5);
     let s = e.scan("A");
     assert_eq!(
         (s.racy_rechecked, s.racy_changed, s.changed),
-        (1, 0, 0),
+        (1, 1, 0),
         "{s:?}"
     );
-    assert_eq!(e.row("A", "only.bin").2, None, "never sampled");
-    // A same-size file appears: the next scan samples both.
-    write(&e.loc("A").join("other.bin"), &content(1));
+    assert!(e.reads().contains(&f));
+    assert_ne!(e.row("A", "only.bin").2, before);
+}
+
+#[test]
+fn a_racy_row_that_aged_out_is_still_judged_by_a_direct_read() {
+    // Racy at its scan, but by the next scan outside the window: the
+    // sampling pass skips it (unique size, not racy any more), so the
+    // comparison reads its ends itself.
+    let e = Estate::new("rescan-racy-aged");
+    let f = e.loc("A").join("only.bin");
+    write(&f, &content(1));
     e.scan("A");
-    assert!(e.row("A", "only.bin").2.is_some());
+    let before = e.row("A", "only.bin").2;
+    assert!(before.is_some());
+    // Age the row and the file together: same (size, mtime) on both sides,
+    // older than the window, and the row still marked racy.
+    let old = ago(600);
+    set_mtime(&f, old);
+    let mtime_ns = std::fs::metadata(&f)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    e.idx
+        .conn
+        .execute(
+            "UPDATE files SET mtime_ns = ?1, racy = 1 WHERE path = 'only.bin'",
+            [mtime_ns],
+        )
+        .unwrap();
+    std::fs::write(&f, content(2)).unwrap();
+    set_mtime(&f, old);
+    let s = e.scan("A");
+    assert_eq!(
+        (s.racy_rechecked, s.racy_changed, s.changed),
+        (1, 1, 0),
+        "{s:?}"
+    );
+    assert!(!stored(&e, "A", "only.bin").1, "no longer racy");
+    assert_ne!(e.row("A", "only.bin").2, before, "stored the new sample");
 }

@@ -264,7 +264,8 @@ pub struct ScanSummary {
     pub racy_rechecked: u64,
     /// Of `racy_rechecked`: re-read after the walk and found with other
     /// bytes (a sample before and after that differ) — a change `stat`
-    /// could not see. Rows without a sample on both sides are not judged.
+    /// could not see. Racy rows are sampled whatever their size; a row
+    /// gone or changed again before its ends could be read is not judged.
     #[serde(default)]
     pub racy_changed: u64,
     /// Rows dropped because their file is gone (index rows only).
@@ -1458,14 +1459,49 @@ pub(crate) fn scan_with(
         sum.sampled = sample_collisions(idx, progress, probe)?;
         let mut now = idx
             .conn
-            .prepare_cached("SELECT sample FROM files WHERE location_id = ?1 AND path = ?2")
+            .prepare_cached(
+                "SELECT sample, size, mtime_ns FROM files WHERE location_id = ?1 AND path = ?2",
+            )
+            .map_err(db_err)?;
+        let mut store = idx
+            .conn
+            .prepare_cached(
+                "UPDATE files SET sample = ?3 WHERE location_id = ?1 AND path = ?2 \
+                 AND size = ?4 AND mtime_ns = ?5 AND sample IS NULL",
+            )
             .map_err(db_err)?;
         for (rel, before) in &racy_before {
-            let after: Option<Vec<u8>> = now
-                .query_row(params![loc, rel], |r| r.get(0))
+            type Now = (Option<Vec<u8>>, i64, i64);
+            let Some((after, size, mtime)) = now
+                .query_row(params![loc, rel], |r| -> rusqlite::Result<Now> {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
                 .optional()
                 .map_err(db_err)?
-                .flatten();
+            else {
+                continue;
+            };
+            // Not sampled above (no other file of its size, and no longer
+            // racy): read its ends here — only while it is still the file
+            // the row describes — so the change is judged by its bytes.
+            let after = match after {
+                Some(a) => Some(a),
+                None => {
+                    let abs = vol.mount_point.join(rel);
+                    let fresh = std::fs::metadata(&abs).ok().map(|m| stat_of(&m));
+                    match fresh {
+                        Some(st) if (to_sql(st.size), to_sql(st.mtime_ns)) == (size, mtime) => {
+                            (probe.on_read)(&abs);
+                            sample_file(&abs, st.size).map(|x| {
+                                let _ =
+                                    store.execute(params![loc, rel, &x.sample[..], size, mtime]);
+                                x.sample.to_vec()
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+            };
             if after.is_some_and(|a| a != *before) {
                 sum.racy_changed += 1;
             }
@@ -1516,8 +1552,9 @@ struct Pending {
 }
 
 /// Read the two ends of every indexed file that has no sample yet and whose
-/// size collides with another indexed file (same size = potential copy),
-/// on every location that is online now. Each file is re-`stat`ed first and
+/// size collides with another indexed file (same size = potential copy) or
+/// that is racy (its sample is what the next scan judges it by), on every
+/// location that is online now. Each file is re-`stat`ed first and
 /// only read while it still matches its row; anything else waits for the
 /// next scan of its volume. Returns how many files were sampled.
 fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Result<u64> {
@@ -1529,8 +1566,8 @@ fn sample_collisions(idx: &Index, progress: &Progress, probe: &Probe) -> io::Res
                 "SELECT l.id, l.uuid, l.root, f.path, f.size, f.mtime_ns, f.ino, l.ino_stable \
                  FROM files f JOIN locations l ON l.id = f.location_id \
                  WHERE l.host NOT LIKE 'ssh://%' \
-                   AND f.sample IS NULL AND f.size > 0 AND f.size IN \
-                   (SELECT size FROM files WHERE size > 0 GROUP BY size HAVING COUNT(*) > 1) \
+                   AND f.sample IS NULL AND f.size > 0 AND (f.racy = 1 OR f.size IN \
+                   (SELECT size FROM files WHERE size > 0 GROUP BY size HAVING COUNT(*) > 1)) \
                  ORDER BY l.id, f.path",
             )
             .map_err(db_err)?;
