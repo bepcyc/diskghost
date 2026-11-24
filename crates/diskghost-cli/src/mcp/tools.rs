@@ -706,6 +706,13 @@ fn find_files(ctx: &Arc<Ctx>, args: &Value) -> R {
             "location must be non-empty and free of control characters",
         ));
     }
+    // A local folder is matched on its canonical form: the index stores
+    // resolved roots, so `/var/x` must find files under `/private/var/x`.
+    let resolved = location
+        .filter(|l| l.starts_with('/'))
+        .and_then(|l| std::fs::canonicalize(l).ok())
+        .and_then(|p| p.to_str().map(str::to_owned));
+    let location = resolved.as_deref().or(location);
     let idx = open_index(&ctx.db, ctx.busy)?;
     // One row past the page tells whether there is a next one.
     let rows = idx

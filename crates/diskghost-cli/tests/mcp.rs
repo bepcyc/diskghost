@@ -713,6 +713,12 @@ fn store_two_snapshots(sb: &Sandbox, dir: &Path) {
             &Progress::default(),
         ))
     };
+    #[cfg(target_os = "macos")]
+    let store = sb
+        .root
+        .join("home/Library/Application Support/org.diskghost.app/snapshots")
+        .join(Snapshot::root_key(dir));
+    #[cfg(not(target_os = "macos"))]
     let store = sb
         .root
         .join("data/org.diskghost.app/snapshots")
