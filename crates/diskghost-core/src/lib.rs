@@ -22,6 +22,9 @@ mod agent_tests;
 pub mod apply;
 #[cfg(all(test, unix))]
 mod apply_tests;
+mod btrfs;
+#[cfg(all(test, unix))]
+mod btrfs_tests;
 mod dupes;
 pub mod index;
 mod index_report;

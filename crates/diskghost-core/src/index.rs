@@ -96,7 +96,7 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
@@ -204,6 +204,14 @@ CREATE TABLE dirs (
     PRIMARY KEY (location_id, path)
 ) WITHOUT ROWID;
 ALTER TABLE locations ADD COLUMN inode_ref_root TEXT;
+",
+    // v9: which inode source made the folder table (xfs | btrfs), and for
+    // btrfs the subvolume (treeid:uuid) and the generation read before the
+    // scan listed anything: the next scan asks what changed after it.
+    r"
+ALTER TABLE locations ADD COLUMN inode_ref_kind TEXT;
+ALTER TABLE locations ADD COLUMN inode_ref_gen INTEGER;
+ALTER TABLE locations ADD COLUMN inode_ref_subvol TEXT;
 ",
 ];
 
@@ -987,7 +995,16 @@ pub(crate) struct Probe<'a> {
     pub(crate) bulkstat: &'a BulkstatFn<'a>,
     /// This process's mount table (empty where there is none).
     pub(crate) mounts: &'a dyn Fn() -> Vec<MountEntry>,
+    /// The btrfs subvolume holding a path (no privilege needed).
+    pub(crate) btrfs_subvol: &'a dyn Fn(&Path) -> io::Result<crate::btrfs::Subvol>,
+    /// Inodes of the subvolume holding a path changed after a generation
+    /// (tree search; CAP_SYS_ADMIN).
+    pub(crate) btrfs_changed: &'a ChangedFn<'a>,
 }
+
+/// [`Probe::btrfs_changed`].
+pub(crate) type ChangedFn<'a> =
+    dyn Fn(&Path, u64) -> io::Result<HashMap<u64, crate::xfs::InodeInfo>> + 'a;
 
 /// [`Probe::bulkstat`].
 pub(crate) type BulkstatFn<'a> = dyn Fn(
@@ -1012,6 +1029,8 @@ impl Probe<'static> {
         cap_sys_admin: &crate::xfs::has_cap_sys_admin,
         bulkstat: &crate::xfs::bulkstat,
         mounts: &mount_table,
+        btrfs_subvol: &crate::btrfs::subvol,
+        btrfs_changed: &crate::btrfs::changed_since,
     };
 }
 
@@ -1534,7 +1553,13 @@ pub(crate) fn scan_with(
                 )?;
             }
             _ if matches!(iplan, InodePlan::Delta { .. }) => {
-                sum.delta = Some("xfs bulkstat: listed only folders whose inode changed".into());
+                sum.delta = Some(match &iplan {
+                    InodePlan::Delta {
+                        source: InodeSource::Btrfs { .. },
+                        ..
+                    } => "btrfs tree search: listed only folders whose inode changed".into(),
+                    _ => "xfs bulkstat: listed only folders whose inode changed".into(),
+                });
                 unreadable += apply_inode_delta(
                     &tx,
                     &iplan,
@@ -2238,12 +2263,26 @@ enum InodePlan {
     Establish {
         why: String,
         inodes: HashMap<u64, crate::xfs::InodeInfo>,
+        source: InodeSource,
     },
-    /// List only folders whose inode changed: `inodes` holds every folder
-    /// and every inode a row under the scan folder names.
+    /// List only folders whose inode changed. XFS: `inodes` holds every
+    /// folder and every inode a row names (absent = gone). btrfs: `inodes`
+    /// holds exactly the inodes changed since the reference (absent =
+    /// unchanged).
     Delta {
         inodes: HashMap<u64, crate::xfs::InodeInfo>,
+        source: InodeSource,
     },
+}
+
+/// Where the inodes of an [`InodePlan`] come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InodeSource {
+    /// Every inode, from XFS BULKSTAT.
+    Xfs,
+    /// Inodes changed since a generation of a btrfs subvolume; `now` is
+    /// the subvolume's generation read before anything was listed.
+    Btrfs { subvol: String, now: u64 },
 }
 
 /// Decide whether this scan may use the XFS inode delta.
@@ -2258,7 +2297,8 @@ fn inode_plan(
     opts: &Options,
     probe: &Probe,
 ) -> io::Result<InodePlan> {
-    if vol.fstype != "xfs" {
+    let fs = vol.fstype.as_str();
+    if fs != "xfs" && fs != "btrfs" {
         return Ok(InodePlan::Off);
     }
     // A bind mount of this same filesystem below the scan folder: the walk
@@ -2268,32 +2308,71 @@ fn inode_plan(
         m.dev == root_dev && m.mount_point != vol.mount_point && m.mount_point.starts_with(root)
     }) {
         return Ok(InodePlan::Walk(format!(
-            "xfs: {} is a second mount of this filesystem below the scan folder; walked",
+            "{fs}: {} is a second mount of this filesystem below the scan folder; walked",
             m.mount_point.display()
         )));
     }
     if !opts.exclude.is_empty() || opts.max_depth.is_some() || opts.follow_symlinks {
-        return Ok(InodePlan::Walk(
-            "xfs: the inode delta works without --exclude, --max-depth and --follow-symlinks; \
+        return Ok(InodePlan::Walk(format!(
+            "{fs}: the inode delta works without --exclude, --max-depth and --follow-symlinks; \
              walked"
-                .into(),
-        ));
+        )));
     }
     if !(probe.cap_sys_admin)() {
-        return Ok(InodePlan::Walk(
-            "xfs: the inode delta reads BULKSTAT, which needs CAP_SYS_ADMIN; this process has \
+        let what = if fs == "xfs" {
+            "BULKSTAT"
+        } else {
+            "the btrfs tree search"
+        };
+        return Ok(InodePlan::Walk(format!(
+            "{fs}: the inode delta reads {what}, which needs CAP_SYS_ADMIN; this process has \
              none (diskghost is never given it), so it walked"
-                .into(),
-        ));
+        )));
     }
-    let ref_root: Option<String> = tx
+    type Ref = (Option<String>, Option<String>, Option<i64>, Option<String>);
+    let (ref_root, ref_kind, ref_gen, ref_subvol): Ref = tx
         .query_row(
-            "SELECT inode_ref_root FROM locations WHERE id = ?1",
+            "SELECT inode_ref_root, inode_ref_kind, inode_ref_gen, inode_ref_subvol \
+             FROM locations WHERE id = ?1",
             [loc],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(db_err)?;
-    let have_table = ref_root.as_deref() == Some(prefix);
+    let mut have_table = ref_root.as_deref() == Some(prefix) && ref_kind.as_deref() == Some(fs);
+    if fs == "btrfs" {
+        // The generation is read before anything is listed: whatever
+        // changes from here on has a later transid.
+        let sv = match (probe.btrfs_subvol)(root) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(InodePlan::Walk(format!(
+                    "btrfs: subvolume info failed ({e}); walked"
+                )))
+            }
+        };
+        let subvol = format!("{}:{}", sv.treeid, sv.uuid);
+        let source = InodeSource::Btrfs {
+            subvol: subvol.clone(),
+            now: sv.generation,
+        };
+        have_table = have_table && ref_subvol.as_deref() == Some(subvol.as_str());
+        let since = match (have_table, ref_gen) {
+            (true, Some(g)) => g as u64,
+            _ => {
+                return Ok(InodePlan::Establish {
+                    why: "btrfs: no folder table from a complete scan of this folder and \
+                          subvolume yet; walked, and recorded one"
+                        .into(),
+                    inodes: HashMap::new(),
+                    source,
+                })
+            }
+        };
+        return Ok(match (probe.btrfs_changed)(root, since) {
+            Ok(inodes) => InodePlan::Delta { inodes, source },
+            Err(e) => InodePlan::Walk(format!("btrfs: tree search failed ({e}); walked")),
+        });
+    }
     let mut want: std::collections::HashSet<u64> = std::collections::HashSet::new();
     if have_table {
         for sql in [
@@ -2323,13 +2402,17 @@ fn inode_plan(
         }
     };
     Ok(if have_table {
-        InodePlan::Delta { inodes }
+        InodePlan::Delta {
+            inodes,
+            source: InodeSource::Xfs,
+        }
     } else {
         InodePlan::Establish {
             why: "xfs: no folder table from a complete scan of this folder yet; walked, and \
                   recorded one"
                 .into(),
             inodes,
+            source: InodeSource::Xfs,
         }
     })
 }
@@ -2383,9 +2466,12 @@ fn apply_inode_delta(
     sum: &mut ScanSummary,
     dirs_seen: &mut Vec<PathBuf>,
 ) -> io::Result<u64> {
-    let InodePlan::Delta { inodes } = plan else {
+    let InodePlan::Delta { inodes, source } = plan else {
         return Ok(0);
     };
+    // XFS: every inode is in `inodes`, so an absent one is gone. btrfs:
+    // only changed ones are, so an absent one did not change.
+    let all = *source == InodeSource::Xfs;
     let mount = &cx.vol.mount_point;
     let mut unreadable = 0u64;
     let skip = |sum: &mut ScanSummary, p: &Path| {
@@ -2411,9 +2497,15 @@ fn apply_inode_delta(
             }
         }
     }
-    let changed = |ino: i64, ctime: Option<i64>| match inodes.get(&(ino as u64)) {
-        Some(i) if i.is_dir() => i.ctime_ns.map(to_sql) != ctime || ctime.is_none(),
-        _ => true,
+    let changed = |ino: i64, ctime: Option<i64>| {
+        if ino < 0 {
+            return true; // a mountpoint: always looked at
+        }
+        match inodes.get(&(ino as u64)) {
+            Some(i) if i.is_dir() && all => i.ctime_ns.map(to_sql) != ctime || ctime.is_none(),
+            Some(_) => true,
+            None => all,
+        }
     };
     let mut dirty: Vec<String> = table
         .iter()
@@ -2635,6 +2727,9 @@ fn apply_inode_delta(
             break;
         }
         let abs = mount.join(&path);
+        if !all && !inodes.contains_key(&(ino as u64)) {
+            continue; // btrfs: its inode did not change
+        }
         match inodes.get(&(ino as u64)) {
             Some(i) if i.is_file() => {
                 let same = (to_sql(i.size), to_sql(i.mtime_ns), i.ctime_ns.map(to_sql))
@@ -2738,14 +2833,28 @@ fn record_inode_ref(
         tx.execute("DELETE FROM dirs WHERE location_id = ?1", [loc])
             .map_err(db_err)?;
         tx.execute(
-            "UPDATE locations SET inode_ref_root = NULL WHERE id = ?1",
+            "UPDATE locations SET inode_ref_root = NULL, inode_ref_kind = NULL, \
+             inode_ref_gen = NULL, inode_ref_subvol = NULL WHERE id = ?1",
             [loc],
         )
         .map_err(db_err)?;
         Ok(())
     };
+    let set_ref = |source: &InodeSource| -> io::Result<()> {
+        let (kind, gen, subvol) = match source {
+            InodeSource::Xfs => ("xfs", None, None),
+            InodeSource::Btrfs { subvol, now } => ("btrfs", Some(to_sql(*now)), Some(subvol)),
+        };
+        tx.execute(
+            "UPDATE locations SET inode_ref_root = ?2, inode_ref_kind = ?3, inode_ref_gen = ?4, \
+             inode_ref_subvol = ?5 WHERE id = ?1",
+            params![loc, prefix, kind, gen, subvol],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    };
     match plan {
-        InodePlan::Establish { inodes, .. } if complete => {
+        InodePlan::Establish { inodes, source, .. } if complete => {
             forget()?;
             let mount = tx
                 .query_row("SELECT root FROM locations WHERE id = ?1", [loc], |r| {
@@ -2763,14 +2872,10 @@ fn record_inode_ref(
                 start_ns,
             )
             .map_err(db_err)?;
-            tx.execute(
-                "UPDATE locations SET inode_ref_root = ?2 WHERE id = ?1",
-                params![loc, prefix],
-            )
-            .map_err(db_err)?;
-            Ok(())
+            set_ref(source)
         }
-        InodePlan::Delta { .. } if complete => Ok(()),
+        // The next delta starts from this scan's own pre-listing reference.
+        InodePlan::Delta { source, .. } if complete => set_ref(source),
         _ => forget(),
     }
 }
@@ -3197,6 +3302,9 @@ mod tests {
                  ALTER TABLE locations DROP COLUMN zfs_ds_guid; \
                  ALTER TABLE locations DROP COLUMN zfs_ref_root; \
                  ALTER TABLE locations DROP COLUMN inode_ref_root; \
+                 ALTER TABLE locations DROP COLUMN inode_ref_kind; \
+                 ALTER TABLE locations DROP COLUMN inode_ref_gen; \
+                 ALTER TABLE locations DROP COLUMN inode_ref_subvol; \
                  DROP TABLE dirs;",
             )
             .unwrap();

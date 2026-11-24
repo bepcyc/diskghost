@@ -84,6 +84,13 @@ pub(crate) struct FakeXfs {
     pub(crate) calls: usize,
     /// The mount table the scan sees (empty: none below the tree).
     pub(crate) mounts: Vec<crate::walk::MountEntry>,
+    /// Locations that pretend to be btrfs: the fake subvolume info (its
+    /// generation is the clock in ns) and tree search (inodes whose change
+    /// time is after the asked generation) — what transids give for real.
+    pub(crate) btrfs: HashSet<String>,
+    pub(crate) btrfs_uuid: String,
+    pub(crate) btrfs_errno: Option<i32>,
+    pub(crate) btrfs_calls: usize,
 }
 
 /// Every inode under `root` (and `root` itself), as BULKSTAT would give.
@@ -172,10 +179,15 @@ impl Estate {
                 mount_point: base.join(&name),
                 ino_stable: !unstable.lock().unwrap().contains(&name),
                 zfs_dataset: zfs_state.lock().unwrap().datasets.get(&name).cloned(),
-                fstype: if xfs_state.lock().unwrap().volumes.contains(&name) {
-                    "xfs".into()
-                } else {
-                    String::new()
+                fstype: {
+                    let x = xfs_state.lock().unwrap();
+                    if x.volumes.contains(&name) {
+                        "xfs".into()
+                    } else if x.btrfs.contains(&name) {
+                        "btrfs".into()
+                    } else {
+                        String::new()
+                    }
                 },
             })
         };
@@ -241,7 +253,29 @@ impl Estate {
             Ok(all.into_iter().filter(|(_, i)| keep(i)).collect())
         };
         let mounts = || self.xfs.lock().unwrap().mounts.clone();
+        let btrfs_subvol = |_p: &Path| -> io::Result<crate::btrfs::Subvol> {
+            let x = self.xfs.lock().unwrap();
+            Ok(crate::btrfs::Subvol {
+                treeid: 5,
+                uuid: x.btrfs_uuid.clone(),
+                generation: crate::index::now_ns(),
+            })
+        };
+        let btrfs_changed =
+            |p: &Path, since: u64| -> io::Result<HashMap<u64, crate::xfs::InodeInfo>> {
+                let mut x = self.xfs.lock().unwrap();
+                x.btrfs_calls += 1;
+                if let Some(e) = x.btrfs_errno {
+                    return Err(io::Error::from_raw_os_error(e));
+                }
+                Ok(inodes_under(p)
+                    .into_iter()
+                    .filter(|(_, i)| i.ctime_ns.is_some_and(|c| c > since))
+                    .collect())
+            };
         let probe = Probe {
+            btrfs_subvol: &btrfs_subvol,
+            btrfs_changed: &btrfs_changed,
             mounts: &mounts,
             zfs: &zfs,
             snap_nlink: &snap_nlink,
