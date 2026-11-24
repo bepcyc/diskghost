@@ -509,13 +509,14 @@ fn a_removal_named_outside_the_scanned_folder_means_a_walk() {
     std::fs::remove_file(a.join("sub/a.bin")).unwrap();
     std::fs::remove_file(a.join("other/b.bin")).unwrap();
     set_diff(&e, &[format!("-\tF\t{}", esc(&a.join("other/b.bin")))]);
+    snap_has(&e, "other/b.bin", 2);
     let s = scan_sub(&e);
     assert!(s.delta.is_none(), "{s:?}");
     assert!(
         s.delta_note
             .as_deref()
             .unwrap()
-            .contains("outside this folder"),
+            .contains("had 2 names in the snapshot"),
         "{s:?}"
     );
     let paths: Vec<String> = rows(&e.idx).into_iter().map(|r| r.0).collect();
@@ -524,4 +525,56 @@ fn a_removal_named_outside_the_scanned_folder_means_a_walk() {
         vec!["sub/keep.bin".to_string()],
         "the walk dropped sub/a.bin"
     );
+}
+
+/// The snapshot (tank/A@s1) holds `rel` with `n` names.
+fn snap_has(e: &Estate, rel: &str, n: u64) {
+    let p = e.loc("A").join(".zfs/snapshot/s1").join(rel);
+    e.zfs.lock().unwrap().snap_nlink.insert(p, n);
+}
+
+#[test]
+fn an_unindexed_removal_inside_the_folder_with_two_names_in_the_snapshot_means_a_walk() {
+    // one.bin (indexed) and two.bin (never indexed, e.g. made after the
+    // walk listed its folder) are one file in the snapshot. Both go; zfs
+    // prints only `- two.bin`, which has no row.
+    let (e, creation) = zfs_estate("zfs-inside-unindexed");
+    let a = e.loc("A");
+    write(&a.join("one.bin"), &content(1));
+    scan_into(&e, &e.idx, &opts(true));
+    age_rows(&e, creation);
+    std::fs::remove_file(a.join("one.bin")).unwrap();
+    set_diff(&e, &[format!("-\tF\t{}", esc(&a.join("two.bin")))]);
+    snap_has(&e, "two.bin", 2);
+    fallback(&e, "had 2 names in the snapshot");
+}
+
+#[test]
+fn an_unindexed_removal_with_one_name_in_the_snapshot_keeps_the_delta() {
+    // Deleted after the snapshot but before the walk: never indexed, one
+    // name — nothing else can be stale, so no walk.
+    let (e, creation) = zfs_estate("zfs-one-name");
+    let a = e.loc("A");
+    write(&a.join("keep.bin"), &content(1));
+    scan_into(&e, &e.idx, &opts(true));
+    age_rows(&e, creation);
+    set_diff(
+        &e,
+        &[format!("-\tF\t{}", esc(&a.join("gone-before-walk.bin")))],
+    );
+    snap_has(&e, "gone-before-walk.bin", 1);
+    let s = scan_into(&e, &e.idx, &opts(true));
+    assert!(s.delta.is_some(), "{s:?}");
+    assert_eq!(rows(&e.idx), walked_rows(&e));
+}
+
+#[test]
+fn an_unreadable_snapshot_link_count_means_a_walk() {
+    let (e, creation) = zfs_estate("zfs-snap-unreadable");
+    let a = e.loc("A");
+    write(&a.join("keep.bin"), &content(1));
+    scan_into(&e, &e.idx, &opts(true));
+    age_rows(&e, creation);
+    set_diff(&e, &[format!("-\tF\t{}", esc(&a.join("x.bin")))]);
+    fallback(&e, "cannot be read");
 }

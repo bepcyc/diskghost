@@ -78,6 +78,9 @@ pub(crate) struct FakeZfs {
     pub(crate) state: BTreeMap<String, (String, String)>,
     pub(crate) diff: Option<Result<String, String>>,
     pub(crate) calls: Vec<Vec<String>>,
+    /// Link counts of files inside snapshots (`<mnt>/.zfs/snapshot/…`);
+    /// a path not here cannot be read.
+    pub(crate) snap_nlink: BTreeMap<PathBuf, u64>,
 }
 
 impl Estate {
@@ -162,8 +165,18 @@ impl Estate {
                 _ => Err(io::Error::other("unexpected zfs call")),
             }
         };
+        let snap_nlink = |p: &Path| -> io::Result<u64> {
+            self.zfs
+                .lock()
+                .unwrap()
+                .snap_nlink
+                .get(p)
+                .copied()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not in the snapshot"))
+        };
         let probe = Probe {
             zfs: &zfs,
+            snap_nlink: &snap_nlink,
             remote_online: &remote_online,
             volume: &volume,
             online: &online,

@@ -955,6 +955,8 @@ pub(crate) struct Probe<'a> {
     pub(crate) remote_online: &'a dyn Fn(&str, &str) -> bool,
     /// Runs `zfs` with these arguments (the ZFS delta only).
     pub(crate) zfs: &'a dyn Fn(&[String]) -> io::Result<String>,
+    /// Link count of a file inside a snapshot (`<mnt>/.zfs/snapshot/…`).
+    pub(crate) snap_nlink: &'a dyn Fn(&Path) -> io::Result<u64>,
 }
 
 fn no_read(_: &Path) {}
@@ -969,6 +971,7 @@ impl Probe<'static> {
         on_read: &no_read,
         remote_online: &crate::remote::ssh_online,
         zfs: &crate::zfs::run_zfs,
+        snap_nlink: &snap_nlink,
     };
 }
 
@@ -1743,15 +1746,32 @@ fn zfs_plan(
                 .map_err(db_err)?
             {
                 Some(ino) => gone_inos.push(ino),
-                // Named outside this folder and never indexed: zfs may have
-                // printed that name of an object whose other name is a row
-                // in here — nothing would ever find it.
-                None if !in_prefix(rel, prefix) => {
-                    return walk(format!(
-                        "--zfs-diff: {} was removed or renamed outside this folder and is not \
-                         indexed; a file it named could have another name in here; walked",
-                        c.path.display()
-                    ));
+                // Removed and never indexed: zfs may have printed this name
+                // of a file whose other name is a row (in this folder or
+                // not) — nothing else would ever find that row. The
+                // snapshot still has the file: its link count there says
+                // whether there was another name (libzfs itself reads
+                // snapshots under /.zfs/snapshot/, ZDIFF_SNAPDIR).
+                None if c.kind == crate::zfs::Kind::Removed && c.ftype == 'F' => {
+                    let short = snap.split_once('@').map_or(snap.as_str(), |(_, s)| s);
+                    let in_snap = vol.mount_point.join(".zfs/snapshot").join(short).join(rel);
+                    match (probe.snap_nlink)(&in_snap) {
+                        Ok(1) => {}
+                        Ok(n) => {
+                            return walk(format!(
+                                "--zfs-diff: {} was removed, is not indexed and had {n} names \
+                                 in the snapshot; another may be a row; walked",
+                                c.path.display()
+                            ))
+                        }
+                        Err(e) => {
+                            return walk(format!(
+                                "--zfs-diff: {} was removed and is not indexed, and its link \
+                                 count in the snapshot cannot be read ({e}); walked",
+                                c.path.display()
+                            ))
+                        }
+                    }
                 }
                 None => {}
             }
@@ -1806,6 +1826,11 @@ fn zfs_plan(
         creation,
         changes,
     })
+}
+
+/// A file's link count, as `lstat` sees it.
+fn snap_nlink(p: &Path) -> io::Result<u64> {
+    std::fs::symlink_metadata(p).map(|m| link_count(&m))
 }
 
 /// How many names a file has (1 where unknown).
