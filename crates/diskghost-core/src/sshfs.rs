@@ -9,10 +9,11 @@
 //! silently: `index add` refuses an sshfs root and names the URL to use.
 //!
 //! `/proc/self/mountinfo` shows an sshfs mount as fstype `fuse.sshfs` with
-//! the source exactly as given to `sshfs` (verified on a live mount):
-//! `host:/abs/path`, `host:` (the remote home), `host:rel` (relative to the
-//! home), `user@host:…`, and `[v6addr]:…` for an IPv6 address; space, tab,
-//! newline and backslash octal-escaped (decoded by the mountinfo parser).
+//! the source exactly as given to `sshfs`. Verified on live mounts:
+//! `host:/abs/path`, `host:` (the remote home), `user@host:…`, a space
+//! octal-escaped as `\040` (decoded by the mountinfo parser). Not verified
+//! live, handled by the same rule: `host:rel` (relative to the home) and
+//! `[v6addr]:…` for an IPv6 address (sshfs's bracket syntax).
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
