@@ -164,11 +164,16 @@ fn enumerate(req: &Value, out: &mut dyn Write) -> io::Result<()> {
                 return;
             }
         }
-        for p in b.files.iter().map(|f| &f.path).chain(&b.aliases) {
-            let frame = match (std::fs::symlink_metadata(p), p.strip_prefix(root)) {
-                (Ok(m), Ok(rel)) => match rel.to_str() {
+        for (p, listed) in b.names_with_stats() {
+            // The walk's own `stat` when it took one (links are not
+            // followed here, as `symlink_metadata`): one `stat` per file.
+            let st = match listed {
+                Some(st) => Ok(st.clone()),
+                None => std::fs::symlink_metadata(p).map(|m| crate::index::stat_of(&m)),
+            };
+            let frame = match (st, p.strip_prefix(root)) {
+                (Ok(st), Ok(rel)) => match rel.to_str() {
                     Some(rel) if !rel.is_empty() => {
-                        let st = crate::index::stat_of(&m);
                         n += 1;
                         json!({"f": {"p": rel, "s": st.size, "m": st.mtime_ns,
                                      "d": st.dev, "i": st.ino}})

@@ -36,6 +36,13 @@ pub(crate) struct Batch {
     /// link to it): not charged again, but a consumer that needs every name
     /// — the persistent index — still sees them.
     pub(crate) aliases: Vec<PathBuf>,
+    /// The `stat` the listing already took of each of `files`, then of each
+    /// of `aliases`, in order (`files.len() + aliases.len()` entries) — so a
+    /// consumer that needs size/mtime/dev/inode (the persistent index) does
+    /// not `stat` every file a second time. On a network or FUSE volume
+    /// each `stat` is a round trip. Empty when the walk had no per-file
+    /// `stat` (the MFT engine): consumers then `stat` themselves.
+    pub(crate) stats: Vec<crate::index::Stat>,
     /// Entries neither counted nor followed: symlinks and junctions when links
     /// are not followed, sockets, devices. A delete still has to remove them.
     pub(crate) others: Vec<PathBuf>,
@@ -44,6 +51,23 @@ pub(crate) struct Batch {
     /// Bounded (path, reason) pairs behind `skipped`: enough to point a
     /// report at what was missed without copying a whole tree of names.
     pub(crate) skips: Vec<(PathBuf, &'static str)>,
+}
+
+impl Batch {
+    /// Every name the batch holds — `files`, then `aliases` — with the
+    /// `stat` the listing took of it, or `None` when the walk took none
+    /// (the caller then has to `stat` the path itself).
+    pub(crate) fn names_with_stats(
+        &self,
+    ) -> impl Iterator<Item = (&PathBuf, Option<&crate::index::Stat>)> {
+        let have = self.stats.len() == self.files.len() + self.aliases.len();
+        self.files
+            .iter()
+            .map(|f| &f.path)
+            .chain(&self.aliases)
+            .enumerate()
+            .map(move |(i, p)| (p, if have { self.stats.get(i) } else { None }))
+    }
 }
 
 /// Threads for a walk with `Options::threads == None`: directory listing is
@@ -509,10 +533,13 @@ fn visit<'s, 'c: 's>(
         subdirs: Vec::new(),
         bound: Vec::new(),
         aliases: Vec::new(),
+        stats: Vec::new(),
         others: Vec::new(),
         skipped: 0,
         skips: Vec::new(),
     };
+    // Stats of aliases, appended after the files' when the batch is sent.
+    let mut alias_stats = Vec::new();
     let entries = match std::fs::read_dir(&b.dir) {
         Ok(rd) => rd,
         Err(_) => {
@@ -624,6 +651,7 @@ fn visit<'s, 'c: 's>(
                     .map(|mut s| s.insert(id))
                     .unwrap_or(true);
                 if !first {
+                    alias_stats.push(crate::index::stat_of(&meta));
                     b.aliases.push(path);
                     continue;
                 }
@@ -631,6 +659,7 @@ fn visit<'s, 'c: 's>(
             let size = on_disk_size(&meta, &path);
             bytes += size;
             b.modified.push(modified_ns(&meta));
+            b.stats.push(crate::index::stat_of(&meta));
             b.files.push(FileEntry {
                 path,
                 size,
@@ -644,6 +673,7 @@ fn visit<'s, 'c: 's>(
         .files
         .fetch_add(b.files.len() as u64, Ordering::Relaxed);
     ctx.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+    b.stats.append(&mut alias_stats);
     let _ = ctx.tx.send(b);
 }
 

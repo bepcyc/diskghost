@@ -876,6 +876,7 @@ impl Probe<'static> {
 }
 
 /// A file as `stat` sees it, in the index's terms.
+#[derive(Clone, Debug)]
 pub(crate) struct Stat {
     pub(crate) size: u64,
     pub(crate) mtime_ns: u64,
@@ -1243,53 +1244,66 @@ pub(crate) fn scan_with(
                 sum.skipped_paths.push(path.to_string_lossy().into_owned());
             }
         };
-        let mut record = |path: &Path, sum: &mut ScanSummary| -> rusqlite::Result<()> {
-            let meta = if follow {
-                std::fs::metadata(path)
-            } else {
-                std::fs::symlink_metadata(path)
-            };
-            let Ok(meta) = meta else {
-                note_skip(sum, path);
-                return Ok(());
-            };
-            let st = stat_of(&meta);
-            let rel = path
-                .strip_prefix(&vol.mount_point)
-                .ok()
-                .and_then(Path::to_str);
-            // A followed link may lead off the volume; a non-UTF-8 name cannot
-            // be stored losslessly in a TEXT column. Neither is indexed.
-            let (Some(rel), true) = (rel, st.dev == root_dev) else {
-                note_skip(sum, path);
-                return Ok(());
-            };
-            sum.seen += 1;
-            let old: Option<(i64, i64, i64)> = get
-                .query_row(params![loc, rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()?;
-            let (size, mtime, dev, ino) = (
-                to_sql(st.size),
-                to_sql(st.mtime_ns),
-                to_sql(st.dev),
-                to_sql(st.ino),
-            );
-            match old {
-                None => {
-                    insert.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
-                    sum.new += 1;
+        // `listed`: the `stat` the walk already took of `path` (same
+        // follow/no-follow rule as below), so the file is not asked twice —
+        // on a FUSE or network volume every `stat` is a round trip. The
+        // decision is the same either way: compare the observed
+        // (size, mtime, inode) with the row.
+        let mut record =
+            |path: &Path, listed: Option<&Stat>, sum: &mut ScanSummary| -> rusqlite::Result<()> {
+                let fresh;
+                let st = match listed {
+                    Some(st) => st,
+                    None => {
+                        let meta = if follow {
+                            std::fs::metadata(path)
+                        } else {
+                            std::fs::symlink_metadata(path)
+                        };
+                        let Ok(meta) = meta else {
+                            note_skip(sum, path);
+                            return Ok(());
+                        };
+                        fresh = stat_of(&meta);
+                        &fresh
+                    }
+                };
+                let rel = path
+                    .strip_prefix(&vol.mount_point)
+                    .ok()
+                    .and_then(Path::to_str);
+                // A followed link may lead off the volume; a non-UTF-8 name cannot
+                // be stored losslessly in a TEXT column. Neither is indexed.
+                let (Some(rel), true) = (rel, st.dev == root_dev) else {
+                    note_skip(sum, path);
+                    return Ok(());
+                };
+                sum.seen += 1;
+                let old: Option<(i64, i64, i64)> = get
+                    .query_row(params![loc, rel], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                let (size, mtime, dev, ino) = (
+                    to_sql(st.size),
+                    to_sql(st.mtime_ns),
+                    to_sql(st.dev),
+                    to_sql(st.ino),
+                );
+                match old {
+                    None => {
+                        insert.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
+                        sum.new += 1;
+                    }
+                    Some(o) if o == (size, mtime, ino) => {
+                        touch.execute(params![loc, rel, gen, dev])?;
+                        sum.unchanged += 1;
+                    }
+                    Some(_) => {
+                        reset.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
+                        sum.changed += 1;
+                    }
                 }
-                Some(o) if o == (size, mtime, ino) => {
-                    touch.execute(params![loc, rel, gen, dev])?;
-                    sum.unchanged += 1;
-                }
-                Some(_) => {
-                    reset.execute(params![loc, rel, size, mtime, dev, ino, gen])?;
-                    sum.changed += 1;
-                }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         let mut unreadable = 0u64;
         let _ = walk(&root, &walk_opts, progress, |b| {
             unreadable += b.skipped;
@@ -1319,8 +1333,8 @@ pub(crate) fn scan_with(
             }
             // Every name of a hard-linked file is a row: the report needs
             // them all to tell one physical copy from several.
-            for p in b.files.iter().map(|f| &f.path).chain(&b.aliases) {
-                if let Err(e) = record(p, &mut sum) {
+            for (p, st) in b.names_with_stats() {
+                if let Err(e) = record(p, st, &mut sum) {
                     failed = Some(e);
                     progress.cancel(); // stop the walk; the error is reported
                     return;
@@ -1978,6 +1992,148 @@ mod tests {
                 }
             }
             None
+        }
+
+        /// The stat-based change predicate, as a row sees it.
+        fn row(idx: &Index, abs: &Path) -> (i64, i64, i64) {
+            let mut st = idx
+                .conn
+                .prepare(
+                    "SELECT f.size, f.mtime_ns, f.ino, l.root, f.path FROM files f \
+                     JOIN locations l ON l.id = f.location_id",
+                )
+                .unwrap();
+            let rows = st
+                .query_map([], |r| {
+                    Ok((
+                        (r.get(0)?, r.get(1)?, r.get(2)?),
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .unwrap();
+            for r in rows {
+                let (v, root, path) = r.unwrap();
+                if Path::new(&root).join(path) == abs {
+                    return v;
+                }
+            }
+            panic!("no row for {}", abs.display());
+        }
+
+        /// A deep tree whose only change is one file rewritten in place
+        /// (same size, same inode), with every ancestor folder's mtime put
+        /// back: nothing above the file shows the change. Guard against any
+        /// future "prune unchanged subtrees by folder mtime" shortcut —
+        /// a folder's mtime covers only its own entries, never a write to a
+        /// file below it, so such a prune would miss exactly this.
+        fn deep_tree(label: &str) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+            let d = tmpdir(label);
+            let t = d.join("t");
+            let deep = t.join("a/b/c/d/deep.bin");
+            write(&deep, &[1u8; 4096]);
+            // A same-size twin, so both get sampled (size collision).
+            write(&t.join("twin.bin"), &[1u8; 4096]);
+            let dirs = ["", "a", "a/b", "a/b/c", "a/b/c/d"]
+                .iter()
+                .map(|r| if r.is_empty() { t.clone() } else { t.join(r) })
+                .collect();
+            (d, deep, dirs)
+        }
+
+        fn dir_mtimes(dirs: &[PathBuf]) -> Vec<SystemTime> {
+            dirs.iter()
+                .map(|p| std::fs::metadata(p).unwrap().modified().unwrap())
+                .collect()
+        }
+
+        fn restore_dir_mtimes(dirs: &[PathBuf], times: &[SystemTime]) {
+            for (p, t) in dirs.iter().zip(times) {
+                std::fs::File::open(p).unwrap().set_modified(*t).unwrap();
+            }
+            assert_eq!(&dir_mtimes(dirs), times, "ancestor mtimes restored");
+        }
+
+        /// Rewrite in place: no create, no rename — same inode, same size.
+        fn rewrite_in_place(path: &Path, byte: u8) {
+            use std::io::Write as _;
+            let ino = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+            let len = std::fs::metadata(path).unwrap().len() as usize;
+            let mut f = std::fs::File::options().write(true).open(path).unwrap();
+            f.write_all(&vec![byte; len]).unwrap();
+            f.sync_all().unwrap();
+            let now = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+            assert_eq!(ino, now, "same inode");
+        }
+
+        #[test]
+        fn rescan_detects_deep_in_place_write_with_ancestor_mtimes_unchanged() {
+            let (d, deep, dirs) = deep_tree("deepwrite");
+            let idx = open_db(&d);
+            let t = &dirs[0];
+            touch(&deep, 600); // a time the rewrite below cannot reproduce
+            let (s, _) = scan(&idx, t);
+            assert_eq!((s.new, s.changed), (2, 0));
+            let before = hashes(&idx, &deep).unwrap();
+            assert!(before.0.is_some(), "collision sampled");
+            let dir_times = dir_mtimes(&dirs);
+
+            rewrite_in_place(&deep, 2);
+            restore_dir_mtimes(&dirs, &dir_times);
+
+            let (s, reads) = scan(&idx, t);
+            assert_eq!(s.changed, 1, "deep in-place write must be detected");
+            assert_eq!((s.new, s.vanished, s.unchanged), (0, 0, 1));
+            assert!(reads.contains(&deep), "changed file re-read");
+            assert!(
+                !reads.contains(&t.join("twin.bin")),
+                "unchanged twin not re-read"
+            );
+            let after = hashes(&idx, &deep).unwrap();
+            assert_ne!(after.0, before.0, "stale sample replaced");
+        }
+
+        #[test]
+        fn rescan_detects_deep_mtime_moved_back_same_size() {
+            // `touch -d`, `cp -p`, `rsync -t`, tar: mtime set into the past.
+            // A "newer than the last scan" watermark misses it; the row
+            // equality predicate does not.
+            let (d, deep, dirs) = deep_tree("deepback");
+            let idx = open_db(&d);
+            let t = &dirs[0];
+            scan(&idx, t);
+            let old = row(&idx, &deep);
+            let dir_times = dir_mtimes(&dirs);
+
+            touch(&deep, 86_400 * 365); // a year back, nothing else changes
+            restore_dir_mtimes(&dirs, &dir_times);
+
+            let (s, _) = scan(&idx, t);
+            assert_eq!(s.changed, 1, "mtime moved back must be detected");
+            let new = row(&idx, &deep);
+            assert_eq!((new.0, new.2), (old.0, old.2), "same size and inode");
+            assert!(new.1 < old.1, "row now holds the older mtime");
+        }
+
+        #[test]
+        fn rescan_stats_each_file_once_and_keeps_hard_link_names() {
+            // The walk's own stat feeds the index (one stat per name): a
+            // hard-linked name still gets its own row with the shared inode.
+            let d = tmpdir("onestat");
+            let t = d.join("t");
+            write(&t.join("x/f.bin"), b"hello");
+            std::fs::hard_link(t.join("x/f.bin"), t.join("y.bin")).unwrap();
+            let idx = open_db(&d);
+            let (s, _) = scan(&idx, &t);
+            assert_eq!(s.new, 2);
+            let a = row(&idx, &t.join("x/f.bin"));
+            let b = row(&idx, &t.join("y.bin"));
+            assert_eq!(a, b, "both names carry the same (size, mtime, inode)");
+            let ino =
+                std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(t.join("y.bin")).unwrap());
+            assert_eq!(a.2 as u64, ino);
+            let (s, _) = scan(&idx, &t);
+            assert_eq!((s.unchanged, s.changed), (2, 0));
         }
         #[test]
         fn live_volume_uuid_and_cow_probe_do_not_fail() {

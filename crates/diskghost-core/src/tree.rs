@@ -1249,6 +1249,7 @@ mod tests {
             subdirs: subdirs.iter().map(PathBuf::from).collect(),
             bound: Vec::new(),
             aliases: Vec::new(),
+            stats: Vec::new(),
             others: Vec::new(),
             skipped: 0,
             skips: Vec::new(),
