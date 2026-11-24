@@ -304,6 +304,13 @@ enum IndexAction {
         /// file through the mount.
         #[arg(long)]
         allow_sshfs: bool,
+        /// On a ZFS dataset, rescan from `zfs diff <snapshot> <dataset>`
+        /// (the newest snapshot older than the last complete scan) instead
+        /// of walking. Opt-in: zfs makes a temporary snapshot for the diff
+        /// and needs root or the `diff` permission. Falls back to the walk,
+        /// and says why, whenever the delta cannot be proven complete.
+        #[arg(long)]
+        zfs_diff: bool,
         #[command(flatten)]
         walk: WalkArgs,
     },
@@ -399,6 +406,7 @@ impl WalkArgs {
             same_file_system: self.one_file_system,
             skip_remote: !self.remote,
             allow_sshfs: false,
+            zfs_diff: false,
         }
     }
 }
@@ -1132,10 +1140,12 @@ fn run_index(json: bool, db: Option<PathBuf>, action: IndexAction) -> ExitCode {
             host,
             agent,
             allow_sshfs,
+            zfs_diff,
             walk,
         } => {
             let opts = Options {
                 allow_sshfs,
+                zfs_diff,
                 ..walk.to_options()
             };
             let role = role.map(Role::from);

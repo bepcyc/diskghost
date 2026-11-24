@@ -119,6 +119,7 @@ impl WalkOpts {
             skip_remote: true,
             // The index refuses an sshfs root and names its ssh:// URL.
             allow_sshfs: false,
+            zfs_diff: false,
         }
     }
 }

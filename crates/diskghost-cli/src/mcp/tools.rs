@@ -71,6 +71,8 @@ pub(crate) fn definitions() -> Vec<Value> {
             "description": "Glob patterns to skip (matched on path, component or name), e.g. [\"node_modules\", \"*.tmp\"]. Local folders only."},
         "one_file_system": {"type": "boolean",
             "description": "Stay on the filesystem of the scan root. Local folders only."},
+        "zfs_diff": {"type": "boolean",
+            "description": "On a ZFS dataset, rescan from `zfs diff` against the newest snapshot older than the last complete scan instead of walking (opt-in: zfs makes a temporary snapshot and needs the diff permission). The summary's delta / delta_note say what ran and why."},
         "allow_sshfs": {"type": "boolean",
             "description": "Index a local folder on an sshfs mount anyway. Default false: refused with error code sshfs_root, whose url field is the ssh:// location of the same folder (listed by the host itself, not one network round trip per file)."},
     });
@@ -435,6 +437,7 @@ fn walk_options(m: &Map<String, Value>) -> Result<Options, ToolError> {
         same_file_system: opt_bool(m, "one_file_system")?.unwrap_or(false),
         skip_remote: true,
         allow_sshfs: opt_bool(m, "allow_sshfs")?.unwrap_or(false),
+        zfs_diff: opt_bool(m, "zfs_diff")?.unwrap_or(false),
         ..Options::default()
     })
 }
@@ -993,6 +996,7 @@ fn add_location(ctx: &Arc<Ctx>, args: &Value) -> R {
             "exclude",
             "one_file_system",
             "allow_sshfs",
+            "zfs_diff",
         ],
     )?;
     let target = parse_target(req_str(&m, "path")?)?;
@@ -1002,11 +1006,12 @@ fn add_location(ctx: &Arc<Ctx>, args: &Value) -> R {
     if matches!(target, Target::Remote { .. })
         && (m.contains_key("exclude")
             || m.contains_key("one_file_system")
-            || m.contains_key("allow_sshfs"))
+            || m.contains_key("allow_sshfs")
+            || m.contains_key("zfs_diff"))
     {
         return Err(ToolError::invalid(
-            "exclude, one_file_system and allow_sshfs apply to local folders only: the host \
-             lists its own files",
+            "exclude, one_file_system, allow_sshfs and zfs_diff apply to local folders only: \
+             the host lists its own files",
         ));
     }
     refuse_sshfs(&target, &opts)?;
@@ -1038,6 +1043,7 @@ fn start_scan(ctx: &Arc<Ctx>, args: &Value) -> R {
             "exclude",
             "one_file_system",
             "allow_sshfs",
+            "zfs_diff",
         ],
     )?;
     let agent = agent_arg(&m)?;

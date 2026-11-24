@@ -12,7 +12,7 @@
 //! disk fills one location, and each scan only answers for the subtree it
 //! walked.
 //!
-//! # Schema (version 6, `PRAGMA user_version`)
+//! # Schema (version 7, `PRAGMA user_version`)
 //!
 //! ```sql
 //! meta      (key TEXT PRIMARY KEY, value INTEGER NOT NULL)
@@ -27,8 +27,11 @@
 //!            cow INTEGER,                 -- v2: copy-on-write fs at that scan
 //!            transport TEXT,              -- v5: shell | agent (remote: how its
 //!                                         -- last scan listed and hashed; local: 'shell')
-//!            ino_stable INTEGER)          -- v6: 0 = inode numbers change per mount
+//!            ino_stable INTEGER,          -- v6: 0 = inode numbers change per mount
 //!                                         -- (exFAT/FAT): rows store ino 0
+//!            zfs_ref, zfs_ref_guid TEXT,  -- v7: ZFS delta start: newest snapshot
+//!            zfs_ref_creation INTEGER,    -- older than the last complete scan of
+//!            zfs_ds_guid, zfs_ref_root TEXT) -- zfs_ref_root (see crate::zfs)
 //! files     (location_id → locations(id) ON DELETE CASCADE,
 //!            path TEXT,                   -- relative to locations.root
 //!            size, mtime_ns, dev, ino INTEGER,
@@ -38,6 +41,7 @@
 //!            seen INTEGER, -- scan generation that last saw the row
 //!            racy INTEGER, -- v6: mtime within RACY_WINDOW_NS of the scan
 //!                          -- that recorded it: re-read at the next scan
+//!            ctime_ns INTEGER, -- v7: inode change time; NULL = unknown
 //!            PRIMARY KEY (location_id, path)) WITHOUT ROWID
 //! INDEX files_size ON files(size); INDEX files_full ON files(full)
 //! scan_roots (location_id → locations(id) ON DELETE CASCADE,  -- v3
@@ -92,7 +96,7 @@ use crate::walk::{walk, MountEntry};
 use crate::{phase, Options, Progress};
 
 /// Schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Version 0 → 1. Each later migration is one more entry; never edit one
 /// that has shipped.
@@ -176,6 +180,17 @@ ALTER TABLE locations ADD COLUMN transport TEXT NOT NULL DEFAULT 'shell'
 ALTER TABLE locations ADD COLUMN ino_stable INTEGER NOT NULL DEFAULT 1
     CHECK (ino_stable IN (0, 1));
 ALTER TABLE files ADD COLUMN racy INTEGER NOT NULL DEFAULT 0 CHECK (racy IN (0, 1));
+",
+    // v7: the ZFS rescan delta — each file's inode change time (NULL =
+    // unknown), and per location the snapshot a `zfs diff` starts from: the
+    // newest one taken before its last complete scan of `zfs_ref_root`.
+    r"
+ALTER TABLE files ADD COLUMN ctime_ns INTEGER;
+ALTER TABLE locations ADD COLUMN zfs_ref TEXT;
+ALTER TABLE locations ADD COLUMN zfs_ref_guid TEXT;
+ALTER TABLE locations ADD COLUMN zfs_ref_creation INTEGER;
+ALTER TABLE locations ADD COLUMN zfs_ds_guid TEXT;
+ALTER TABLE locations ADD COLUMN zfs_ref_root TEXT;
 ",
 ];
 
@@ -269,6 +284,14 @@ pub struct ScanSummary {
     /// gone or changed again before its ends could be read is not judged.
     #[serde(default)]
     pub racy_changed: u64,
+    /// The scan read what changed from a filesystem's own record instead
+    /// of walking the tree (`zfs diff since <snapshot>: N changes`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    /// Why a requested delta (`--zfs-diff`) was not used, or why the next
+    /// scan cannot use one: the tree was walked instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_note: Option<String>,
     /// Rows dropped because their file is gone (index rows only).
     pub vanished: u64,
     /// Files whose two ends were read because their size collides, or
@@ -699,6 +722,8 @@ pub(crate) struct Volume {
     pub(crate) mount_point: PathBuf,
     /// See [`inode_numbers_stable`]; `true` when the type is unknown.
     pub(crate) ino_stable: bool,
+    /// The dataset name when the volume is a ZFS filesystem.
+    pub(crate) zfs_dataset: Option<String>,
 }
 
 /// This process's mount table (empty where there is none).
@@ -750,6 +775,7 @@ fn volume(path: &Path) -> io::Result<Volume> {
         key: dev_key(dev_major(dev), dev_minor(dev)),
         mount_point: top.to_path_buf(),
         ino_stable: true,
+        zfs_dataset: None,
     })
 }
 
@@ -799,6 +825,7 @@ fn resolve_volume(
         key,
         mount_point: m.mount_point.clone(),
         ino_stable: inode_numbers_stable(&m.fstype),
+        zfs_dataset: (m.fstype == "zfs").then(|| m.source.clone()),
     })
 }
 
@@ -926,6 +953,8 @@ pub(crate) struct Probe<'a> {
     pub(crate) on_read: &'a (dyn Fn(&Path) + Sync),
     /// Whether a remote location (`host` column, root) is reachable now.
     pub(crate) remote_online: &'a dyn Fn(&str, &str) -> bool,
+    /// Runs `zfs` with these arguments (the ZFS delta only).
+    pub(crate) zfs: &'a dyn Fn(&[String]) -> io::Result<String>,
 }
 
 fn no_read(_: &Path) {}
@@ -939,6 +968,7 @@ impl Probe<'static> {
         rotational: &crate::rotational::is_rotational,
         on_read: &no_read,
         remote_online: &crate::remote::ssh_online,
+        zfs: &crate::zfs::run_zfs,
     };
 }
 
@@ -949,6 +979,8 @@ pub(crate) struct Stat {
     pub(crate) mtime_ns: u64,
     pub(crate) dev: u64,
     pub(crate) ino: u64,
+    /// Inode change time (ns since the epoch); `None` where unknown.
+    pub(crate) ctime_ns: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -959,6 +991,10 @@ pub(crate) fn stat_of(meta: &std::fs::Metadata) -> Stat {
         mtime_ns: crate::walk::modified_ns(meta),
         dev: meta.dev(),
         ino: meta.ino(),
+        ctime_ns: u64::try_from(meta.ctime())
+            .ok()
+            .and_then(|s| s.checked_mul(1_000_000_000))
+            .and_then(|s| s.checked_add(u64::try_from(meta.ctime_nsec()).ok()?)),
     }
 }
 
@@ -969,6 +1005,7 @@ pub(crate) fn stat_of(meta: &std::fs::Metadata) -> Stat {
         mtime_ns: crate::walk::modified_ns(meta),
         dev: 0,
         ino: 0,
+        ctime_ns: None,
     }
 }
 
@@ -1291,6 +1328,12 @@ pub(crate) fn scan_with(
         )
         .map_err(db_err)?;
 
+    // ZFS delta (opt-in): decided before anything is read, from the
+    // reference the last complete scan of this folder recorded.
+    let plan = zfs_plan(&tx, loc, &vol, &prefix, opts, probe)?;
+    if let ZfsPlan::Walk(why) = &plan {
+        sum.delta_note = Some(why.clone());
+    }
     // A location is one volume: never cross into another mount. The MFT
     // engine is Windows-only and yields no inode identity.
     let walk_opts = Options {
@@ -1298,7 +1341,6 @@ pub(crate) fn scan_with(
         mft: false,
         ..opts.clone()
     };
-    let mut failed: Option<rusqlite::Error> = None;
     // Folders listed but not entered: other filesystems below the root.
     let mut bound: Vec<String> = Vec::new();
     // Racy rows re-read by this scan, with the sample they had: compared
@@ -1313,20 +1355,21 @@ pub(crate) fn scan_with(
             .map_err(db_err)?;
         let mut insert = tx
             .prepare_cached(
-                "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, seen, racy) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO files \
+                 (location_id, path, size, mtime_ns, dev, ino, seen, racy, ctime_ns) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )
             .map_err(db_err)?;
         let mut touch = tx
             .prepare_cached(
-                "UPDATE files SET seen = ?3, dev = ?4, racy = ?5 \
+                "UPDATE files SET seen = ?3, dev = ?4, racy = ?5, ctime_ns = ?6 \
                  WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
         let mut reset = tx
             .prepare_cached(
                 "UPDATE files SET size = ?3, mtime_ns = ?4, dev = ?5, ino = ?6, \
-                 sample = NULL, full = NULL, seen = ?7, racy = ?8 \
+                 sample = NULL, full = NULL, seen = ?7, racy = ?8, ctime_ns = ?9 \
                  WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
@@ -1343,113 +1386,112 @@ pub(crate) fn scan_with(
         // on a FUSE or network volume every `stat` is a round trip. The
         // decision is the same either way: compare the observed
         // (size, mtime, inode) with the row.
-        let mut record =
-            |path: &Path, listed: Option<&Stat>, sum: &mut ScanSummary| -> rusqlite::Result<()> {
-                let fresh;
-                let st = match listed {
-                    Some(st) => st,
-                    None => {
-                        let meta = if follow {
-                            std::fs::metadata(path)
-                        } else {
-                            std::fs::symlink_metadata(path)
-                        };
-                        let Ok(meta) = meta else {
-                            note_skip(sum, path);
-                            return Ok(());
-                        };
-                        fresh = stat_of(&meta);
-                        &fresh
-                    }
-                };
-                let rel = path
-                    .strip_prefix(&vol.mount_point)
-                    .ok()
-                    .and_then(Path::to_str);
-                // A followed link may lead off the volume; a non-UTF-8 name cannot
-                // be stored losslessly in a TEXT column. Neither is indexed.
-                let (Some(rel), true) = (rel, st.dev == root_dev) else {
-                    note_skip(sum, path);
-                    return Ok(());
-                };
-                sum.seen += 1;
-                type Old = (i64, i64, i64, bool, Option<Vec<u8>>);
-                let old: Option<Old> = get
-                    .query_row(params![loc, rel], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                    })
-                    .optional()?;
-                let (size, mtime, dev, ino) = (
-                    to_sql(st.size),
-                    to_sql(st.mtime_ns),
-                    to_sql(st.dev),
-                    if ino_stable { to_sql(st.ino) } else { 0 },
-                );
-                let racy = is_racy(st.mtime_ns, start_ns);
-                match old {
-                    None => {
-                        insert.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
-                        sum.new += 1;
-                    }
-                    Some((s, m, i, false, _)) if (s, m, i) == (size, mtime, ino) => {
-                        touch.execute(params![loc, rel, gen, dev, racy])?;
-                        sum.unchanged += 1;
-                    }
-                    // Same stat, but recorded too close to its scan: content may
-                    // have changed within that timestamp tick. Read it again.
-                    Some((s, m, i, true, before)) if (s, m, i) == (size, mtime, ino) => {
-                        reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
-                        sum.racy_rechecked += 1;
-                        if let Some(b) = before {
-                            racy_before.push((rel.to_string(), b));
-                        }
-                    }
-                    Some(_) => {
-                        reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
-                        sum.changed += 1;
-                    }
+        let mut record = |path: &Path,
+                          listed: Option<&Stat>,
+                          sum: &mut ScanSummary|
+         -> rusqlite::Result<()> {
+            let fresh;
+            let st = match listed {
+                Some(st) => st,
+                None => {
+                    let meta = if follow {
+                        std::fs::metadata(path)
+                    } else {
+                        std::fs::symlink_metadata(path)
+                    };
+                    let Ok(meta) = meta else {
+                        note_skip(sum, path);
+                        return Ok(());
+                    };
+                    fresh = stat_of(&meta);
+                    &fresh
                 }
-                Ok(())
             };
-        let mut unreadable = 0u64;
-        let _ = walk(&root, &walk_opts, progress, |b| {
-            unreadable += b.skipped;
-            for (p, _) in &b.skips {
-                if sum.skipped_paths.len() < 32 {
-                    sum.skipped_paths.push(p.to_string_lossy().into_owned());
+            let rel = path
+                .strip_prefix(&vol.mount_point)
+                .ok()
+                .and_then(Path::to_str);
+            // A followed link may lead off the volume; a non-UTF-8 name cannot
+            // be stored losslessly in a TEXT column. Neither is indexed.
+            let (Some(rel), true) = (rel, st.dev == root_dev) else {
+                note_skip(sum, path);
+                return Ok(());
+            };
+            sum.seen += 1;
+            type Old = (i64, i64, i64, bool, Option<Vec<u8>>);
+            let old: Option<Old> = get
+                .query_row(params![loc, rel], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .optional()?;
+            let (size, mtime, dev, ino) = (
+                to_sql(st.size),
+                to_sql(st.mtime_ns),
+                to_sql(st.dev),
+                if ino_stable { to_sql(st.ino) } else { 0 },
+            );
+            let racy = is_racy(st.mtime_ns, start_ns);
+            let ctime = st.ctime_ns.map(to_sql);
+            match old {
+                None => {
+                    insert.execute(params![loc, rel, size, mtime, dev, ino, gen, racy, ctime])?;
+                    sum.new += 1;
                 }
-            }
-            for dir in &b.bound {
-                match dir
-                    .strip_prefix(&vol.mount_point)
-                    .ok()
-                    .and_then(Path::to_str)
-                {
-                    Some(rel) => bound.push(rel.to_string()),
-                    // Cannot be protected by name: keep every row instead.
-                    None => {
-                        unreadable += 1;
-                        if sum.skipped_paths.len() < 32 {
-                            sum.skipped_paths.push(dir.to_string_lossy().into_owned());
-                        }
+                Some((s, m, i, false, _)) if (s, m, i) == (size, mtime, ino) => {
+                    touch.execute(params![loc, rel, gen, dev, racy, ctime])?;
+                    sum.unchanged += 1;
+                }
+                // Same stat, but recorded too close to its scan: content may
+                // have changed within that timestamp tick. Read it again.
+                Some((s, m, i, true, before)) if (s, m, i) == (size, mtime, ino) => {
+                    reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy, ctime])?;
+                    sum.racy_rechecked += 1;
+                    if let Some(b) = before {
+                        racy_before.push((rel.to_string(), b));
                     }
                 }
-            }
-            if failed.is_some() {
-                return;
-            }
-            // Every name of a hard-linked file is a row: the report needs
-            // them all to tell one physical copy from several.
-            for (p, st) in b.names_with_stats() {
-                if let Err(e) = record(p, st, &mut sum) {
-                    failed = Some(e);
-                    progress.cancel(); // stop the walk; the error is reported
-                    return;
+                Some(_) => {
+                    reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy, ctime])?;
+                    sum.changed += 1;
                 }
             }
-        });
-        if let Some(e) = failed.take() {
-            return Err(db_err(e)); // the transaction rolls back on drop
+            Ok(())
+        };
+        let mut unreadable = 0u64;
+        match &plan {
+            ZfsPlan::Delta {
+                snapshot, changes, ..
+            } => {
+                sum.delta = Some(format!(
+                    "zfs diff since {snapshot}: {} changes",
+                    changes.len()
+                ));
+                unreadable += apply_zfs_delta(
+                    &tx,
+                    &plan,
+                    &DeltaCtx {
+                        loc,
+                        gen,
+                        prefix: &prefix,
+                        vol: &vol,
+                        walk_opts: &walk_opts,
+                        progress,
+                    },
+                    &mut record,
+                    &mut sum,
+                )?;
+            }
+            _ => {
+                unreadable += walk_into(
+                    &root,
+                    &walk_opts,
+                    progress,
+                    &vol.mount_point,
+                    &mut record,
+                    &mut sum,
+                    &mut bound,
+                )?;
+            }
         }
         sum.skipped += unreadable;
         sum.complete = !progress.cancelled() && unreadable == 0 && opts.max_depth.is_none();
@@ -1459,8 +1501,22 @@ pub(crate) fn scan_with(
     // after a complete walk — a folder that could not be read is not gone —
     // and never under a mount the walk listed without entering (a nested
     // btrfs subvolume shares this location but is not walked from here).
-    if sum.complete {
+    // (A delta drops what it saw removed itself; this is the walk's rule.)
+    let delta = matches!(plan, ZfsPlan::Delta { .. });
+    if sum.complete && !delta {
         sum.vanished = drop_vanished(&tx, loc, gen, &prefix, &bound).map_err(db_err)? as u64;
+    }
+    if opts.zfs_diff {
+        record_zfs_ref(
+            &tx,
+            loc,
+            &vol,
+            &prefix,
+            sum.complete,
+            start_ns,
+            probe,
+            &mut sum,
+        )?;
     }
     tx.commit().map_err(db_err)?;
 
@@ -1517,6 +1573,429 @@ pub(crate) fn scan_with(
         }
     }
     Ok(sum)
+}
+
+/// How a scan learns what changed under its folder.
+enum ZfsPlan {
+    /// No delta asked for: walk.
+    Off,
+    /// A delta was asked for but cannot be proven complete: walk, and say
+    /// why.
+    Walk(String),
+    /// `zfs diff` from `snapshot` (created `creation`, seconds) to now.
+    Delta {
+        snapshot: String,
+        creation: i64,
+        changes: Vec<crate::zfs::Change>,
+    },
+}
+
+/// Whether relative `path` lies in the scan folder `prefix` ('' = all).
+fn in_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'/')
+}
+
+/// Decide whether this scan may use the ZFS delta. Every condition that
+/// makes `zfs diff` incomplete is a reason to walk.
+fn zfs_plan(
+    tx: &Connection,
+    loc: i64,
+    vol: &Volume,
+    prefix: &str,
+    opts: &Options,
+    probe: &Probe,
+) -> io::Result<ZfsPlan> {
+    if !opts.zfs_diff {
+        return Ok(ZfsPlan::Off);
+    }
+    let walk = |why: String| Ok(ZfsPlan::Walk(why));
+    let Some(ds) = vol.zfs_dataset.as_deref() else {
+        return walk("--zfs-diff: not a ZFS dataset; walked".into());
+    };
+    if !opts.exclude.is_empty() || opts.max_depth.is_some() || opts.follow_symlinks {
+        return walk(
+            "--zfs-diff works without --exclude, --max-depth and --follow-symlinks; walked".into(),
+        );
+    }
+    type Ref = (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
+    let (snap, snap_guid, creation, ds_guid, ref_root): Ref = tx
+        .query_row(
+            "SELECT zfs_ref, zfs_ref_guid, zfs_ref_creation, zfs_ds_guid, zfs_ref_root \
+             FROM locations WHERE id = ?1",
+            [loc],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .map_err(db_err)?;
+    let (Some(snap), Some(snap_guid), Some(creation), Some(ds_guid), Some(ref_root)) =
+        (snap, snap_guid, creation, ds_guid, ref_root)
+    else {
+        return walk(format!(
+            "--zfs-diff: no snapshot of {ds} older than a complete scan of this folder yet; walked"
+        ));
+    };
+    if ref_root != prefix {
+        return walk(format!(
+            "--zfs-diff: the reference snapshot belongs to a scan of {:?}, not of this folder; walked",
+            ref_root
+        ));
+    }
+    let now_guid = match (probe.zfs)(&crate::zfs::guid_args(ds)) {
+        Ok(g) => g.trim().to_string(),
+        Err(e) => return walk(format!("--zfs-diff: {e}; walked")),
+    };
+    if now_guid != ds_guid {
+        return walk(format!(
+            "--zfs-diff: dataset {ds} has another guid than at the last scan (recreated or \
+             received); walked"
+        ));
+    }
+    let snaps = match (probe.zfs)(&crate::zfs::list_args(ds))
+        .map_err(|e| e.to_string())
+        .and_then(|o| crate::zfs::parse_snapshots(&o))
+    {
+        Ok(s) => s,
+        Err(e) => return walk(format!("--zfs-diff: {e}; walked")),
+    };
+    match snaps.iter().find(|s| s.name == snap) {
+        None => {
+            return walk(format!(
+                "--zfs-diff: snapshot {snap} no longer exists; walked"
+            ))
+        }
+        Some(s) if s.guid != snap_guid => {
+            return walk(format!(
+                "--zfs-diff: snapshot {snap} was destroyed and made again; walked"
+            ))
+        }
+        Some(_) => {}
+    }
+    let changes = match (probe.zfs)(&crate::zfs::diff_args(&snap, ds))
+        .map_err(|e| e.to_string())
+        .and_then(|o| crate::zfs::parse_diff(&o))
+    {
+        Ok(c) => c,
+        Err(e) => return walk(format!("--zfs-diff: {e}; walked")),
+    };
+    let outside = changes.iter().find(|c| {
+        !c.path.starts_with(&vol.mount_point)
+            || c.new_path
+                .as_ref()
+                .is_some_and(|n| !n.starts_with(&vol.mount_point))
+    });
+    if let Some(c) = outside {
+        return walk(format!(
+            "--zfs-diff: {} is not under the mountpoint {}; walked",
+            c.path.display(),
+            vol.mount_point.display()
+        ));
+    }
+    Ok(ZfsPlan::Delta {
+        snapshot: snap,
+        creation,
+        changes,
+    })
+}
+
+/// What [`apply_zfs_delta`] needs of the scan.
+struct DeltaCtx<'a> {
+    loc: i64,
+    gen: i64,
+    prefix: &'a str,
+    vol: &'a Volume,
+    walk_opts: &'a Options,
+    progress: &'a Progress,
+}
+
+type Recorder<'r> = dyn FnMut(&Path, Option<&Stat>, &mut ScanSummary) -> rusqlite::Result<()> + 'r;
+
+/// Bring the rows under the scan folder up to date from `zfs diff`:
+/// every path it names (both names of a rename) is looked at again — a
+/// file goes through the scan's own `record`, a folder that was created or
+/// renamed is walked, anything gone (or no longer a file) loses its rows.
+/// A folder that is only "modified" is not walked: each entry added to or
+/// removed from it has a line of its own. Rows the diff cannot vouch for —
+/// a file created after the snapshot (its inode change time is newer than
+/// the snapshot, or unknown) could have been indexed and removed again
+/// without any line, and a racy row may hide a same-tick write — are looked
+/// at too. Returns how many entries could not be read.
+fn apply_zfs_delta(
+    tx: &Connection,
+    plan: &ZfsPlan,
+    cx: &DeltaCtx,
+    record: &mut Recorder,
+    sum: &mut ScanSummary,
+) -> io::Result<u64> {
+    let ZfsPlan::Delta {
+        changes, creation, ..
+    } = plan
+    else {
+        return Ok(0);
+    };
+    let rel_of = |p: &Path| -> Option<String> {
+        p.strip_prefix(&cx.vol.mount_point)
+            .ok()
+            .and_then(Path::to_str)
+            .map(str::to_string)
+    };
+    let mut unreadable = 0u64;
+    let mut targets: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for c in changes {
+        if c.kind == crate::zfs::Kind::Modified && c.ftype == '/' {
+            continue; // its entries have lines of their own
+        }
+        targets.insert(c.path.clone());
+        if let Some(n) = &c.new_path {
+            targets.insert(n.clone());
+        }
+        // A rename moves the rows first, so the files keep their hashes;
+        // the new name is then looked at like any other.
+        if let (crate::zfs::Kind::Renamed, Some(n)) = (c.kind, &c.new_path) {
+            if let (Some(from), Some(to)) = (rel_of(&c.path), rel_of(n)) {
+                if in_prefix(&from, cx.prefix) && in_prefix(&to, cx.prefix) {
+                    move_rows(tx, cx.loc, &from, &to).map_err(db_err)?;
+                }
+            }
+        }
+    }
+    // Rows the diff cannot vouch for (see above).
+    {
+        let mut st = tx
+            .prepare(
+                "SELECT path FROM files WHERE location_id = ?1 \
+                 AND (ctime_ns IS NULL OR ctime_ns >= ?2 OR racy = 1)",
+            )
+            .map_err(db_err)?;
+        let since = (*creation - 2).saturating_mul(1_000_000_000);
+        let rows = st
+            .query_map(params![cx.loc, since], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        for r in rows {
+            let rel = r.map_err(db_err)?;
+            if in_prefix(&rel, cx.prefix) {
+                targets.insert(cx.vol.mount_point.join(rel));
+            }
+        }
+    }
+    // Sorted: a folder comes before what is under it, which its walk covers.
+    let mut walked: Vec<PathBuf> = Vec::new();
+    for abs in &targets {
+        if cx.progress.cancelled() {
+            break;
+        }
+        if walked.iter().any(|w| abs.starts_with(w)) {
+            continue;
+        }
+        let Some(rel) = rel_of(abs) else {
+            // Not UTF-8: never indexed; and its rows cannot be named.
+            unreadable += 1;
+            if sum.skipped_paths.len() < 32 {
+                sum.skipped_paths.push(abs.to_string_lossy().into_owned());
+            }
+            continue;
+        };
+        if !in_prefix(&rel, cx.prefix) {
+            continue;
+        }
+        match std::fs::symlink_metadata(abs) {
+            Ok(m) if m.is_dir() => {
+                let mut bound = Vec::new();
+                let before = unreadable;
+                unreadable += walk_into(
+                    abs,
+                    cx.walk_opts,
+                    cx.progress,
+                    &cx.vol.mount_point,
+                    record,
+                    sum,
+                    &mut bound,
+                )?;
+                if unreadable == before && !cx.progress.cancelled() {
+                    sum.vanished +=
+                        drop_vanished(tx, cx.loc, cx.gen, &rel, &bound).map_err(db_err)? as u64;
+                }
+                walked.push(abs.clone());
+            }
+            Ok(m) if m.is_file() => record(abs, Some(&stat_of(&m)), sum).map_err(db_err)?,
+            // Unreadable is not gone: keep its rows, and the scan is not
+            // complete (the next one walks).
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                unreadable += 1;
+                if sum.skipped_paths.len() < 32 {
+                    sum.skipped_paths.push(abs.to_string_lossy().into_owned());
+                }
+            }
+            // Gone, or no longer a file the index keeps (a link, a socket…).
+            Ok(_) | Err(_) => {
+                sum.vanished += tx
+                    .execute(
+                        "DELETE FROM files WHERE location_id = ?1 AND (path = ?2 \
+                         OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
+                        params![cx.loc, rel],
+                    )
+                    .map_err(db_err)? as u64;
+            }
+        }
+    }
+    Ok(unreadable)
+}
+
+/// Rename rows `from` (and everything under it) to `to`, replacing rows
+/// already there. Index rows only.
+fn move_rows(tx: &Connection, loc: i64, from: &str, to: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM files WHERE location_id = ?1 AND (path = ?2 \
+         OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
+        params![loc, to],
+    )?;
+    tx.execute(
+        "UPDATE files SET path = ?3 || substr(path, length(?2) + 1) WHERE location_id = ?1 \
+         AND (path = ?2 OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
+        params![loc, from, to],
+    )?;
+    Ok(())
+}
+
+/// After a scan with `--zfs-diff`: remember the newest snapshot taken
+/// before this scan began as the next delta's start — only after a complete
+/// scan, else forget it (the next scan walks).
+#[allow(clippy::too_many_arguments)]
+fn record_zfs_ref(
+    tx: &Connection,
+    loc: i64,
+    vol: &Volume,
+    prefix: &str,
+    complete: bool,
+    start_ns: u64,
+    probe: &Probe,
+    sum: &mut ScanSummary,
+) -> io::Result<()> {
+    let clear = || {
+        tx.execute(
+            "UPDATE locations SET zfs_ref = NULL, zfs_ref_guid = NULL, zfs_ref_creation = NULL, \
+             zfs_ds_guid = NULL, zfs_ref_root = NULL WHERE id = ?1",
+            [loc],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    };
+    let Some(ds) = vol.zfs_dataset.as_deref() else {
+        return clear();
+    };
+    if !complete {
+        add_note(
+            sum,
+            "--zfs-diff: this scan was not complete, so the next one walks".into(),
+        );
+        return clear();
+    }
+    let found = (probe.zfs)(&crate::zfs::guid_args(ds))
+        .map_err(|e| e.to_string())
+        .and_then(|g| {
+            let snaps = (probe.zfs)(&crate::zfs::list_args(ds))
+                .map_err(|e| e.to_string())
+                .and_then(|o| crate::zfs::parse_snapshots(&o))?;
+            Ok((g.trim().to_string(), snaps))
+        });
+    match found {
+        Ok((guid, snaps)) => match crate::zfs::newest_before(&snaps, start_ns) {
+            Some(s) => {
+                tx.execute(
+                    "UPDATE locations SET zfs_ref = ?2, zfs_ref_guid = ?3, \
+                     zfs_ref_creation = ?4, zfs_ds_guid = ?5, zfs_ref_root = ?6 WHERE id = ?1",
+                    params![loc, s.name, s.guid, s.creation, guid, prefix],
+                )
+                .map_err(db_err)?;
+                Ok(())
+            }
+            None => {
+                add_note(
+                    sum,
+                    format!(
+                        "--zfs-diff: {ds} has no snapshot taken before this scan; the next scan \
+                         walks too (diskghost does not create snapshots)"
+                    ),
+                );
+                clear()
+            }
+        },
+        Err(e) => {
+            add_note(sum, format!("--zfs-diff: {e}; the next scan walks too"));
+            clear()
+        }
+    }
+}
+
+/// Add `note` to the summary's delta note (one sentence per reason).
+fn add_note(sum: &mut ScanSummary, note: String) {
+    match &mut sum.delta_note {
+        Some(n) => {
+            n.push_str("; ");
+            n.push_str(&note);
+        }
+        None => sum.delta_note = Some(note),
+    }
+}
+
+/// Walk `dir` (on the scan's volume) into `record`: every name of every
+/// file; folders listed but not entered go to `bound`. Returns how many
+/// entries could not be read.
+fn walk_into(
+    dir: &Path,
+    walk_opts: &Options,
+    progress: &Progress,
+    mount_point: &Path,
+    record: &mut Recorder,
+    sum: &mut ScanSummary,
+    bound: &mut Vec<String>,
+) -> io::Result<u64> {
+    let mut unreadable = 0u64;
+    let mut failed: Option<rusqlite::Error> = None;
+    let _ = walk(dir, walk_opts, progress, |b| {
+        unreadable += b.skipped;
+        for (p, _) in &b.skips {
+            if sum.skipped_paths.len() < 32 {
+                sum.skipped_paths.push(p.to_string_lossy().into_owned());
+            }
+        }
+        for d in &b.bound {
+            match d.strip_prefix(mount_point).ok().and_then(Path::to_str) {
+                Some(rel) => bound.push(rel.to_string()),
+                // Cannot be protected by name: keep every row instead.
+                None => {
+                    unreadable += 1;
+                    if sum.skipped_paths.len() < 32 {
+                        sum.skipped_paths.push(d.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        if failed.is_some() {
+            return;
+        }
+        // Every name of a hard-linked file is a row: the report needs
+        // them all to tell one physical copy from several.
+        for (p, st) in b.names_with_stats() {
+            if let Err(e) = record(p, st, sum) {
+                failed = Some(e);
+                progress.cancel(); // stop the walk; the error is reported
+                return;
+            }
+        }
+    });
+    match failed {
+        Some(e) => Err(db_err(e)), // the transaction rolls back on drop
+        None => Ok(unreadable),
+    }
 }
 
 /// Drop rows of location `loc` under `prefix` that scan generation `gen`
@@ -1933,7 +2412,13 @@ mod tests {
             c.execute_batch(
                 "ALTER TABLE locations DROP COLUMN transport; \
                  ALTER TABLE locations DROP COLUMN ino_stable; \
-                 ALTER TABLE files DROP COLUMN racy;",
+                 ALTER TABLE files DROP COLUMN racy; \
+                 ALTER TABLE files DROP COLUMN ctime_ns; \
+                 ALTER TABLE locations DROP COLUMN zfs_ref; \
+                 ALTER TABLE locations DROP COLUMN zfs_ref_guid; \
+                 ALTER TABLE locations DROP COLUMN zfs_ref_creation; \
+                 ALTER TABLE locations DROP COLUMN zfs_ds_guid; \
+                 ALTER TABLE locations DROP COLUMN zfs_ref_root;",
             )
             .unwrap();
             c.pragma_update(None, "user_version", 2).unwrap();

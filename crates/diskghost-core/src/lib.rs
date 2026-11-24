@@ -43,6 +43,9 @@ pub mod sshfs;
 mod testkit;
 mod tree;
 mod walk;
+mod zfs;
+#[cfg(all(test, unix))]
+mod zfs_tests;
 
 pub use apply::{
     apply, journal_path, load_plan, read_journal, undo, ApplyOptions, JournalEntry, Outcome,
@@ -121,6 +124,13 @@ pub struct Options {
     /// same folder (see [`sshfs::SshfsRoot`]): listed by the host itself,
     /// not one network round trip per file. Plain scans ignore it.
     pub allow_sshfs: bool,
+    /// On a ZFS dataset, rescan with `zfs diff <snapshot> <dataset>` from
+    /// the newest snapshot older than the last complete scan, instead of a
+    /// walk (see `docs/rescan-delta.md`). Opt-in: diffing against the live
+    /// filesystem makes `zfs` create (and drop) a temporary snapshot, and
+    /// needs root or the delegated `diff` permission. Whenever the delta
+    /// cannot be proven complete the walk runs and the summary says why.
+    pub zfs_diff: bool,
 }
 
 /// Live progress + cancellation shared with a running scan / duplicate search.
