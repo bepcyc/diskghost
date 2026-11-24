@@ -354,3 +354,29 @@ fn a_racy_row_with_the_same_bytes_is_rechecked_not_reported_changed() {
         "{s:?}"
     );
 }
+
+#[test]
+fn documented_limit_a_racy_row_of_unique_size_is_reset_but_not_judged() {
+    // Only sizes shared with another file are sampled (a unique size has
+    // no copy to compare with). A racy unique-size row that changed in
+    // place loses its (empty) hashes and is counted in racy_rechecked,
+    // but racy_changed cannot judge it: no sample before or after. Its
+    // bytes are read when a same-size file appears.
+    let e = Estate::new("rescan-racy-unique");
+    let f = e.loc("A").join("only.bin");
+    write(&f, &content(1));
+    e.scan("A");
+    assert!(stored(&e, "A", "only.bin").1);
+    rewrite_keeping_time(&f, 5);
+    let s = e.scan("A");
+    assert_eq!(
+        (s.racy_rechecked, s.racy_changed, s.changed),
+        (1, 0, 0),
+        "{s:?}"
+    );
+    assert_eq!(e.row("A", "only.bin").2, None, "never sampled");
+    // A same-size file appears: the next scan samples both.
+    write(&e.loc("A").join("other.bin"), &content(1));
+    e.scan("A");
+    assert!(e.row("A", "only.bin").2.is_some());
+}

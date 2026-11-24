@@ -41,7 +41,9 @@ mtime is within `RACY_WINDOW_NS` (2 s) of its scan's start, or in the
 future, is stored with `racy = 1`; the next scan re-reads it even when its
 `stat` is unchanged (counted as `racy_rechecked`, not `changed`; of those,
 `racy_changed` counts rows whose sample before and after the re-read
-differ — a change `stat` missed, verified by the bytes), and the
+differ — a change `stat` missed, verified by the bytes; a file whose size
+no other indexed file shares is never sampled, so it is reset but not
+judged — its bytes are read once a same-size file appears), and the
 index report re-reads it too. Remote (`ssh://`) rows are not covered: the
 remote clock is not known here.
 
