@@ -197,7 +197,8 @@ enum Command {
         singles_paths: Option<PathBuf>,
     },
     /// Persistent index of every file on registered volumes: a re-scan only
-    /// re-reads files whose size, time or inode changed. Volumes are known by
+    /// re-reads files whose size, time or inode changed (exFAT/FAT: size or
+    /// time; also files written within 2 s of the last scan). Volumes are known by
     /// filesystem UUID, so an unplugged disk keeps its entries. Read-only:
     /// indexed files are never modified or deleted.
     Index {

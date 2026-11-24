@@ -252,7 +252,8 @@ pub struct ScanSummary {
     pub seen: u64,
     /// Of those, not in the index before.
     pub new: u64,
-    /// Of those, indexed with another size, time or inode: hashes reset.
+    /// Of those, indexed with another size, time or inode (inode not
+    /// compared on exFAT/FAT locations): hashes reset.
     pub changed: u64,
     /// Of those, unchanged: not read, only marked seen.
     pub unchanged: u64,
@@ -1673,7 +1674,9 @@ mod tests {
         for t in ["exfat", "vfat", "msdos"] {
             assert!(!inode_numbers_stable(t), "{t}");
         }
-        for t in ["ext4", "xfs", "btrfs", "f2fs", "ntfs3", "fuseblk", "tmpfs"] {
+        // Kernel drivers with persistent inode numbers. `fuseblk` is not
+        // asserted: exfat-fuse also mounts as `fuseblk` (unverified here).
+        for t in ["ext4", "xfs", "btrfs", "f2fs", "ntfs3", "tmpfs"] {
             assert!(inode_numbers_stable(t), "{t}");
         }
         // Decided from the live mount table's fstype (fixture line: exfat).
