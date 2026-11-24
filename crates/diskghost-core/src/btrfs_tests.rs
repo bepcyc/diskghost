@@ -253,6 +253,9 @@ fn the_generation_advances_after_each_complete_delta() {
         .query_row("SELECT inode_ref_gen FROM locations", [], |r| r.get(0))
         .unwrap();
     write(&e.loc("A").join("m/later.bin"), &content(16));
+    // Outside the fake's 20 ms coarse-clock margin before G2 is read, so
+    // the next delta has nothing to look at (exact count below).
+    std::thread::sleep(std::time::Duration::from_millis(50));
     delta_equals_walk(&e, 1);
     let g2: i64 = e
         .idx
