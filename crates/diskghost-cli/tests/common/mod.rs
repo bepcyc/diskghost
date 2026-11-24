@@ -16,14 +16,19 @@ pub fn bin() -> String {
 }
 
 /// The only tools the server may ever offer. Adding one must fail a test.
-pub const ALLOWLIST: [&str; 10] = [
+pub const ALLOWLIST: [&str; 15] = [
     "add_location",
     "cancel_job",
+    "diff_since",
     "dupes_report",
+    "find_files",
+    "forget_location",
+    "index_status",
     "job_status",
     "list_drives",
     "list_jobs",
     "list_locations",
+    "list_snapshots",
     "plan_dedup",
     "set_location_role",
     "start_scan",

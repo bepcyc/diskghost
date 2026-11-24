@@ -10,7 +10,7 @@ use diskghost_core::{
     diff, disk_space, find_duplicates_cached, index_remote, index_scan, is_mount_point, reclaim,
     remove_path, validate_globs, DiffReport, DirSize, DupGroup, FileStats, HashCache, Index,
     Options, Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, Role, ScanReport,
-    ScanSummary, ScanTree, Snapshot, CHECKPOINT_INTERVAL,
+    ScanSummary, ScanTree, Snapshot, CHECKPOINT_INTERVAL, FIND_DEFAULT_LIMIT, FIND_MAX_LIMIT,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager};
@@ -1447,6 +1447,100 @@ async fn list_locations() -> Result<Vec<LocationInfo>, String> {
     .await
 }
 
+/// What `forget_location` answers.
+#[derive(Serialize)]
+struct ForgetResult {
+    /// `false` when the index had no such location (already forgotten).
+    forgotten: bool,
+}
+
+/// Drop location `uuid` and its rows from the index at `db` — what
+/// `diskghost index forget <uuid>` does. Index rows only: no file on any disk
+/// is touched.
+fn forget_in(db: &Path, uuid: &str) -> Result<ForgetResult, String> {
+    if !db.exists() {
+        return Ok(ForgetResult { forgotten: false });
+    }
+    let idx = Index::open(db).map_err(|e| format!("cannot open index {}: {e}", db.display()))?;
+    let forgotten = idx.forget(uuid).map_err(|e| e.to_string())?;
+    Ok(ForgetResult { forgotten })
+}
+
+/// Forget one location of the shared index (the CLI's `index forget`). The
+/// location's index entries go; its files on disk are never touched.
+#[tauri::command]
+async fn forget_location(uuid: String) -> Result<ForgetResult, String> {
+    blocking(move || {
+        let db = index_db()
+            .ok_or_else(|| "no data directory (set HOME or XDG_DATA_HOME)".to_string())?;
+        forget_in(&db, &uuid)
+    })
+    .await
+}
+
+/// One page of `find_indexed_files`.
+#[derive(Serialize)]
+struct FoundPage {
+    files: Vec<diskghost_core::FoundFile>,
+    offset: usize,
+    limit: usize,
+    /// Another page follows this one.
+    more: bool,
+}
+
+/// Search the index at `db` for paths containing `pattern` (the same query
+/// as the MCP `find_files`): `limit` defaults to `FIND_DEFAULT_LIMIT` and is
+/// capped at `FIND_MAX_LIMIT`. Reads the index only; no index yet = no hit.
+fn find_in(
+    db: &Path,
+    pattern: &str,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    location: Option<&str>,
+) -> Result<FoundPage, String> {
+    let limit = limit.unwrap_or(FIND_DEFAULT_LIMIT).clamp(1, FIND_MAX_LIMIT);
+    let offset = offset.unwrap_or(0);
+    if pattern.is_empty() || !db.exists() {
+        return Ok(FoundPage {
+            files: Vec::new(),
+            offset,
+            limit,
+            more: false,
+        });
+    }
+    let idx = Index::open(db).map_err(|e| format!("cannot open index {}: {e}", db.display()))?;
+    // One row past the page tells whether another page follows.
+    let mut files = idx
+        .find_files(pattern, location, limit + 1, offset)
+        .map_err(|e| e.to_string())?;
+    let more = files.len() > limit;
+    files.truncate(limit);
+    Ok(FoundPage {
+        files,
+        offset,
+        limit,
+        more,
+    })
+}
+
+/// Find indexed files whose path contains `pattern` (case-insensitive, no
+/// wildcards), optionally only on one location (uuid or folder). Runs off
+/// the UI thread; reads the index, never the disks.
+#[tauri::command]
+async fn find_indexed_files(
+    pattern: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    location: Option<String>,
+) -> Result<FoundPage, String> {
+    blocking(move || {
+        // No data directory: an empty path, which does not exist — no hit.
+        let db = index_db().unwrap_or_default();
+        find_in(&db, &pattern, limit, offset, location.as_deref())
+    })
+    .await
+}
+
 /// The drives to offer for the real local filesystems `mounts`: `/` first
 /// (always, even when the table names it differently), then the others by
 /// mount point. (path, filesystem type, kind, media). `rotational` is the
@@ -1619,6 +1713,8 @@ fn main() {
             is_elevated,
             add_location,
             list_locations,
+            forget_location,
+            find_indexed_files,
             list_index_jobs
         ])
         .run(tauri::generate_context!())
@@ -1674,6 +1770,65 @@ mod tests {
         let rows = read_index_jobs(&db).unwrap();
         assert_eq!(rows[0].state, "interrupted", "{rows:?}");
         assert_eq!(rows[0].files, 10);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn forget_location_drops_index_rows_and_never_touches_files() {
+        // `forget_location` → `forget_in` on a scratch index: the location
+        // and its rows go, the scanned file stays on disk.
+        let d = std::env::temp_dir().join(format!("diskghost-gui-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let tree = d.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("a.txt"), b"hello").unwrap();
+        let db = d.join("index.db");
+        // No index yet: nothing to forget, and nothing is created.
+        assert!(!forget_in(&db, "nope").unwrap().forgotten);
+        assert!(!db.exists());
+        let idx = Index::open(&db).unwrap();
+        let s = index_scan(&idx, &tree, &Options::default(), &Progress::default()).unwrap();
+        drop(idx);
+        assert!(!forget_in(&db, "no-such-uuid").unwrap().forgotten);
+        assert!(forget_in(&db, &s.uuid).unwrap().forgotten);
+        assert!(!forget_in(&db, &s.uuid).unwrap().forgotten, "already gone");
+        let idx = Index::open(&db).unwrap();
+        assert!(idx.status_without_remote_probe().unwrap().is_empty());
+        assert!(tree.join("a.txt").exists(), "files on disk stay");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_indexed_files_pages_through_the_index() {
+        // `find_indexed_files` → `find_in` on a scratch index.
+        let d = std::env::temp_dir().join(format!("diskghost-gui-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let tree = d.join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        for f in ["a.TXT", "b.txt", "sub/c.txt", "d.bin"] {
+            std::fs::write(tree.join(f), b"x").unwrap();
+        }
+        let db = d.join("index.db");
+        // No index yet: no hit, and nothing is created.
+        assert!(find_in(&db, "txt", None, None, None).unwrap().files.is_empty());
+        assert!(!db.exists());
+        let idx = Index::open(&db).unwrap();
+        let s = index_scan(&idx, &tree, &Options::default(), &Progress::default()).unwrap();
+        drop(idx);
+        let all = find_in(&db, "TXT", None, None, None).unwrap();
+        assert_eq!((all.files.len(), all.limit, all.more), (3, FIND_DEFAULT_LIMIT, false));
+        assert!(all.files.iter().all(|f| f.location_uuid == s.uuid));
+        let p1 = find_in(&db, ".txt", Some(2), Some(0), None).unwrap();
+        assert_eq!((p1.files.len(), p1.more), (2, true));
+        let p2 = find_in(&db, ".txt", Some(2), Some(2), None).unwrap();
+        assert_eq!((p2.files.len(), p2.more), (1, false));
+        let sub = std::fs::canonicalize(tree.join("sub")).unwrap();
+        let sub = sub.to_string_lossy().into_owned();
+        let only = find_in(&db, "txt", None, None, Some(&sub)).unwrap();
+        assert_eq!(only.files.len(), 1, "only under {sub}");
+        assert!(find_in(&db, "txt", None, None, Some("no-such-uuid")).unwrap().files.is_empty());
+        assert_eq!(find_in(&db, "x", Some(99_999), None, None).unwrap().limit, FIND_MAX_LIMIT);
+        assert!(find_in(&db, "", None, None, None).unwrap().files.is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

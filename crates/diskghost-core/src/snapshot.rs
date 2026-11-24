@@ -664,6 +664,13 @@ impl DiffReport {
         self.changed_files_list.truncate(top);
     }
 
+    /// [`DiffReport::truncate`] by value.
+    #[must_use]
+    pub fn capped(mut self, top: usize) -> DiffReport {
+        self.truncate(top);
+        self
+    }
+
     /// True if nothing at all changed under this directory.
     pub fn is_unchanged(&self) -> bool {
         self.delta == 0

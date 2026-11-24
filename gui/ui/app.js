@@ -589,6 +589,7 @@ function renderLocations() {
   const rows = [];
   for (const l of locations) {
     const remote = l.host.startsWith("ssh://");
+    const roots = [];
     for (const r of l.roots.length ? l.roots : [l.root]) {
       const target = remote ? `${l.host}/${r}` : String(r);
       const label = remote ? `${l.host.slice(6)}:${r}` : String(r);
@@ -604,10 +605,85 @@ function renderLocations() {
         tipRow(t("locLastScan"), fmtDate(l.last_seen)),
         tipRow(t("locReach"), l.online === null ? t("locNotProbed") : l.online ? t("locOnlineNow") : t("locOffline")),
       ]);
-      rows.push(b);
+      roots.push(b);
     }
+    // One Forget per location (it covers all its folders): index rows only.
+    rows.push(el("div", { class: "loc-item" },
+      el("div", { class: "loc-roots" }, ...roots),
+      btn("trash", `${t("locForget")} ${l.uuid}`, {
+        class: "icon-btn quiet is-danger-hover", iconOnly: true,
+        onclick: () => forgetLocations([l], t("locForgetQ")),
+      })));
   }
+  $("btn-forget-locs").disabled = locations.length === 0;
+  $("btn-forget-locs").title = `${t("locForgetAll")} (${num(locations.length)})`;
   $("locations").replaceChildren(...(rows.length ? rows : [el("p", { class: "side-empty", text: t("locEmpty") })]));
+}
+
+// Forget `locs` from the index after a confirmation naming how many indexed
+// entries go. Index rows only — the backend never touches a file.
+async function forgetLocations(locs, question) {
+  if (!locs.length) return;
+  const entries = locs.reduce((n, l) => n + l.files, 0);
+  if (!(await ask(question, [{ text: locs.map((l) => l.roots[0] || l.root).join(", "), cls: "path" }, { text: t("locForgetNote")(num(entries)) }], locs.length > 1 ? t("locForgetAll") : t("locForget"), true))) return;
+  for (const l of locs) {
+    try { await invoke("forget_location", { uuid: l.uuid }); } catch (e) { status(`${t("locForgetFailed")} ${errText(e)}`, true); break; }
+  }
+  await loadLocations();
+  if (findState.pattern) runFind(findState.pattern, 0); // its hits may be gone
+}
+
+// ---------------------------- find in index ----------------------------
+// A substring search over the indexed paths (`find_indexed_files`, the
+// MCP find_files query). It reads the index only, off the UI thread; a
+// newer search always wins over a slower older answer.
+const FIND_PAGE = 50;
+let findSeq = 0;
+let findTimer = 0;
+let findState = { pattern: "", offset: 0 };
+
+async function runFind(pattern, offset) {
+  const seq = ++findSeq;
+  findState = { pattern, offset };
+  if (!pattern) { $("find-results").replaceChildren(); return; }
+  try {
+    const page = await invoke("find_indexed_files", { pattern, limit: FIND_PAGE, offset });
+    if (seq === findSeq) renderFind(page);
+  } catch (e) {
+    if (seq === findSeq) { $("find-results").replaceChildren(); status(`${t("findFailed")} ${errText(e)}`, true); }
+  }
+}
+
+function renderFind(page) {
+  const hits = page.files.map((f) => {
+    const remote = f.host.startsWith("ssh://");
+    const where = remote ? `${f.host.slice(6)}:${f.root}` : String(f.root);
+    const row = el("div", { class: "find-hit", tabindex: "0" },
+      el("span", { class: "drive-name", text: baseName(String(f.path)) }),
+      el("span", { class: "drive-path", text: String(f.path) }),
+      el("span", { class: "drive-free num", text: `${human(f.size)} · ${where}` }));
+    tip(row, () => [
+      el("b", { text: String(f.path) }),
+      tipRow(t("findRoot"), where),
+      tipRow(t("locUuid"), f.location_uuid),
+      tipRow(t("findSize"), human(f.size)),
+      tipRow(t("findHashed"), f.hashed ? t("findYes") : t("findNo")),
+    ]);
+    return row;
+  });
+  if (!hits.length) {
+    $("find-results").replaceChildren(el("p", { class: "side-empty", text: page.offset ? t("findNoMore") : t("findNone") }));
+    return;
+  }
+  const pager = page.offset > 0 || page.more
+    ? el("div", { class: "find-pager" },
+      btn("chevron", t("findPrev"), { class: "icon-btn quiet find-prev", iconOnly: true, disabled: page.offset === 0,
+        onclick: () => runFind(findState.pattern, Math.max(0, page.offset - page.limit)) }),
+      el("span", { class: "drive-free num", text: `${num(page.offset + 1)}–${num(page.offset + hits.length)}` }),
+      btn("chevron", t("findNext"), { class: "icon-btn quiet", iconOnly: true, disabled: !page.more,
+        onclick: () => runFind(findState.pattern, page.offset + page.limit) }))
+    : null;
+  $("find-results").replaceChildren(...hits, ...(pager ? [pager] : []));
 }
 
 // The add-location dialog: validate the shape before the job is queued, the
@@ -2271,6 +2347,18 @@ async function pollIndexJobs() {
 setInterval(pollIndexJobs, 2000);
 
 $("btn-add-loc").addEventListener("click", openAddLocation);
+$("btn-forget-locs").addEventListener("click", () => forgetLocations(locations, t("locForgetAllQ")(num(locations.length))));
+// Typing searches after a pause; Enter at once.
+$("find").addEventListener("input", (e) => {
+  clearTimeout(findTimer);
+  const v = e.target.value.trim();
+  findTimer = setTimeout(() => runFind(v, 0), 300);
+});
+$("findform").addEventListener("submit", (e) => {
+  e.preventDefault();
+  clearTimeout(findTimer);
+  runFind($("find").value.trim(), 0);
+});
 
 // Drag & drop: every dropped folder becomes its own queued scan.
 try {

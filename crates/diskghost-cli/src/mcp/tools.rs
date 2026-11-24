@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use diskghost_core::remote::{parse_ssh_url, AgentMode};
 use diskghost_core::{
-    disk_space, index_dupes, index_remote, index_scan, is_cow_fs, is_rotational, make_plan,
+    diff, disk_space, index_dupes, index_remote, index_scan, is_cow_fs, is_rotational, make_plan,
     validate_globs, volume_uuid, Index, IndexDupesReport, IndexReportOptions, LocalMount,
-    LocationStatus, Options, Policy, Progress, Role,
+    LocationStatus, Options, Policy, Progress, Role, Snapshot,
 };
 use serde_json::{json, Map, Value};
 
@@ -24,6 +24,13 @@ type R = Result<Value, ToolError>;
 /// Default and maximum page size of the paged outputs.
 const DEFAULT_LIMIT: u64 = 50;
 const MAX_LIMIT: u64 = 500;
+/// `find_files` pages are larger: one row is a short path, not a group.
+const FIND_DEFAULT_LIMIT: u64 = 200;
+const FIND_MAX_LIMIT: u64 = 1000;
+/// Longest `find_files` pattern accepted.
+const MAX_PATTERN: usize = 1024;
+/// Folders listed inline by `diff_since` unless `top` says otherwise.
+const DEFAULT_TOP: u64 = 20;
 /// `dupes_report` ignores files below this unless told otherwise — the
 /// CLI's `--min-mb 1`.
 const DEFAULT_MIN_SIZE: u64 = 1024 * 1024;
@@ -111,6 +118,55 @@ pub(crate) fn definitions() -> Vec<Value> {
             &["location", "role"], false, true,
         ),
         def(
+            "forget_location",
+            "Forget a location",
+            "Remove a location and all its file rows from the index (the inverse of add_location). Changes the index only: no file in the scanned folder is touched. Answers forgotten=false when the uuid is not in the index. Refused with index_busy while a job of this server writes the index.",
+            json!({"uuid": {"type": "string", "description": "uuid from list_locations."}}),
+            &["uuid"], false, true,
+        ),
+        def(
+            "find_files",
+            "Find indexed files",
+            "Search the indexed paths of every location (offline ones included; nothing on disk or over ssh is read). pattern is a plain substring — no glob, no regex — matched ASCII-case-insensitively against the full path (location root + relative path); % _ and \\ in it are literal. Optional location restricts to one location uuid or to full paths under a root prefix. Ordered by location uuid then path, so offset paging is stable. Rows: path, location_uuid, host, root, size, hashed (a full-content hash is stored).",
+            json!({
+                "pattern": {"type": "string", "minLength": 1, "maxLength": MAX_PATTERN, "description": "Substring to look for in the path."},
+                "limit": json!({"type": "integer", "minimum": 1, "maximum": FIND_MAX_LIMIT, "description": "Rows per page (default 200, max 1000)."}),
+                "offset": page("Rows to skip."),
+                "location": {"type": "string", "description": "A location uuid, or an absolute path prefix such as /data/photos."},
+            }),
+            &["pattern"], true, true,
+        ),
+        def(
+            "index_status",
+            "Index status",
+            "Per-location detail, the data `diskghost index status` prints: uuid, host, role, root, scanned folders, files, bytes, last scan (unix seconds) and reachability — online (the volume is mounted / the ssh host answered), offline (kept in the index, still counted in reports) or unchecked (ssh with probe_remote=false). Optional location narrows it to one uuid. Read-only.",
+            json!({
+                "location": {"type": "string", "description": "uuid from list_locations; default every location."},
+                "probe_remote": {"type": "boolean", "description": "Check ssh locations over ssh (default true, up to 10 s per unreachable host)."},
+            }),
+            &[], true, true,
+        ),
+        def(
+            "list_snapshots",
+            "List stored snapshots",
+            "Snapshots the diskghost GUI stored for a scanned folder (newest first: taken_at unix seconds, size on disk, whether files are recorded). Snapshots are not part of the index: they live in the GUI's data directory (<data dir>/org.diskghost.app/snapshots/), one history per folder as scanned, and only the GUI (or a build of it) writes them — an empty list means none were stored for that exact root. Read-only.",
+            json!({"root": {"type": "string", "description": "Absolute folder path exactly as it was scanned in the GUI."}}),
+            &["root"], true, true,
+        ),
+        def(
+            "diff_since",
+            "Diff between stored snapshots",
+            "What changed under a folder between the stored snapshot taken_at=snapshot and a newer stored one (against, default the newest): folders that grew, shrank, appeared or vanished and — when both record files — single files. Unlike the GUI's diff_since this never walks the disk: the \"now\" side is a stored snapshot, so it is as fresh as the last GUI scan. Read-only; see list_snapshots.",
+            json!({
+                "root": {"type": "string", "description": "Absolute folder path exactly as it was scanned in the GUI."},
+                "snapshot": page("taken_at of the older snapshot (from list_snapshots)."),
+                "against": page("taken_at of the newer snapshot; default the newest stored."),
+                "path": {"type": "string", "description": "A folder inside root to look at; default root."},
+                "top": json!({"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "Entries per list (default 20, max 500)."}),
+            }),
+            &["root", "snapshot"], true, true,
+        ),
+        def(
             "start_scan",
             "Rescan indexed folders",
             "Rescan an already indexed location (every folder indexed on it) or one folder inside it. Unchanged files are not re-read. Returns a job_id; poll job_status. Only the index is written.",
@@ -177,6 +233,11 @@ pub(crate) fn call(ctx: &Arc<Ctx>, name: &str, args: &Value) -> Option<R> {
         "list_locations" => list_locations(ctx, args),
         "add_location" => add_location(ctx, args),
         "set_location_role" => set_location_role(ctx, args),
+        "forget_location" => forget_location(ctx, args),
+        "find_files" => find_files(ctx, args),
+        "index_status" => index_status(ctx, args),
+        "list_snapshots" => list_snapshots(args),
+        "diff_since" => diff_since(args),
         "start_scan" => start_scan(ctx, args),
         "job_status" => job_status(ctx, args),
         "list_jobs" => list_jobs(ctx, args),
@@ -596,6 +657,253 @@ fn set_location_role(ctx: &Arc<Ctx>, args: &Value) -> R {
         }
         Err(e) => Err(ToolError::from_io(&ctx.db, &e)),
     }
+}
+
+fn forget_location(ctx: &Arc<Ctx>, args: &Value) -> R {
+    let m = args_of(args, &["uuid"])?;
+    let uuid = req_str(&m, "uuid")?;
+    if uuid.is_empty() || uuid.chars().any(char::is_control) {
+        return Err(ToolError::invalid(
+            "uuid must be non-empty and free of control characters",
+        ));
+    }
+    if let Some(job) = ctx.jobs.writer_active() {
+        return Err(ToolError {
+            code: "index_busy",
+            message: format!(
+                "{job} of this server is writing the index right now; its transaction would \
+                 hold this change until it ends — retry afterwards"
+            ),
+            db: Some(ctx.db.display().to_string()),
+        });
+    }
+    let idx = open_index(&ctx.db, ctx.busy)?;
+    let forgotten = idx
+        .forget(uuid)
+        .map_err(|e| ToolError::from_io(&ctx.db, &e))?;
+    Ok(json!({"uuid": uuid, "forgotten": forgotten}))
+}
+
+fn find_files(ctx: &Arc<Ctx>, args: &Value) -> R {
+    let m = args_of(args, &["pattern", "limit", "offset", "location"])?;
+    let pattern = req_str(&m, "pattern")?;
+    if pattern.is_empty() || pattern.len() > MAX_PATTERN || pattern.contains('\0') {
+        return Err(ToolError::invalid(format!(
+            "pattern must be 1 to {MAX_PATTERN} bytes without NUL"
+        )));
+    }
+    let limit = opt_u64(&m, "limit")?.unwrap_or(FIND_DEFAULT_LIMIT);
+    if !(1..=FIND_MAX_LIMIT).contains(&limit) {
+        return Err(ToolError::invalid(format!(
+            "limit must be between 1 and {FIND_MAX_LIMIT}"
+        )));
+    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let offset = usize::try_from(opt_u64(&m, "offset")?.unwrap_or(0)).unwrap_or(usize::MAX);
+    let location = opt_str(&m, "location")?;
+    if location.is_some_and(|l| l.is_empty() || l.chars().any(char::is_control)) {
+        return Err(ToolError::invalid(
+            "location must be non-empty and free of control characters",
+        ));
+    }
+    let idx = open_index(&ctx.db, ctx.busy)?;
+    // One row past the page tells whether there is a next one.
+    let rows = idx
+        .find_files(pattern, location, limit.saturating_add(1), offset)
+        .map_err(|e| ToolError::from_io(&ctx.db, &e))?;
+    let has_more = rows.len() > limit;
+    let rows: Vec<_> = rows.into_iter().take(limit).collect();
+    Ok(json!({
+        "pattern": pattern,
+        "offset": offset,
+        "limit": limit,
+        "count": rows.len(),
+        "has_more": has_more,
+        "files": rows,
+    }))
+}
+
+fn index_status(ctx: &Arc<Ctx>, args: &Value) -> R {
+    let m = args_of(args, &["location", "probe_remote"])?;
+    let probe = opt_bool(&m, "probe_remote")?.unwrap_or(true);
+    let only = opt_str(&m, "location")?;
+    let idx = open_index(&ctx.db, ctx.busy)?;
+    let status = if probe {
+        idx.status()
+    } else {
+        idx.status_without_remote_probe()
+    }
+    .map_err(|e| ToolError::from_io(&ctx.db, &e))?;
+    let locations: Vec<Value> = sorted_locations(status)
+        .iter()
+        .filter(|l| only.is_none_or(|u| l.uuid == u))
+        .map(|l| {
+            let remote = diskghost_core::remote::is_remote_host(&l.host);
+            let (online, reach) = if remote && !probe {
+                (Value::Null, "unchecked")
+            } else if l.online {
+                (json!(true), "online")
+            } else {
+                (json!(false), "offline")
+            };
+            let mut v = location_json(l, online);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("reachability".into(), json!(reach));
+                o.insert("last_scan_unix".into(), json!(unix(l.last_seen)));
+            }
+            v
+        })
+        .collect();
+    if let (Some(u), true) = (only, locations.is_empty()) {
+        return Err(ToolError::new(
+            "unknown_location",
+            format!("no location {u:?}; see list_locations"),
+        ));
+    }
+    Ok(json!({"db": ctx.db, "locations": locations}))
+}
+
+// ------------------------------------------------------------- snapshots
+
+/// The folder the GUI keeps the snapshots of `root` in: Tauri's
+/// `app_data_dir` for the identifier `org.diskghost.app`, then
+/// `snapshots/<root key>` (see `snapshot_dir` in gui/src-tauri). The
+/// snapshots are the GUI's, not the index's; this only reads them.
+fn snapshot_store(root: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base =
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"));
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    Some(
+        base?
+            .join("org.diskghost.app")
+            .join("snapshots")
+            .join(Snapshot::root_key(root)),
+    )
+}
+
+/// Stored snapshots in `dir`: (taken_at, file), newest first — the GUI's
+/// `snapshot_files`: `<unix seconds>.dgs` (files recorded) or `.json`.
+fn snapshot_files(dir: &Path) -> Vec<(u64, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let ext = path.extension()?.to_str()?;
+            if ext != "dgs" && ext != "json" {
+                return None;
+            }
+            Some((path.file_stem()?.to_str()?.parse().ok()?, path))
+        })
+        .collect();
+    out.sort_unstable_by_key(|x| Reverse(x.0));
+    out
+}
+
+fn root_arg(m: &Map<String, Value>) -> Result<PathBuf, ToolError> {
+    let s = req_str(m, "root")?;
+    let p = Path::new(s);
+    if s.is_empty() || s.chars().any(char::is_control) || !p.is_absolute() {
+        return Err(ToolError::invalid(
+            "root must be an absolute path without control characters",
+        ));
+    }
+    Ok(p.to_path_buf())
+}
+
+fn store_of(root: &Path) -> Result<PathBuf, ToolError> {
+    snapshot_store(root).ok_or_else(|| {
+        ToolError::new(
+            "no_state_dir",
+            "no data directory known ($XDG_DATA_HOME / $HOME unset): cannot find the GUI snapshots",
+        )
+    })
+}
+
+fn list_snapshots(args: &Value) -> R {
+    let m = args_of(args, &["root"])?;
+    let root = root_arg(&m)?;
+    let dir = store_of(&root)?;
+    let snapshots: Vec<Value> = snapshot_files(&dir)
+        .into_iter()
+        .map(|(taken_at, file)| {
+            json!({
+                "taken_at": taken_at,
+                "bytes": std::fs::metadata(&file).map_or(0, |md| md.len()),
+                "files": file.extension().is_some_and(|e| e == "dgs"),
+            })
+        })
+        .collect();
+    Ok(json!({"root": root, "store": dir, "snapshots": snapshots}))
+}
+
+fn diff_since(args: &Value) -> R {
+    let m = args_of(args, &["root", "snapshot", "against", "path", "top"])?;
+    let root = root_arg(&m)?;
+    let since = opt_u64(&m, "snapshot")?
+        .ok_or_else(|| ToolError::invalid("snapshot is required (taken_at from list_snapshots)"))?;
+    let against = opt_u64(&m, "against")?;
+    let at = match opt_str(&m, "path")? {
+        Some(p)
+            if !p.is_empty() && Path::new(p).is_absolute() && !p.chars().any(char::is_control) =>
+        {
+            PathBuf::from(p)
+        }
+        Some(_) => return Err(ToolError::invalid("path must be an absolute folder path")),
+        None => root.clone(),
+    };
+    let top = opt_u64(&m, "top")?.unwrap_or(DEFAULT_TOP);
+    if !(1..=MAX_LIMIT).contains(&top) {
+        return Err(ToolError::invalid(format!(
+            "top must be between 1 and {MAX_LIMIT}"
+        )));
+    }
+    let files = snapshot_files(&store_of(&root)?);
+    let find = |ts: u64| files.iter().find(|(t, _)| *t == ts).map(|(_, f)| f.clone());
+    let old_file = find(since).ok_or_else(|| {
+        ToolError::new(
+            "unknown_snapshot",
+            format!(
+                "no stored snapshot taken_at={since} for {}; see list_snapshots",
+                root.display()
+            ),
+        )
+    })?;
+    let new_file = match against {
+        Some(ts) => find(ts).ok_or_else(|| {
+            ToolError::new(
+                "unknown_snapshot",
+                format!("no stored snapshot taken_at={ts}"),
+            )
+        })?,
+        None => files
+            .first()
+            .map(|(_, f)| f.clone())
+            .ok_or_else(|| ToolError::new("unknown_snapshot", "no stored snapshot"))?,
+    };
+    if old_file == new_file {
+        return Err(ToolError::new(
+            "unknown_snapshot",
+            "snapshot and against are the same snapshot: a diff needs two (one older, one newer)",
+        ));
+    }
+    let load = |f: &Path| {
+        Snapshot::load(f).map_err(|e| ToolError::new("snapshot_unreadable", e.to_string()))
+    };
+    let (old, new) = (load(&old_file)?, load(&new_file)?);
+    let report = diff(&old, &new, &at)
+        .map_err(|e| ToolError::new("diff_failed", e.to_string()))?
+        .capped(usize::try_from(top).unwrap_or(usize::MAX));
+    Ok(serde_json::to_value(&report).unwrap_or(Value::Null))
 }
 
 /// One scan the job performs.

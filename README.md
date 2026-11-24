@@ -164,12 +164,15 @@ find duplicates across every indexed volume — offline ones included — and
 write a dedup **plan** under a policy you state in chat.
 
 **It never touches your files.** No tool can move, delete, rename or write a
-user file: `apply`, `undo`, `rm`, `dupes --reclaim` and `index forget` are not
-exposed, and a test fails the build if the MCP module so much as names them.
+user file: `apply`, `undo`, `rm` and `dupes --reclaim` are not exposed, and a
+test fails the build if the MCP module so much as names them.
+(`forget_location` is the MCP side of `index forget`: it drops index rows,
+never a file.)
 Carrying a plan out stays a manual step you run yourself
 (`diskghost apply <plan> --dry-run`). The server writes exactly three things:
 
-- the index database (hashes and rows, like `index add` and `dupes --index`);
+- the index database (hashes and rows, like `index add` and `dupes --index`;
+  `forget_location` deletes a location's rows, like `index forget`);
 - plan files, created with `create_new` (never overwritten) in one fixed
   directory, `$XDG_STATE_HOME/diskghost/plans/` (`~/.local/state/diskghost/plans/`),
   named `plan-<UTC time>-<random>.json` — a tool cannot choose the path;
@@ -183,6 +186,10 @@ Carrying a plan out stays a manual step you run yourself
 | `list_locations` | Indexed locations: role, root, scanned folders, files, bytes, last scan, online now |
 | `add_location` | Validate a local folder or `ssh://` URL, then start a scan **job** |
 | `set_location_role` | `master` (keep) / `scratch` (expendable) / `normal` — index only |
+| `forget_location` | Drop a location's rows from the index (`forgotten: bool`); no file is touched |
+| `find_files` | Case-insensitive substring search over the indexed paths (optional `location` uuid or root prefix; paged, default 200, max 1000) |
+| `index_status` | Per-location detail as `diskghost index status`: role, files, bytes, last scan, online / offline / unchecked |
+| `list_snapshots`, `diff_since` | Read the GUI's stored snapshots of a folder and diff two of them (never walks the disk; snapshots are not in the index) |
 | `start_scan` | Rescan an indexed location or a folder inside it (**job**) |
 | `job_status`, `list_jobs`, `cancel_job` | Phase, live counters and result/error of a job; stop one |
 | `dupes_report` | Duplicate groups biggest-first with copies, keep/reclaimable hints, copy-on-write warning, single-copy counts, paging |
@@ -212,7 +219,70 @@ agy mcp add diskghost /path/to/diskghost mcp          # Antigravity CLI
 `diskghost mcp --db FILE` uses another index; `DISKGHOST_MCP_LOG=FILE` (or `-`
 for stderr) logs the protocol version and method sequence of each session.
 Protocol versions `2025-06-18` and `2025-11-25` (through `initialize`) and the
-stateless `2026-07-28` (`server/discover`) are supported.
+stateless `2026-07-28` (`server/discover`) are supported. Progress is read by
+polling `job_status`; the server sends no `notifications/progress`.
+
+#### Deployment
+
+**Supported: one stdio server per client.** The `mcp add` lines above are the
+production setup — each agent spawns its own `diskghost mcp` and talks to it
+over stdin/stdout; there is no network listener. Several such servers (several
+agents, plus the GUI and the CLI) may share one index at once: the index takes
+one writer at a time (`index_busy` instead of a hang), and the shared job
+registry (`index-jobs.db`) lets every one of them see every job. A server's
+jobs end with it, so a scan started from a client that then exits is
+cancelled (a local scan records nothing — run it again).
+
+**Optional: a systemd `--user` socket for clients that cannot spawn a
+program.** Socket activation starts one `diskghost mcp` per connection
+(`Accept=yes`), under systemd's resource controls and with its log in the
+journal. It is the same stdio server — each connection is its own server
+and its jobs end when that connection closes — and the registry keeps the
+instances coherent with each other and with the GUI.
+
+```ini
+# ~/.config/systemd/user/diskghost-mcp.socket
+[Unit]
+Description=diskghost MCP server socket
+
+[Socket]
+ListenStream=%t/diskghost-mcp.sock
+SocketMode=0600
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# ~/.config/systemd/user/diskghost-mcp@.service
+[Unit]
+Description=diskghost MCP server (one per connection)
+
+[Service]
+# Absolute path of your diskghost (cargo install puts it in ~/.cargo/bin).
+ExecStart=%h/.cargo/bin/diskghost mcp
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Nice=10
+IOSchedulingClass=idle
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now diskghost-mcp.socket
+claude mcp add --scope user diskghost -- socat - "UNIX-CONNECT:$XDG_RUNTIME_DIR/diskghost-mcp.sock"
+```
+
+The socket lives in `$XDG_RUNTIME_DIR` and diagnostics go to the journal
+(`journalctl --user -u 'diskghost-mcp@*'`), so this setup puts no file inside
+a folder you scan — keep it that way: a log, FIFO or driver directory inside a
+scan target gets indexed by the very scan it serves.
+
+[`contrib/mcp-drive/`](contrib/mcp-drive/) (a FIFO + JSONL session driver
+for one long-lived server) is an **example only**, kept for scripted
+experiments — it is not the production path and is not supported.
 
 ## Desktop app (GUI)
 

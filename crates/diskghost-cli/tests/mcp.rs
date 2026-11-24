@@ -125,7 +125,16 @@ fn mcp_tool_allowlist_is_exact() {
     names.sort_unstable();
     assert_eq!(names, ALLOWLIST, "the tool list must equal the allowlist");
 
-    let read_only = ["job_status", "list_drives", "list_jobs", "list_locations"];
+    let read_only = [
+        "diff_since",
+        "find_files",
+        "index_status",
+        "job_status",
+        "list_drives",
+        "list_jobs",
+        "list_locations",
+        "list_snapshots",
+    ];
     for t in tools {
         let name = t["name"].as_str().unwrap();
         assert_eq!(t["inputSchema"]["type"], "object", "{name}");
@@ -223,7 +232,8 @@ fn mcp_module_has_no_mutating_symbols() {
         "remove_path",
         "RemoveMode",
         "ReclaimAction",
-        "forget",
+        // `forget` is allowed: forget_location drops index rows only (like
+        // set_location_role it mutates the index, never a user file).
         "rename",
         "remove_file",
         "remove_dir",
@@ -579,4 +589,184 @@ fn mcp_index_busy_is_honest_when_another_process_holds_the_lock() {
     drop(other);
     let again = m.ok("add_location", json!({"path": tree.to_str().unwrap()}));
     m.wait_job(again["job_id"].as_str().unwrap(), "done");
+}
+
+// ------------------------------------------ parity tools (#1410)
+
+/// Seed a scratch index with the fixture and return (tree, location uuid).
+#[cfg(unix)]
+fn seeded(m: &mut common::Mcp, sb: &Sandbox) -> (PathBuf, String) {
+    let tree = sb.fixture("tree");
+    let add = m.ok("add_location", json!({"path": tree.to_str().unwrap()}));
+    m.wait_job(add["job_id"].as_str().unwrap(), "done");
+    let locs = m.ok("list_locations", json!({"probe_remote": false}));
+    let uuid = locs["locations"][0]["uuid"].as_str().unwrap().to_string();
+    (tree, uuid)
+}
+
+#[test]
+#[cfg(unix)]
+fn mcp_forget_location_drops_index_rows_and_no_file() {
+    let sb = Sandbox::new("forget");
+    let mut m = sb.spawn(&[]);
+    m.handshake("2025-06-18");
+    let (tree, uuid) = seeded(&mut m, &sb);
+
+    let bad = m.call("forget_location", json!({"uuid": ""}));
+    assert_eq!(bad["isError"], json!(true), "{bad}");
+    let none = m.ok("forget_location", json!({"uuid": "no-such-uuid"}));
+    assert_eq!(none["forgotten"], json!(false));
+
+    let r = m.ok("forget_location", json!({"uuid": uuid}));
+    assert_eq!(r["forgotten"], json!(true), "{r}");
+    let locs = m.ok("list_locations", json!({"probe_remote": false}));
+    assert!(locs["locations"].as_array().unwrap().is_empty(), "{locs}");
+    assert!(tree.join("a/one.bin").is_file(), "a user file was touched");
+}
+
+#[test]
+#[cfg(unix)]
+fn mcp_find_files_matches_substrings_and_pages() {
+    let sb = Sandbox::new("find");
+    let mut m = sb.spawn(&[]);
+    m.handshake("2025-06-18");
+    let (tree, uuid) = seeded(&mut m, &sb);
+
+    // Case-insensitive substring over the full path.
+    let r = m.ok("find_files", json!({"pattern": "TWO.BIN"}));
+    let files = r["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{r}");
+    assert_eq!(files[0]["location_uuid"], json!(uuid));
+    assert!(files[0]["path"].as_str().unwrap().ends_with("b/two.bin"));
+    assert_eq!(files[0]["size"], json!(64 * 1024));
+    assert_eq!(r["has_more"], json!(false));
+
+    // `%` and `_` are literal, not wildcards.
+    let wild = m.ok("find_files", json!({"pattern": "%"}));
+    assert_eq!(wild["count"], json!(0), "{wild}");
+
+    // Paging: 4 files, 3 matches of .bin under b/ and a/ → pages of 1.
+    let p1 = m.ok("find_files", json!({"pattern": ".bin", "limit": 1}));
+    assert_eq!(p1["count"], json!(1));
+    assert_eq!(p1["has_more"], json!(true), "{p1}");
+    let p2 = m.ok(
+        "find_files",
+        json!({"pattern": ".bin", "limit": 1, "offset": 3}),
+    );
+    assert_eq!(p2["count"], json!(1), "{p2}");
+    assert_eq!(p2["has_more"], json!(false));
+
+    // location = uuid or a root prefix; a foreign one matches nothing.
+    let by_uuid = m.ok("find_files", json!({"pattern": "bin", "location": uuid}));
+    assert_eq!(by_uuid["count"], json!(4), "{by_uuid}");
+    let prefix = format!("{}/b/", tree.display());
+    let by_prefix = m.ok("find_files", json!({"pattern": "bin", "location": prefix}));
+    assert_eq!(by_prefix["count"], json!(2), "{by_prefix}");
+    let other = m.ok(
+        "find_files",
+        json!({"pattern": "bin", "location": "/nowhere"}),
+    );
+    assert_eq!(other["count"], json!(0));
+
+    for bad in [
+        json!({}),
+        json!({"pattern": ""}),
+        json!({"pattern": "x", "limit": 1001}),
+    ] {
+        let r = m.call("find_files", bad);
+        assert_eq!(r["isError"], json!(true), "{r}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn mcp_index_status_reports_per_location_detail() {
+    let sb = Sandbox::new("istatus");
+    let mut m = sb.spawn(&[]);
+    m.handshake("2025-06-18");
+    let (_, uuid) = seeded(&mut m, &sb);
+
+    let all = m.ok("index_status", json!({"probe_remote": false}));
+    assert_eq!(all["locations"].as_array().unwrap().len(), 1, "{all}");
+    let one = m.ok("index_status", json!({"location": uuid}));
+    let l = &one["locations"][0];
+    assert_eq!(l["uuid"], json!(uuid));
+    assert_eq!(l["files"], json!(4), "{l}");
+    assert_eq!(l["reachability"], json!("online"), "{l}");
+    assert_eq!(l["role"], json!("normal"));
+    assert!(l["last_scan_unix"].as_u64().unwrap() > 0);
+
+    let r = m.call("index_status", json!({"location": "no-such-uuid"}));
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert_eq!(r["structuredContent"]["error"]["code"], "unknown_location");
+}
+
+/// Store two snapshots of `dir` the way the GUI does (`<ts>.dgs` under
+/// `<data dir>/org.diskghost.app/snapshots/<root key>`).
+#[cfg(unix)]
+fn store_two_snapshots(sb: &Sandbox, dir: &Path) {
+    use diskghost_core::{Options, Progress, ScanTree, Snapshot};
+    let capture = || {
+        Snapshot::capture(&ScanTree::build(
+            dir,
+            &Options::default(),
+            &Progress::default(),
+        ))
+    };
+    let store = sb
+        .root
+        .join("data/org.diskghost.app/snapshots")
+        .join(Snapshot::root_key(dir));
+    std::fs::create_dir_all(&store).unwrap();
+    capture().save(&store.join("100.dgs")).unwrap();
+    std::fs::write(dir.join("a/new.bin"), vec![1u8; 10 * 1024]).unwrap();
+    capture().save(&store.join("200.dgs")).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn mcp_list_snapshots_reads_the_gui_store() {
+    let sb = Sandbox::new("snaplist");
+    let tree = sb.fixture("tree");
+    let mut m = sb.spawn(&[]);
+    m.handshake("2025-06-18");
+    let root = tree.to_str().unwrap();
+
+    let none = m.ok("list_snapshots", json!({"root": root}));
+    assert!(none["snapshots"].as_array().unwrap().is_empty(), "{none}");
+
+    store_two_snapshots(&sb, &tree);
+    let r = m.ok("list_snapshots", json!({"root": root}));
+    let s = r["snapshots"].as_array().unwrap();
+    assert_eq!(s.len(), 2, "{r}");
+    assert_eq!(s[0]["taken_at"], json!(200), "newest first: {r}");
+    assert_eq!(s[1]["taken_at"], json!(100));
+    assert_eq!(s[0]["files"], json!(true));
+
+    let rel = m.call("list_snapshots", json!({"root": "relative"}));
+    assert_eq!(rel["isError"], json!(true), "{rel}");
+}
+
+#[test]
+#[cfg(unix)]
+fn mcp_diff_since_compares_two_stored_snapshots() {
+    let sb = Sandbox::new("snapdiff");
+    let tree = sb.fixture("tree");
+    let mut m = sb.spawn(&[]);
+    m.handshake("2025-06-18");
+    let root = tree.to_str().unwrap();
+    store_two_snapshots(&sb, &tree);
+
+    let r = m.ok("diff_since", json!({"root": root, "snapshot": 100}));
+    assert_eq!(r["new_files_count"], json!(1), "{r}");
+    assert!(r["delta"].as_i64().unwrap() > 0, "{r}");
+
+    let unknown = m.call("diff_since", json!({"root": root, "snapshot": 5}));
+    assert_eq!(unknown["isError"], json!(true), "{unknown}");
+    assert_eq!(
+        unknown["structuredContent"]["error"]["code"],
+        "unknown_snapshot"
+    );
+    let same = m.call("diff_since", json!({"root": root, "snapshot": 200}));
+    assert_eq!(same["isError"], json!(true), "{same}");
 }

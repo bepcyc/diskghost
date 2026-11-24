@@ -34,9 +34,22 @@
         <section class="side-sec" aria-labelledby="h-locs">
           <div class="side-head">
             <h2 id="h-locs" class="side-title" data-i18n="locations">Locations</h2>
-            <button id="btn-add-loc" class="icon-btn quiet" type="button" data-icon="plus" data-i18n-title="locAdd" data-i18n-label="locAdd" aria-label="Add location…"></button>
+            <span class="side-head-acts">
+              <button id="btn-forget-locs" class="icon-btn quiet is-danger-hover" type="button" data-icon="trash" data-i18n-title="locForgetAll" data-i18n-label="locForgetAll" aria-label="Forget all locations"></button>
+              <button id="btn-add-loc" class="icon-btn quiet" type="button" data-icon="plus" data-i18n-title="locAdd" data-i18n-label="locAdd" aria-label="Add location…"></button>
+            </span>
           </div>
           <div id="locations" class="drives"></div>
+        </section>
+        <section class="side-sec" aria-labelledby="h-find">
+          <div class="side-head">
+            <h2 id="h-find" class="side-title" data-i18n="findTitle">Find in index</h2>
+          </div>
+          <form id="findform" role="search" autocomplete="off">
+            <label class="sr-only" for="find" data-i18n="findLabel">Search the indexed file paths</label>
+            <input id="find" type="search" spellcheck="false" data-i18n-ph="findPh" />
+          </form>
+          <div id="find-results" class="find-results"></div>
         </section>
         <section class="side-sec" aria-labelledby="h-jobs">
           <div class="side-head">

@@ -243,6 +243,24 @@ pub struct ScanSummary {
     pub agent_note: Option<String>,
 }
 
+/// [`Index::find_files`] page size when the caller names none.
+pub const FIND_DEFAULT_LIMIT: usize = 200;
+/// The largest page [`Index::find_files`] callers may ask for.
+pub const FIND_MAX_LIMIT: usize = 1000;
+
+/// One indexed file found by [`Index::find_files`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FoundFile {
+    /// Full path: the location's `root` joined with the indexed relative path.
+    pub path: PathBuf,
+    pub location_uuid: String,
+    pub host: String,
+    pub root: PathBuf,
+    pub size: u64,
+    /// Whether a full-content hash is stored for the file.
+    pub hashed: bool,
+}
+
 /// One location as `diskghost index status` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocationStatus {
@@ -444,6 +462,81 @@ impl Index {
             .execute("DELETE FROM locations WHERE uuid = ?1", [uuid])
             .map_err(db_err)?;
         Ok(n > 0)
+    }
+
+    /// Search the indexed paths. `pattern` is a plain substring (no glob, no
+    /// regex), matched ASCII-case-insensitively against the full path
+    /// (`root/relative`) with SQL `LIKE` — `%`, `_` and `\` in it are
+    /// literal. `location`, when given, restricts to the location with that
+    /// uuid or to full paths at or under that folder (`/data` covers
+    /// `/data/x`, never `/database`). Ordered by location, then path, so
+    /// `limit`/`offset` paging is stable. Read-only; offline locations are
+    /// searched too. Callers cap `limit` at [`FIND_MAX_LIMIT`].
+    pub fn find_files(
+        &self,
+        pattern: &str,
+        location: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<Vec<FoundFile>> {
+        fn like_escape(s: &str) -> String {
+            let mut o = String::with_capacity(s.len());
+            for c in s.chars() {
+                if matches!(c, '%' | '_' | '\\') {
+                    o.push('\\');
+                }
+                o.push(c);
+            }
+            o
+        }
+        const FULL: &str = "(rtrim(l.root, '/') || '/' || f.path)";
+        let contains = format!("%{}%", like_escape(pattern));
+        // A folder restriction: the folder itself or anything below it.
+        let (uuid, folder, below) = match location {
+            Some(l) => {
+                let f = l.trim_end_matches('/');
+                (
+                    l.to_string(),
+                    f.to_string(),
+                    format!("{}/%", like_escape(f)),
+                )
+            }
+            None => (String::new(), String::new(), String::new()),
+        };
+        let sql = format!(
+            "SELECT l.uuid, l.host, l.root, f.path, f.size, f.full IS NOT NULL \
+             FROM files f JOIN locations l ON l.id = f.location_id \
+             WHERE {FULL} LIKE ?1 ESCAPE '\\' \
+               AND (?2 = 0 OR l.uuid = ?3 OR {FULL} = ?7 OR {FULL} LIKE ?4 ESCAPE '\\') \
+             ORDER BY l.uuid, f.path LIMIT ?5 OFFSET ?6"
+        );
+        let mut st = self.conn.prepare_cached(&sql).map_err(db_err)?;
+        let rows = st
+            .query_map(
+                params![
+                    contains,
+                    i64::from(location.is_some()),
+                    uuid,
+                    below,
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                    folder,
+                ],
+                |r| {
+                    let root = PathBuf::from(r.get::<_, String>(2)?);
+                    let rel: String = r.get(3)?;
+                    Ok(FoundFile {
+                        location_uuid: r.get(0)?,
+                        host: r.get(1)?,
+                        path: under(&root, &rel),
+                        root,
+                        size: r.get::<_, i64>(4)?.max(0) as u64,
+                        hashed: r.get(5)?,
+                    })
+                },
+            )
+            .map_err(db_err)?;
+        rows.collect::<Result<_, _>>().map_err(db_err)
     }
 
     /// Set only a location's role (host and rows untouched).
@@ -1738,6 +1831,60 @@ mod tests {
         assert!(!idx.forget("a-uuid").unwrap());
         assert_eq!(row_count(&idx), 3);
         assert_eq!(idx.status().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn find_files_matches_substrings_literally_and_pages() {
+        let d = tmpdir("find");
+        let idx = open_db(&d);
+        insert_location(&idx, "a-uuid", "/data");
+        insert_location(&idx, "b-uuid", "/database");
+        let id_a: i64 = idx
+            .conn
+            .query_row("SELECT id FROM locations WHERE uuid = 'a-uuid'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        for p in ["Photos/IMG_1.JPG", "photos/img%1.jpg", "docs/x.txt"] {
+            idx.conn
+                .execute(
+                    "INSERT INTO files (location_id, path, size, mtime_ns, dev, ino, seen) \
+                     VALUES (?1, ?2, 5, 0, 0, 99, 1)",
+                    rusqlite::params![id_a, p],
+                )
+                .unwrap();
+        }
+        let paths = |pat: &str, loc: Option<&str>, limit: usize, offset: usize| -> Vec<String> {
+            idx.find_files(pat, loc, limit, offset)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path.to_string_lossy().into_owned())
+                .collect()
+        };
+        // Case-insensitive substring over root/relative.
+        assert_eq!(
+            paths("photos/", None, 10, 0),
+            ["/data/Photos/IMG_1.JPG", "/data/photos/img%1.jpg"]
+        );
+        // `%` and `_` are literal, not wildcards.
+        assert_eq!(paths("img%1", None, 10, 0), ["/data/photos/img%1.jpg"]);
+        assert_eq!(paths("img_1", None, 10, 0), ["/data/Photos/IMG_1.JPG"]);
+        assert!(paths("i_g", None, 10, 0).is_empty());
+        // Every location has f0..f2: six hits, paged two at a time.
+        assert_eq!(paths("/f", None, 10, 0).len(), 6);
+        assert_eq!(paths("/f", None, 2, 0), ["/data/f0", "/data/f1"]);
+        assert_eq!(paths("/f", None, 2, 4), ["/database/f1", "/database/f2"]);
+        // A uuid or a folder restricts; `/data` is not a prefix of `/database`.
+        assert_eq!(paths("/f", Some("b-uuid"), 10, 0).len(), 3);
+        assert_eq!(paths("/f", Some("/data"), 10, 0).len(), 3);
+        assert_eq!(paths("/f", Some("/data/"), 10, 0).len(), 3);
+        assert_eq!(paths("", Some("/data/docs"), 10, 0), ["/data/docs/x.txt"]);
+        assert!(paths("/f", Some("nope"), 10, 0).is_empty());
+        let f = &idx.find_files("x.txt", None, 1, 0).unwrap()[0];
+        assert_eq!(
+            (f.location_uuid.as_str(), f.root.as_path(), f.size, f.hashed),
+            ("a-uuid", Path::new("/data"), 5, false)
+        );
     }
 
     #[test]

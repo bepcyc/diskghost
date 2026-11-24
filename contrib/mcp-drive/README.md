@@ -1,5 +1,9 @@
 # mcp-drive — session driver for a persistent `diskghost mcp` daemon
 
+> **Example only — not the production path.** The supported deployment is
+> one stdio `diskghost mcp` per client, or the systemd `--user` socket unit;
+> see "MCP server → Deployment" in the top-level README.
+
 `diskghost mcp` speaks JSON-RPC on stdin/stdout and exits when stdin
 closes — which kills every queued scan. This driver keeps one daemon
 alive across agent turns: requests go into a FIFO, results stream to a
