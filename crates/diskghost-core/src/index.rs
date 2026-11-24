@@ -169,7 +169,8 @@ ALTER TABLE locations ADD COLUMN transport TEXT NOT NULL DEFAULT 'shell'
     CHECK (transport IN ('shell', 'agent'));
 ",
     // v6: whether a location's filesystem keeps inode numbers (exFAT/FAT
-    // hand out new ones per mount and per inode-cache eviction), and rows
+    // hand out new ones per mount, and per the source also when an inode is
+    // re-read after leaving the cache), and rows
     // whose time is too close to their scan to trust (see `RACY_WINDOW_NS`).
     r"
 ALTER TABLE locations ADD COLUMN ino_stable INTEGER NOT NULL DEFAULT 1
