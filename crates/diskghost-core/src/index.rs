@@ -1506,18 +1506,26 @@ pub(crate) fn scan_with(
     if sum.complete && !delta {
         sum.vanished = drop_vanished(&tx, loc, gen, &prefix, &bound).map_err(db_err)? as u64;
     }
-    if opts.zfs_diff {
-        record_zfs_ref(
-            &tx,
-            loc,
-            &vol,
-            &prefix,
-            sum.complete,
-            start_ns,
-            probe,
-            &mut sum,
-        )?;
-    }
+    // Every scan decides the next delta's start: only a complete
+    // `--zfs-diff` scan that saw every file of its folder records one; any
+    // other scan of the location (no option, --exclude, --follow-symlinks,
+    // --max-depth, another folder) forgets it, since its rows no longer
+    // match what the reference vouches for.
+    let eligible = opts.zfs_diff
+        && opts.exclude.is_empty()
+        && !opts.follow_symlinks
+        && opts.max_depth.is_none();
+    record_zfs_ref(
+        &tx,
+        loc,
+        &vol,
+        &prefix,
+        sum.complete && eligible,
+        eligible,
+        start_ns,
+        probe,
+        &mut sum,
+    )?;
     tx.commit().map_err(db_err)?;
 
     if !progress.cancelled() {
@@ -1686,6 +1694,26 @@ fn zfs_plan(
         Ok(c) => c,
         Err(e) => return walk(format!("--zfs-diff: {e}; walked")),
     };
+    // One path per object: a file with several names (now or at S) is not
+    // fully described — another name may have changed with it, unlisted.
+    if changes.iter().any(|c| c.links.is_some()) {
+        return walk(
+            "--zfs-diff: a hard link was added or removed, and zfs diff names one path per \
+             file; walked"
+                .into(),
+        );
+    }
+    let shared = changes
+        .iter()
+        .flat_map(|c| std::iter::once(&c.path).chain(c.new_path.as_ref()))
+        .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && link_count(&m) > 1));
+    if let Some(p) = shared {
+        return walk(format!(
+            "--zfs-diff: {} has several names (hard links), and zfs diff names one path per \
+             file; walked",
+            p.display()
+        ));
+    }
     let outside = changes.iter().find(|c| {
         !c.path.starts_with(&vol.mount_point)
             || c.new_path
@@ -1704,6 +1732,17 @@ fn zfs_plan(
         creation,
         changes,
     })
+}
+
+/// How many names a file has (1 where unknown).
+#[cfg(unix)]
+fn link_count(m: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(m)
+}
+
+#[cfg(not(unix))]
+fn link_count(_m: &std::fs::Metadata) -> u64 {
+    1
 }
 
 /// What [`apply_zfs_delta`] needs of the scan.
@@ -1875,6 +1914,7 @@ fn record_zfs_ref(
     vol: &Volume,
     prefix: &str,
     complete: bool,
+    eligible: bool,
     start_ns: u64,
     probe: &Probe,
     sum: &mut ScanSummary,
@@ -1891,6 +1931,9 @@ fn record_zfs_ref(
     let Some(ds) = vol.zfs_dataset.as_deref() else {
         return clear();
     };
+    if !eligible {
+        return clear();
+    }
     if !complete {
         add_note(
             sum,

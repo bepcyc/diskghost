@@ -308,7 +308,10 @@ enum IndexAction {
         /// (the newest snapshot older than the last complete scan) instead
         /// of walking. Opt-in: zfs makes a temporary snapshot for the diff
         /// and needs root or the `diff` permission. Falls back to the walk,
-        /// and says why, whenever the delta cannot be proven complete.
+        /// and says why, whenever the delta cannot be proven complete. Not
+        /// detected: a `zfs rollback` to that snapshot (or a later one) can
+        /// bring back files the last scan never saw — rescan without
+        /// --zfs-diff after a rollback.
         #[arg(long)]
         zfs_diff: bool,
         #[command(flatten)]
@@ -1239,6 +1242,14 @@ fn print_index_add(path: &Path, s: &ScanSummary) {
             "  {} files: {} new, {} changed, {} unchanged; {} vanished; {} sampled",
             s.seen, s.new, s.changed, s.unchanged, s.vanished, s.sampled
         ),
+    }
+    if let Some(d) = &s.delta {
+        println!(
+            "  delta: {d} — only the paths it names (and rows it cannot vouch for) were looked at"
+        );
+    }
+    if let Some(n) = &s.delta_note {
+        println!("  note: {n}");
     }
     if s.racy_rechecked > 0 {
         println!(

@@ -396,3 +396,77 @@ fn real_zfs_delta_matches_a_walk() {
     assert_eq!(rows(&idx), rows(&walk));
     let _ = std::fs::remove_dir_all(&db);
 }
+
+fn has_ref(e: &Estate) -> bool {
+    e.idx
+        .conn
+        .query_row("SELECT zfs_ref IS NOT NULL FROM locations", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_scan_with_exclude_records_no_reference() {
+    // Its rows lack the excluded files: a delta from it would never add
+    // the ones that did not change since the snapshot.
+    let (e, creation) = zfs_estate("zfs-excl-ref");
+    let a = e.loc("A");
+    write(&a.join("f.bin"), &content(1));
+    write(&a.join("x.tmp"), &content(2));
+    let o = Options {
+        zfs_diff: true,
+        exclude: vec!["*.tmp".into()],
+        ..Options::default()
+    };
+    let s = scan_into(&e, &e.idx, &o);
+    assert!(s.complete, "{s:?}");
+    assert!(!has_ref(&e));
+    age_rows(&e, creation);
+    set_diff(&e, &[]);
+    fallback(&e, "no snapshot");
+}
+
+#[test]
+fn any_other_scan_of_the_location_forgets_the_reference() {
+    let (e, creation) = zfs_estate("zfs-forget-ref");
+    let a = e.loc("A");
+    write(&a.join("f.bin"), &content(1));
+    write(&a.join("x.tmp"), &content(2));
+    scan_into(&e, &e.idx, &opts(true));
+    assert!(has_ref(&e));
+    // A plain scan with --exclude drops x.tmp's row.
+    let o = Options {
+        exclude: vec!["*.tmp".into()],
+        ..Options::default()
+    };
+    scan_into(&e, &e.idx, &o);
+    assert!(!has_ref(&e), "forgotten");
+    age_rows(&e, creation);
+    set_diff(&e, &[]);
+    // Trusting the old reference would leave x.tmp unindexed.
+    fallback(&e, "no snapshot");
+}
+
+#[test]
+fn a_file_with_several_names_means_a_walk() {
+    // zfs diff names one path per object: the other name's row would
+    // stay stale if the delta were trusted.
+    let (e, creation) = zfs_estate("zfs-hardlink");
+    let a = e.loc("A");
+    write(&a.join("one.bin"), &content(1));
+    std::fs::hard_link(a.join("one.bin"), a.join("two.bin")).unwrap();
+    scan_into(&e, &e.idx, &opts(true));
+    age_rows(&e, creation);
+    std::fs::write(a.join("one.bin"), b"changed through one name").unwrap();
+    set_diff(&e, &[format!("M\tF\t{}", esc(&a.join("one.bin")))]);
+    fallback(&e, "several names");
+}
+
+#[test]
+fn a_link_count_change_means_a_walk() {
+    let e = ready("zfs-linkdelta");
+    let a = e.loc("A");
+    set_diff(&e, &[format!("M\tF\t{}\t(+1)", esc(&a.join("f.bin")))]);
+    fallback(&e, "hard link was added or removed");
+}

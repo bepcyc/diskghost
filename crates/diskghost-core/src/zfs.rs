@@ -40,6 +40,10 @@ pub(crate) struct Change {
     pub(crate) path: PathBuf,
     /// `R` only: where it went.
     pub(crate) new_path: Option<PathBuf>,
+    /// `M` with a link-count change: by how much (`(+1)` → 1). Such a line
+    /// names one of the object's paths only (`write_inuse_diffs_one` prints
+    /// one name per object, and only the link change, not a rename).
+    pub(crate) links: Option<i64>,
 }
 
 /// Parse the whole output of `zfs diff -F -H`. Any line that does not have
@@ -68,11 +72,16 @@ pub(crate) fn parse_diff(out: &str) -> Result<Vec<Change>, String> {
             _ => return Err(bad("no single-character file type (run with -F)")),
         };
         let path = unescape(f[2]).map_err(|e| bad(&e))?;
-        let new_path = match (kind, f.get(3)) {
-            (Kind::Renamed, Some(p)) if f.len() == 4 => Some(unescape(p).map_err(|e| bad(&e))?),
+        let (new_path, links) = match (kind, f.get(3)) {
+            (Kind::Renamed, Some(p)) if f.len() == 4 => {
+                (Some(unescape(p).map_err(|e| bad(&e))?), None)
+            }
             (Kind::Renamed, _) => return Err(bad("a rename needs exactly one new path")),
-            (Kind::Modified, Some(d)) if f.len() == 4 && is_link_delta(d) => None,
-            (_, None) => None,
+            (Kind::Modified, Some(d)) if f.len() == 4 => (
+                None,
+                Some(link_delta(d).ok_or_else(|| bad("bad link-count change"))?),
+            ),
+            (_, None) => (None, None),
             _ => return Err(bad("unexpected extra field")),
         };
         changes.push(Change {
@@ -80,17 +89,20 @@ pub(crate) fn parse_diff(out: &str) -> Result<Vec<Change>, String> {
             ftype,
             path,
             new_path,
+            links,
         });
     }
     Ok(changes)
 }
 
-/// `(+1)`, `(-2)`: a link-count change.
-fn is_link_delta(s: &str) -> bool {
-    s.strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .and_then(|s| s.strip_prefix(['+', '-']))
-        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+/// `(+1)`, `(-2)`: a link-count change (`%+d`).
+fn link_delta(s: &str) -> Option<i64> {
+    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+    let digits = inner.strip_prefix(['+', '-'])?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    inner.parse().ok()
 }
 
 /// Undo `stream_bytes`: `\ooo` (a backslash and four octal digits) is one
@@ -252,10 +264,15 @@ R\t/\t/tank/test/dir\\0040a\t/tank/test/dir\\0040b\n\
                 kind: Kind::Modified,
                 ftype: '/',
                 path: "/tank/test/".into(),
-                new_path: None
+                new_path: None,
+                links: None,
             }
         );
-        assert_eq!((c[1].kind, c[1].new_path.as_ref()), (Kind::Modified, None));
+        assert_eq!(
+            (c[1].kind, c[1].new_path.as_ref(), c[1].links),
+            (Kind::Modified, None, Some(1))
+        );
+        assert_eq!(parse_diff("M\tF\t/a\t(-2)").unwrap()[0].links, Some(-2));
         assert_eq!(
             (c[2].kind, c[2].path.clone(), c[2].new_path.clone()),
             (
