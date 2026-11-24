@@ -1519,6 +1519,7 @@ pub(crate) fn scan_with(
                         vol: &vol,
                         walk_opts: &walk_opts,
                         progress,
+                        start_ns,
                     },
                     &mut record,
                     &mut sum,
@@ -1536,6 +1537,7 @@ pub(crate) fn scan_with(
                         vol: &vol,
                         walk_opts: &walk_opts,
                         progress,
+                        start_ns,
                     },
                     root_dev,
                     &mut record,
@@ -1596,7 +1598,9 @@ pub(crate) fn scan_with(
         &iplan,
         sum.complete,
         &dirs_seen,
+        &bound,
         root_dev,
+        start_ns,
     )?;
     tx.commit().map_err(db_err)?;
 
@@ -1921,6 +1925,8 @@ struct DeltaCtx<'a> {
     vol: &'a Volume,
     walk_opts: &'a Options,
     progress: &'a Progress,
+    /// When the scan began (racy folder times).
+    start_ns: u64,
 }
 
 type Recorder<'r> = dyn FnMut(&Path, Option<&Stat>, &mut ScanSummary) -> rusqlite::Result<()> + 'r;
@@ -2397,6 +2403,9 @@ fn apply_inode_delta(
     // Subtrees walked whole (new or replaced folders): nothing below needs
     // another look.
     let mut walked: Vec<String> = Vec::new();
+    // Folders that are another filesystem's mountpoint (kept in the table
+    // as always-changed, so an unmount is noticed).
+    let mut mounts: Vec<String> = Vec::new();
     let under_walked = |walked: &[String], rel: &str| walked.iter().any(|w| in_prefix(rel, w));
     let mut set_ctime = tx
         .prepare("UPDATE dirs SET ctime_ns = ?3 WHERE location_id = ?1 AND path = ?2")
@@ -2423,11 +2432,17 @@ fn apply_inode_delta(
             }
         };
         let st = stat_of(&meta);
-        if !meta.is_dir() || st.dev != root_dev {
+        if !meta.is_dir() {
             sum.vanished += delete_under(tx, cx.loc, d).map_err(db_err)? as u64;
             if meta.is_file() {
                 record(&abs, Some(&st), sum).map_err(db_err)?;
             }
+            continue;
+        }
+        if st.dev != root_dev {
+            // Another filesystem is mounted here: its rows stay, as a walk
+            // keeps rows under a mount it does not enter.
+            mounts.push(d.clone());
             continue;
         }
         if to_sql(st.ino) != stored_ino {
@@ -2440,7 +2455,7 @@ fn apply_inode_delta(
                 mount,
                 record,
                 sum,
-                &mut Vec::new(),
+                &mut mounts,
                 dirs_seen,
             )?;
             walked.push(d.clone());
@@ -2492,7 +2507,8 @@ fn apply_inode_delta(
             } else if m.is_dir() {
                 seen.insert(rel.clone());
                 if es.dev != root_dev {
-                    continue; // another mount below: not this location's
+                    mounts.push(rel.clone()); // another mount: not entered
+                    continue;
                 }
                 if table.get(&rel).map(|(i, _)| *i) == Some(to_sql(es.ino)) {
                     continue; // known: its own inode says whether it changed
@@ -2514,6 +2530,7 @@ fn apply_inode_delta(
                     sum.vanished +=
                         drop_vanished(tx, cx.loc, cx.gen, &rel, &bound).map_err(db_err)? as u64;
                 }
+                mounts.extend(bound);
                 walked.push(rel);
             }
         }
@@ -2546,7 +2563,13 @@ fn apply_inode_delta(
             for g in gone {
                 sum.vanished += delete_under(tx, cx.loc, &g).map_err(db_err)? as u64;
             }
-            let ct = inodes.get(&st.ino).and_then(|i| i.ctime_ns).map(to_sql);
+            // A time within the racy window cannot vouch for "no change
+            // since": store none, so the next scan lists it again.
+            let ct = inodes
+                .get(&st.ino)
+                .and_then(|i| i.ctime_ns)
+                .filter(|c| !is_racy(*c, cx.start_ns))
+                .map(to_sql);
             set_ctime.execute(params![cx.loc, d, ct]).map_err(db_err)?;
         } else {
             // Not fully listed: the next scan must list it again.
@@ -2616,20 +2639,33 @@ fn apply_inode_delta(
         }
     }
     // Folders walked whole join the table (their times from BULKSTAT).
-    add_dirs(tx, cx.loc, mount, dirs_seen, inodes, root_dev).map_err(db_err)?;
+    add_dirs(
+        tx,
+        cx.loc,
+        mount,
+        dirs_seen,
+        &mounts,
+        inodes,
+        root_dev,
+        cx.start_ns,
+    )
+    .map_err(db_err)?;
     Ok(unreadable)
 }
 
 /// Add (or replace) folder-table rows for `dirs`, with their inode change
 /// time from the pre-scan BULKSTAT pass (`NULL` when it did not see the
 /// folder: the next scan lists it again).
+#[allow(clippy::too_many_arguments)]
 fn add_dirs(
     tx: &Connection,
     loc: i64,
     mount: &Path,
     dirs: &[PathBuf],
+    mounts: &[String],
     inodes: &HashMap<u64, crate::xfs::InodeInfo>,
     root_dev: u64,
+    start_ns: u64,
 ) -> rusqlite::Result<()> {
     let mut put = tx.prepare(
         "INSERT OR REPLACE INTO dirs (location_id, path, ino, ctime_ns) VALUES (?1, ?2, ?3, ?4)",
@@ -2649,12 +2685,20 @@ fn add_dirs(
             .get(&st.ino)
             .filter(|i| i.is_dir())
             .and_then(|i| i.ctime_ns)
+            .filter(|c| !is_racy(*c, start_ns))
             .map(to_sql);
         put.execute(params![loc, rel, to_sql(st.ino), ct])?;
+    }
+    // Mountpoints of other filesystems: inode -1 never matches, so each
+    // scan looks at them again — and walks one that is no longer mounted
+    // (an unmount does not change the parent folder's time).
+    for m in mounts {
+        put.execute(params![loc, m, -1i64, Option::<i64>::None])?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 /// After every scan: keep the folder table only after a complete scan that
 /// read BULKSTAT first; any other scan of the location forgets it.
 fn record_inode_ref(
@@ -2664,7 +2708,9 @@ fn record_inode_ref(
     plan: &InodePlan,
     complete: bool,
     dirs_seen: &[PathBuf],
+    mounts: &[String],
     root_dev: u64,
+    start_ns: u64,
 ) -> io::Result<()> {
     let forget = || -> io::Result<()> {
         tx.execute("DELETE FROM dirs WHERE location_id = ?1", [loc])
@@ -2684,7 +2730,17 @@ fn record_inode_ref(
                     r.get::<_, String>(0)
                 })
                 .map_err(db_err)?;
-            add_dirs(tx, loc, Path::new(&mount), dirs_seen, inodes, root_dev).map_err(db_err)?;
+            add_dirs(
+                tx,
+                loc,
+                Path::new(&mount),
+                dirs_seen,
+                mounts,
+                inodes,
+                root_dev,
+                start_ns,
+            )
+            .map_err(db_err)?;
             tx.execute(
                 "UPDATE locations SET inode_ref_root = ?2 WHERE id = ?1",
                 params![loc, prefix],

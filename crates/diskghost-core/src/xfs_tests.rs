@@ -101,6 +101,9 @@ fn ready(label: &str) -> Estate {
     write(&a.join("m/two.bin"), &content(5));
     write(&a.join("sub/s1.bin"), &content(6));
     write(&a.join("sub/inner/s2.bin"), &content(7));
+    // Folder change times within 2 s of a scan are not trusted (racy):
+    // let these be older, as folders usually are.
+    std::thread::sleep(Duration::from_millis(2100));
     let s = scan(&e, &Options::default());
     assert!(s.complete && s.delta.is_none(), "{s:?}");
     assert!(
@@ -269,4 +272,138 @@ fn other_filesystems_are_untouched() {
     let s = scan(&e, &Options::default());
     assert!(s.delta.is_none() && s.delta_note.is_none(), "{s:?}");
     assert_eq!(e.xfs.lock().unwrap().calls, 0);
+}
+
+#[test]
+fn a_folder_time_within_the_racy_window_is_not_trusted() {
+    // Made just now: a later change in the same timestamp tick could leave
+    // the time as is, so the table keeps none and the next scan lists it.
+    let e = xfs_estate("xfs-racy-dirs", true);
+    write(&e.loc("A").join("fresh/f.bin"), &content(1));
+    scan(&e, &Options::default());
+    let null: i64 = e
+        .idx
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM dirs WHERE ctime_ns IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(null as usize, dir_rows(&e), "every fresh folder");
+    settle(&e);
+    let s = scan(&e, &Options::default());
+    assert!(s.delta.is_some() && s.seen >= 1, "listed again: {s:?}");
+}
+
+#[test]
+fn a_subtree_moved_to_another_folder_leaves_the_rows_a_walk_would() {
+    let e = ready("xfs-cross-move");
+    let a = e.loc("A");
+    std::fs::rename(a.join("x/y"), a.join("m/y")).unwrap();
+    let s = scan(&e, &Options::default());
+    assert!(s.delta.is_some(), "{s:?}");
+    assert_eq!(rows(&e.idx), walked_rows(&e));
+}
+
+/// A copy of the index as it is now (`VACUUM INTO`), to which a walk
+/// is applied by [`walk_rescan_rows`]: what a walk would leave of *this*
+/// index (a walk keeps rows under a mount it does not enter, so a fresh
+/// database is not the baseline there).
+fn copy_index(e: &Estate, n: u32) -> std::path::PathBuf {
+    let p = e.dir.join(format!("copy-{n}.db"));
+    e.idx
+        .conn
+        .execute("VACUUM INTO ?1", [p.to_str().unwrap()])
+        .unwrap();
+    p
+}
+
+fn walk_rescan_rows(e: &Estate, copy: &Path) -> Vec<Row> {
+    let idx = Index::open(copy).unwrap();
+    let cap = std::mem::replace(&mut e.xfs.lock().unwrap().cap, false);
+    let root = e.loc("A");
+    let s = e
+        .with_probe(|p| scan_with(&idx, &root, &Options::default(), &Progress::default(), p))
+        .unwrap();
+    e.xfs.lock().unwrap().cap = cap;
+    assert!(s.delta.is_none(), "{s:?}");
+    rows(&idx)
+}
+
+/// A btrfs subvolume: another `st_dev` below the tree, made without root
+/// (the test box's /tmp is btrfs). `None` where that is not possible.
+fn other_device(p: &Path) -> Option<()> {
+    let ok = std::process::Command::new("btrfs")
+        .args(["subvolume", "create"])
+        .arg(p)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    use std::os::unix::fs::MetadataExt;
+    let parent = std::fs::metadata(p.parent()?).ok()?.dev();
+    (ok && std::fs::metadata(p).ok()?.dev() != parent).then_some(())
+}
+
+#[test]
+fn a_mountpoint_keeps_its_rows_and_an_unmount_is_noticed() {
+    let e = xfs_estate("xfs-mounts", true);
+    let a = e.loc("A");
+    write(&a.join("plain/f.bin"), &content(1));
+    write(&a.join("d/old.bin"), &content(2));
+    if other_device(&a.join("vol")).is_none() {
+        eprintln!("SKIP: no btrfs subvolume possible here (another st_dev without root)");
+        return;
+    }
+    write(&a.join("vol/inside.bin"), &content(3));
+    std::thread::sleep(Duration::from_millis(2100));
+    scan(&e, &Options::default());
+    settle(&e);
+    let ino: i64 = e
+        .idx
+        .conn
+        .query_row("SELECT ino FROM dirs WHERE path = 'vol'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ino, -1, "a mountpoint is kept as always-changed");
+    // H1: a known folder replaced by another filesystem under its name —
+    // a walk keeps rows under a mount it does not enter; so must the delta.
+    std::fs::remove_dir_all(a.join("d")).unwrap();
+    assert!(other_device(&a.join("d")).is_some());
+    let copy = copy_index(&e, 1);
+    let s = scan(&e, &Options::default());
+    assert!(s.delta.is_some(), "{s:?}");
+    assert_eq!(rows(&e.idx), walk_rescan_rows(&e, &copy));
+    assert!(
+        rows(&e.idx).iter().any(|r| r.0 == "d/old.bin"),
+        "kept, as the walk keeps it"
+    );
+    // H2: the other filesystem goes (an unmount, here a subvolume removed)
+    // and a plain folder is there instead: it is walked.
+    std::fs::remove_dir_all(a.join("vol")).unwrap();
+    write(&a.join("vol/now.bin"), &content(4));
+    let copy = copy_index(&e, 2);
+    let s = scan(&e, &Options::default());
+    assert!(s.delta.is_some(), "{s:?}");
+    assert!(rows(&e.idx).iter().any(|r| r.0 == "vol/now.bin"), "{s:?}");
+    assert_eq!(rows(&e.idx), walk_rescan_rows(&e, &copy));
+    let _ = std::fs::remove_dir_all(a.join("d"));
+}
+
+#[test]
+fn a_folder_that_cannot_be_listed_keeps_its_rows_and_the_table_is_forgotten() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = ready("xfs-unreadable");
+    let m = e.loc("A").join("m");
+    std::fs::set_permissions(&m, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&m).is_ok();
+    let before = rows(&e.idx);
+    let s = scan(&e, &Options::default());
+    std::fs::set_permissions(&m, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        return; // root: a mode cannot make it unreadable
+    }
+    assert!(s.delta.is_some() && !s.complete, "{s:?}");
+    assert_eq!(rows(&e.idx), before, "nothing dropped");
+    assert!(!has_table(&e), "incomplete: the next scan walks");
 }
