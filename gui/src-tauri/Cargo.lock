@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "diskghost-core"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "blake3",
  "fs4",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "diskghost-gui"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "diskghost-core",
  "serde",
