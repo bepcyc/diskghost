@@ -39,7 +39,9 @@ scan (git's "racy" case). exFAT ticks are 10 ms (`s_time_gran`), FAT 2 s,
 and the kernel's clock tick is coarse on any filesystem. So a row whose
 mtime is within `RACY_WINDOW_NS` (2 s) of its scan's start, or in the
 future, is stored with `racy = 1`; the next scan re-reads it even when its
-`stat` is unchanged (counted as `racy_rechecked`, not `changed`), and the
+`stat` is unchanged (counted as `racy_rechecked`, not `changed`; of those,
+`racy_changed` counts rows whose sample before and after the re-read
+differ — a change `stat` missed, verified by the bytes), and the
 index report re-reads it too. Remote (`ssh://`) rows are not covered: the
 remote clock is not known here.
 

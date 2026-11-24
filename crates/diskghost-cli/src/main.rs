@@ -1222,8 +1222,8 @@ fn print_index_add(path: &Path, s: &ScanSummary) {
     if s.racy_rechecked > 0 {
         println!(
             "  {} re-read although their size and time are unchanged: written within 2 s \
-             of the last scan, too close to trust",
-            s.racy_rechecked
+             of the last scan, too close to trust; {} of them had other bytes",
+            s.racy_rechecked, s.racy_changed
         );
     }
     if s.algo.as_deref().is_some_and(|a| a != "blake3") {

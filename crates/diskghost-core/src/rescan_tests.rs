@@ -216,9 +216,10 @@ fn a_write_in_the_scan_tick_is_caught_by_the_next_scan() {
     rewrite_keeping_time(&old, 7);
 
     let s = e.scan("A");
+    // `stat` saw no change (changed 0); the re-read did, and says so.
     assert_eq!(
-        (s.racy_rechecked, s.changed, s.unchanged),
-        (1, 0, 1),
+        (s.racy_rechecked, s.racy_changed, s.changed, s.unchanged),
+        (1, 1, 0, 1),
         "{s:?}"
     );
     assert!(e.reads().contains(&fresh), "the racy file is re-read");
@@ -337,4 +338,19 @@ fn apply_without_inode_numbers_still_refuses_a_changed_file() {
         .unwrap();
     assert_eq!(r.count(Status::Stale), 1, "{r:#?}");
     assert!(target.exists());
+}
+
+#[test]
+fn a_racy_row_with_the_same_bytes_is_rechecked_not_reported_changed() {
+    let e = Estate::new("rescan-racy-same");
+    write(&e.loc("A").join("a.bin"), &content(1));
+    write(&e.loc("A").join("b.bin"), &content(1));
+    e.scan("A");
+    assert!(stored(&e, "A", "a.bin").1 && stored(&e, "A", "b.bin").1);
+    let s = e.scan("A");
+    assert_eq!(
+        (s.racy_rechecked, s.racy_changed, s.changed),
+        (2, 0, 0),
+        "{s:?}"
+    );
 }

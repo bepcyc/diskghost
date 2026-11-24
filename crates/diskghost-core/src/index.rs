@@ -259,9 +259,14 @@ pub struct ScanSummary {
     pub unchanged: u64,
     /// Of those, unchanged by `stat` but racy at the last scan (time too
     /// close to it to trust): hashes reset and re-read like a changed file,
-    /// counted here — not as `changed`, since no change was observed.
+    /// counted here — not as `changed`, since `stat` observed no change.
     #[serde(default)]
     pub racy_rechecked: u64,
+    /// Of `racy_rechecked`: re-read after the walk and found with other
+    /// bytes (a sample before and after that differ) — a change `stat`
+    /// could not see. Rows without a sample on both sides are not judged.
+    #[serde(default)]
+    pub racy_changed: u64,
     /// Rows dropped because their file is gone (index rows only).
     pub vanished: u64,
     /// Files whose two ends were read because their size collides.
@@ -1286,10 +1291,13 @@ pub(crate) fn scan_with(
     let mut failed: Option<rusqlite::Error> = None;
     // Folders listed but not entered: other filesystems below the root.
     let mut bound: Vec<String> = Vec::new();
+    // Racy rows re-read by this scan, with the sample they had: compared
+    // after sampling, so a change `stat` missed is counted, not guessed.
+    let mut racy_before: Vec<(String, Vec<u8>)> = Vec::new();
     {
         let mut get = tx
             .prepare_cached(
-                "SELECT size, mtime_ns, ino, racy FROM files \
+                "SELECT size, mtime_ns, ino, racy, sample FROM files \
                  WHERE location_id = ?1 AND path = ?2",
             )
             .map_err(db_err)?;
@@ -1355,9 +1363,10 @@ pub(crate) fn scan_with(
                     return Ok(());
                 };
                 sum.seen += 1;
-                let old: Option<(i64, i64, i64, bool)> = get
+                type Old = (i64, i64, i64, bool, Option<Vec<u8>>);
+                let old: Option<Old> = get
                     .query_row(params![loc, rel], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                     })
                     .optional()?;
                 let (size, mtime, dev, ino) = (
@@ -1372,15 +1381,18 @@ pub(crate) fn scan_with(
                         insert.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
                         sum.new += 1;
                     }
-                    Some((s, m, i, false)) if (s, m, i) == (size, mtime, ino) => {
+                    Some((s, m, i, false, _)) if (s, m, i) == (size, mtime, ino) => {
                         touch.execute(params![loc, rel, gen, dev, racy])?;
                         sum.unchanged += 1;
                     }
                     // Same stat, but recorded too close to its scan: content may
                     // have changed within that timestamp tick. Read it again.
-                    Some((s, m, i, true)) if (s, m, i) == (size, mtime, ino) => {
+                    Some((s, m, i, true, before)) if (s, m, i) == (size, mtime, ino) => {
                         reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
                         sum.racy_rechecked += 1;
+                        if let Some(b) = before {
+                            racy_before.push((rel.to_string(), b));
+                        }
                     }
                     Some(_) => {
                         reset.execute(params![loc, rel, size, mtime, dev, ino, gen, racy])?;
@@ -1444,6 +1456,20 @@ pub(crate) fn scan_with(
 
     if !progress.cancelled() {
         sum.sampled = sample_collisions(idx, progress, probe)?;
+        let mut now = idx
+            .conn
+            .prepare_cached("SELECT sample FROM files WHERE location_id = ?1 AND path = ?2")
+            .map_err(db_err)?;
+        for (rel, before) in &racy_before {
+            let after: Option<Vec<u8>> = now
+                .query_row(params![loc, rel], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?
+                .flatten();
+            if after.is_some_and(|a| a != *before) {
+                sum.racy_changed += 1;
+            }
+        }
     }
     Ok(sum)
 }
