@@ -42,7 +42,8 @@ mod rescan_tests;
 mod rotational;
 mod snapshot;
 pub mod sshfs;
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 mod testkit;
 mod tree;
 mod walk;

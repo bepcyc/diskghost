@@ -95,7 +95,6 @@ pub(crate) struct FakeXfs {
 
 /// Every inode under `root` (and `root` itself), as BULKSTAT would give.
 pub(crate) fn inodes_under(root: &Path) -> HashMap<u64, crate::xfs::InodeInfo> {
-    use std::os::unix::fs::MetadataExt;
     let mut out = HashMap::new();
     let mut todo = vec![root.to_path_buf()];
     while let Some(p) = todo.pop() {
@@ -103,15 +102,25 @@ pub(crate) fn inodes_under(root: &Path) -> HashMap<u64, crate::xfs::InodeInfo> {
             continue;
         };
         let st = crate::index::stat_of(&m);
+        #[cfg(unix)]
+        let (ino, mode, nlink) = {
+            use std::os::unix::fs::MetadataExt;
+            (m.ino(), m.mode(), m.nlink() as u32)
+        };
+        #[cfg(not(unix))]
+        let (ino, mode, nlink) = {
+            use std::os::windows::fs::MetadataExt;
+            (m.file_index(), 0, 1)
+        };
         out.insert(
-            m.ino(),
+            ino,
             crate::xfs::InodeInfo {
-                ino: m.ino(),
+                ino,
                 size: m.len(),
                 mtime_ns: st.mtime_ns,
                 ctime_ns: st.ctime_ns,
-                mode: m.mode(),
-                nlink: m.nlink() as u32,
+                mode,
+                nlink,
             },
         );
         if m.is_dir() {
