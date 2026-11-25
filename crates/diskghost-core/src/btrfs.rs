@@ -399,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn tree_search_needs_cap_sys_admin() {
         if crate::xfs::has_cap_sys_admin() {
             return;

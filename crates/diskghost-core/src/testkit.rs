@@ -108,10 +108,7 @@ pub(crate) fn inodes_under(root: &Path) -> HashMap<u64, crate::xfs::InodeInfo> {
             (m.ino(), m.mode(), m.nlink() as u32)
         };
         #[cfg(not(unix))]
-        let (ino, mode, nlink) = {
-            use std::os::windows::fs::MetadataExt;
-            (m.file_index(), 0, 1)
-        };
+        let (ino, mode, nlink) = (0, 0, 1);
         out.insert(
             ino,
             crate::xfs::InodeInfo {

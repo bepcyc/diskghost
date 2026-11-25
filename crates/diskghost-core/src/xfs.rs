@@ -254,6 +254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_capability_pre_check_reads_cap_eff() {
         // Whatever this process has, the answer is the bit in CapEff.
         let s = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -268,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn without_the_capability_the_ioctl_is_refused_or_not_xfs() {
         // On this (non-XFS or unprivileged) test box the real call fails;
         // the scan turns that error into a walk.
