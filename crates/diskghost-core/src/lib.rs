@@ -22,6 +22,7 @@ mod agent_tests;
 pub mod apply;
 #[cfg(all(test, unix))]
 mod apply_tests;
+#[cfg_attr(not(unix), allow(dead_code))]
 mod btrfs;
 #[cfg(all(test, unix))]
 mod btrfs_tests;
@@ -41,11 +42,11 @@ mod rescan_tests;
 mod rotational;
 mod snapshot;
 pub mod sshfs;
-#[cfg(test)]
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(all(test, unix))]
 mod testkit;
 mod tree;
 mod walk;
+#[cfg_attr(not(unix), allow(dead_code))]
 mod xfs;
 #[cfg(all(test, unix))]
 mod xfs_tests;

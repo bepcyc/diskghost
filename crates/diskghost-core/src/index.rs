@@ -241,6 +241,7 @@ pub(crate) fn now_ns() -> u64 {
 /// `fat_build_inode`): a file gets a new number after a remount or after
 /// its inode was evicted from the cache. On such a location the index
 /// stores inode 0 and compares `(size, mtime)` only.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn inode_numbers_stable(fstype: &str) -> bool {
     !matches!(fstype, "exfat" | "vfat" | "msdos")
 }
